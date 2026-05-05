@@ -1,0 +1,53 @@
+# Client configuration. Every field can be overridden via CLI flags.
+#
+# This file is the canonical source of truth for the workload shape. The
+# same config is used across all three engines; only `protocol`,
+# `base_url`, and `model` change between runs.
+
+# --- Protocol selection ---
+# One of: vllm_openai, pytorch_hf, triton_vllm
+protocol: vllm_openai
+base_url: http://localhost:8000
+model: meta-llama/Meta-Llama-3-8B-Instruct
+
+# --- Request rate and concurrency ---
+# target_rate_rps is the open-loop arrival rate (Poisson by default).
+# concurrency_cap is the hard ceiling on requests in flight; when reached
+# new arrivals are dropped and recorded with status="dropped".
+# These values are placeholders; calibrate per-engine in pilot.
+target_rate_rps: 4.0
+concurrency_cap: 64
+
+# --- Workload shape ---
+# Prompt input length distribution, in tokens. Log-normal with given
+# median and approximate p95, clipped to [min, max].
+prompt_len:
+  median: 1500
+  p95: 3500
+  min: 256
+  max: 7500
+
+# Output max_tokens distribution.
+max_tokens:
+  median: 200
+  p95: 800
+  min: 32
+  max: 1500
+
+# Probability that a request is streaming.
+streaming_prob: 0.7
+
+# Inter-arrival distribution: poisson | constant
+request_distribution: poisson
+
+# --- Misc ---
+request_timeout_s: 600
+rotation_seconds: 60
+seed: 0
+
+# Tokenizer used for prompt-length matching. cl100k_base is fast and
+# close enough to most modern LLM tokenizers for workload shaping.
+tokenizer: cl100k_base
+
+# Path to the prompt corpus, relative to this config file unless absolute.
+corpus_path: prompts/arxiv_corpus.jsonl
