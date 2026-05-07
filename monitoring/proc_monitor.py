@@ -23,11 +23,17 @@ Sampled fields per sample:
   num_fds                open file descriptors
   cpu_percent            since last sample
   voluntary_ctx_switches
+  voluntary_ctx_switches_rate  switches/sec derived from delta of the counter
   involuntary_ctx_switches
+  involuntary_ctx_switches_rate  switches/sec derived from delta of the counter
   io_read_bytes
+  io_read_bytes_rate          bytes/sec derived from delta of the counter
   io_write_bytes
+  io_write_bytes_rate         bytes/sec derived from delta of the counter
   io_read_count
+  io_read_count_rate          ops/sec derived from delta of the counter
   io_write_count
+  io_write_count_rate         ops/sec derived from delta of the counter
   num_children           direct child processes
   _sample_duration_s
   _overrun
@@ -66,11 +72,17 @@ FIELDNAMES = [
     "num_fds",
     "cpu_percent",
     "voluntary_ctx_switches",
+    "voluntary_ctx_switches_rate",
     "involuntary_ctx_switches",
+    "involuntary_ctx_switches_rate",
     "io_read_bytes",
+    "io_read_bytes_rate",
     "io_write_bytes",
+    "io_write_bytes_rate",
     "io_read_count",
+    "io_read_count_rate",
     "io_write_count",
+    "io_write_count_rate",
     "num_children",
     "_sample_duration_s",
     "_overrun",
@@ -123,8 +135,18 @@ class PidResolver:
 
 
 def make_sampler(resolver: PidResolver):
+    previous_sample: Optional[dict[str, Any]] = None
+    previous_pid: Optional[int] = None
+
+    def _delta_rate(current: Optional[int], previous: Optional[int], delta_seconds: float) -> Optional[float]:
+        if current is None or previous is None or delta_seconds <= 0:
+            return float("nan")
+        return (current - previous) / delta_seconds
+
     def sample() -> dict[str, Any]:
         import time
+
+        nonlocal previous_sample, previous_pid
 
         ts = time.time()
         proc, pid = resolver.get()
@@ -134,6 +156,10 @@ def make_sampler(resolver: PidResolver):
                 "pid": pid,
                 "process_alive": False,
             }
+
+        if pid != previous_pid:
+            previous_sample = None
+
         try:
             with proc.oneshot():
                 mem = proc.memory_full_info()
@@ -150,7 +176,7 @@ def make_sampler(resolver: PidResolver):
                 except psutil.Error:
                     children = None
 
-            return {
+            sample_data = {
                 "ts_unix": ts,
                 "pid": pid,
                 "process_alive": True,
@@ -169,6 +195,55 @@ def make_sampler(resolver: PidResolver):
                 "io_write_count": io.write_count if io else None,
                 "num_children": children,
             }
+
+            if previous_sample is None:
+                rate_fields = {
+                    "voluntary_ctx_switches_rate": float("nan"),
+                    "involuntary_ctx_switches_rate": float("nan"),
+                    "io_read_bytes_rate": float("nan"),
+                    "io_write_bytes_rate": float("nan"),
+                    "io_read_count_rate": float("nan"),
+                    "io_write_count_rate": float("nan"),
+                }
+            else:
+                delta_seconds = ts - previous_sample["ts_unix"]
+                rate_fields = {
+                    "voluntary_ctx_switches_rate": _delta_rate(
+                        sample_data["voluntary_ctx_switches"],
+                        previous_sample["voluntary_ctx_switches"],
+                        delta_seconds,
+                    ),
+                    "involuntary_ctx_switches_rate": _delta_rate(
+                        sample_data["involuntary_ctx_switches"],
+                        previous_sample["involuntary_ctx_switches"],
+                        delta_seconds,
+                    ),
+                    "io_read_bytes_rate": _delta_rate(
+                        sample_data["io_read_bytes"],
+                        previous_sample["io_read_bytes"],
+                        delta_seconds,
+                    ),
+                    "io_write_bytes_rate": _delta_rate(
+                        sample_data["io_write_bytes"],
+                        previous_sample["io_write_bytes"],
+                        delta_seconds,
+                    ),
+                    "io_read_count_rate": _delta_rate(
+                        sample_data["io_read_count"],
+                        previous_sample["io_read_count"],
+                        delta_seconds,
+                    ),
+                    "io_write_count_rate": _delta_rate(
+                        sample_data["io_write_count"],
+                        previous_sample["io_write_count"],
+                        delta_seconds,
+                    ),
+                }
+
+            sample_data.update(rate_fields)
+            previous_sample = sample_data
+            previous_pid = pid
+            return sample_data
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return {
                 "ts_unix": ts,
