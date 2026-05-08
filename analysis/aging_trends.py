@@ -27,6 +27,11 @@ Pipeline:
   5. Mark a trend as significant when both MK q-value < alpha AND the Sen
      CI excludes zero.
 
+Proc monitor catalog:
+  Il catalogo include solo metriche istantanee o derivate (rate). I
+  counter cumulativi sono esclusi perche' crescono linearmente per
+  costruzione.
+
 Why not block bootstrap. The circular block bootstrap rearranges blocks
 of the series, which destroys any monotonic trend present in the
 data. Its sampling distribution is the null distribution of the slope
@@ -284,8 +289,9 @@ def main() -> None:
     if proc_ds is not None:
         for col in ["rss_bytes", "vms_bytes", "uss_bytes", "pss_bytes",
                     "num_threads", "num_fds", "cpu_percent",
-                    "voluntary_ctx_switches", "involuntary_ctx_switches",
-                    "io_read_bytes", "io_write_bytes", "io_read_count", "io_write_count"]:
+                    "voluntary_ctx_switches_rate", "involuntary_ctx_switches_rate",
+                    "io_read_bytes_rate", "io_write_bytes_rate",
+                    "io_read_count_rate", "io_write_count_rate"]:
             if col in proc_ds.columns:
                 catalog.append(("proc", col, proc_ds[col]))
     if system_ds is not None:
