@@ -1,5 +1,9 @@
 """PyTorch + HuggingFace adapter for the minimal FastAPI loop we ship.
 
+Protocol adapter for the pytorch_naive engine (engines/pytorch_naive/).
+Named pytorch_hf for historical reasons; refers to the HuggingFace
+transformers API used by the naive baseline.
+
 The PyTorch+HF naive engine in this project exposes:
 
   POST /generate
