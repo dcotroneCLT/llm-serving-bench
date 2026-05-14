@@ -95,7 +95,8 @@ def main() -> None:
             print(f"[sweep] Skipping remaining rates due to interrupt.")
             break
 
-        level_label = f"{int(round(rate)):02d}rps"
+        # rate in centesimi: 0.10 -> 010rps, 1.0 -> 100rps, 16 -> 1600rps
+        level_label = f"{int(round(rate * 100)):03d}rps"
         out_dir = args.output_root / f"client_{level_label}"
         out_dir.mkdir(parents=True, exist_ok=True)
 

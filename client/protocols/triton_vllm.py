@@ -78,6 +78,12 @@ class TritonVLLMAdapter(ProtocolAdapter):
                         line = line.strip()
                         if not line:
                             continue
+                        # Strip SSE "data: " prefix if present (Triton+vLLM V1 uses SSE,
+                        # Triton+vLLM V0 used NDJSON). Skip non-data SSE lines.
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
+                            if not line or line == "[DONE]":
+                                continue
                         try:
                             obj = json.loads(line)
                         except json.JSONDecodeError:

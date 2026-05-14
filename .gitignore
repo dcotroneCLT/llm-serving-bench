@@ -100,3 +100,6 @@ engines/triton_vllm/model_repository/*/*.bin
 
 # Local override for compose
 docker-compose.override.yml
+
+# Local backup files from in-place patches
+*.backup_pre_*
