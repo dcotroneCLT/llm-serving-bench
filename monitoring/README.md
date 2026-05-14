@@ -11,6 +11,8 @@ directory.
 - `proc_monitor.py` psutil-based per-process metrics, default 5 s
 - `system_monitor.py` system-wide metrics, default 5 s
 - `run_monitors.py` orchestrator that spawns all three and writes manifest
+- `find_engine_pid.py` dynamic engine-PID resolver for containerized engines
+- `RUN_AGING.md` 4-tmux-session launch procedure for 24-hour aging runs
 
 ## Prerequisites
 
@@ -67,6 +69,25 @@ python run_monitors.py \
     --duration-seconds 7200 \
     --label-engine vllm_standalone
 ```
+
+### Containerized engines: use find_engine_pid.py
+
+For any engine running inside a Docker container, do **not** capture
+the PID by hand with `docker top` and write it into `engine.pid`
+statically. That breaks the moment the engine respawns a worker, and
+proc_monitor will record `process_alive=False` for the remainder of
+the run — this is exactly what happened to the 2026-05-12/13 aging
+runs.
+
+Instead, run `find_engine_pid.py` alongside `run_monitors.py`. It
+inspects the container's descendant tree every N seconds and rewrites
+`engine.pid` whenever the engine worker's PID changes; proc_monitor
+re-reads the pidfile on each sample and follows the new PID
+transparently.
+
+See `RUN_AGING.md` for the full 4-tmux-session launch procedure
+(engine container, pid tracker, host monitors, client) and a table of
+per-engine `--process-pattern` regexes.
 
 Output structure:
 

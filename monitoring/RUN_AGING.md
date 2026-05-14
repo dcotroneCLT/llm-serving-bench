@@ -1,0 +1,166 @@
+# Running a 24-hour aging experiment
+
+This document codifies the launch procedure for any aging run that
+targets a *containerized* serving engine. It is the result of the
+2026-05-12/13 ablation runs where a static PID-capture broke the
+per-process indicators (see [README.md](README.md) for context).
+
+The procedure uses four independent tmux sessions so each component
+can be inspected or restarted in isolation.
+
+## Components
+
+| Session | Role             | Script                                  |
+| ------- | ---------------- | --------------------------------------- |
+| 1       | engine container | `docker run …` (engine-specific)        |
+| 2       | pid tracker      | `monitoring/find_engine_pid.py`         |
+| 3       | host monitors    | `monitoring/run_monitors.py`            |
+| 4       | client load      | `client/run_client.py`                  |
+
+Sessions 2 and 3 share the same `<run_dir>/engine.pid`: session 2 keeps
+it updated to point at the live engine worker; session 3 (specifically
+`proc_monitor.py`) re-reads it every sample.
+
+## Engine-specific process patterns
+
+The `--process-pattern` is a regex matched against the joined cmdline of
+each descendant of the container's init process. Use the pattern below
+that matches the engine generation you are testing.
+
+| Engine                                         | Pattern                            | Notes                                              |
+| ---------------------------------------------- | ---------------------------------- | -------------------------------------------------- |
+| Triton 25.09 + vLLM V1 (VLLM_USE_V1=1)         | `EngineCore`                       | V1's dedicated async engine subprocess             |
+| vLLM v0.7.3 standalone (V0 engine, mp backend) | `spawn_main`                       | The multiprocessing worker hosting V0              |
+| Triton + in-process V0 (e.g. our E2 baseline)  | `triton_python_backend_stub`       | V0 ran inside the Triton Python backend, no spawn  |
+
+If you add a new engine generation, identify the pattern by hand once:
+
+```
+docker exec -it <engine> ps -ef
+# or, from the host:
+pstree -p $(docker inspect --format '{{.State.Pid}}' <engine>)
+```
+
+Pick the deepest descendant doing real work. Avoid matching the
+container init (PID 1 inside the container) or short-lived wrappers.
+
+## Launch sequence
+
+Below, replace placeholders with the values for the run you are
+launching. `<run_dir>` is `<runs_root>/<run_id>` and is created
+automatically by `run_monitors.py`.
+
+### Session 1 — engine container
+
+The engine is launched by whatever procedure the engine repo
+documents. Two reference invocations:
+
+```
+# Triton 25.09 with vLLM V1
+docker run -d --name triton_v1 --gpus device=1 \
+  --shm-size=4g -e VLLM_USE_V1=1 \
+  -p 8001:8000 \
+  -v <model_repo>:/models \
+  nvcr.io/nvidia/tritonserver:25.09-vllm-python-py3 \
+  tritonserver --model-repository=/models
+```
+
+```
+# vLLM 0.7.3 standalone (V0 engine)
+docker run -d --name vllm_v0 --gpus device=0 \
+  --shm-size=4g \
+  -p 8000:8000 \
+  vllm/vllm-openai:v0.7.3 \
+  --model <hf_id> --port 8000
+```
+
+Wait for the engine to finish loading the model and to respond to a
+single warm-up request before starting the other sessions, otherwise
+the pid tracker may publish the loader PID and not the steady-state
+worker PID.
+
+### Session 2 — pid tracker
+
+```
+mkdir -p <run_dir>
+python monitoring/find_engine_pid.py \
+  --container-name <engine_container> \
+  --process-pattern <pattern_from_table_above> \
+  --pidfile <run_dir>/engine.pid \
+  --poll-seconds 30 \
+  --duration-seconds 86400
+```
+
+The script writes each resolved PID atomically to `<run_dir>/engine.pid`
+and logs to stderr only when the PID changes. Keep this session
+visible during the first hour so you can confirm at least one
+resolution event.
+
+### Session 3 — host monitors
+
+```
+python monitoring/run_monitors.py \
+  --run-id <run_id> \
+  --runs-root <runs_root> \
+  --gpu-index <gpu_index> \
+  --pidfile <run_dir>/engine.pid \
+  --duration-seconds 86400 \
+  --label-engine <engine_label>
+```
+
+`<gpu_index>` is the same GPU passed to the container via
+`--gpus device=N`. `<engine_label>` is the base name for the
+proc-monitor CSV (e.g. `triton_v1`, `vllm_v0`).
+
+### Session 4 — client
+
+```
+python client/run_client.py \
+  --config <config.yaml> \
+  --output-dir <run_dir>/client \
+  --duration-seconds 86400
+```
+
+The client config specifies target RPS, prompt corpus, and protocol.
+
+## Validation, first 5 minutes
+
+Before walking away from the run, verify:
+
+1. `<run_dir>/engine.pid` exists and contains a non-zero PID.
+2. `head <run_dir>/<engine_label>_000000.csv` shows
+   `process_alive=True` and non-zero `rss_bytes`.
+3. The pid tracker's stderr shows at least one
+   `[find_engine_pid] resolved pid=… cmdline=…` line.
+4. `nvidia-smi --id=<gpu_index>` reports the engine using GPU memory.
+5. The client log shows non-zero successful requests within the first
+   minute.
+
+If item 2 fails (process_alive=False after 5 minutes), the most likely
+causes are:
+
+- `--process-pattern` does not match any descendant (check session 2 log).
+- The proc monitor cannot read `/proc/<pid>` because it runs under a
+  different user than the engine. Run both as the same user, or as a
+  user that is a member of the `docker` group.
+- The container is using PID namespace isolation in a way that hides
+  the worker from the host `/proc`. This is rare with the standard
+  `docker run` invocations above but can happen with custom
+  `--security-opt` flags.
+
+## Why a static PID is not enough
+
+A PID captured once at run start works only if the engine's worker
+process never exits. In practice:
+
+- vLLM V1 uses a separate `EngineCore` subprocess that the parent can
+  respawn on internal recovery paths.
+- vLLM V0 with the multiprocessing backend hosts the engine in a
+  `spawn_main` subprocess; the parent supervisor can restart it.
+- Triton's Python backend can reload a model on configuration change,
+  changing the stub PID.
+
+Any of these events will leave a static pidfile pointing at a dead
+PID, after which `proc_monitor.py` records `process_alive=False`
+forever. The dynamic tracker fixes this without changing the
+proc-monitor contract.
