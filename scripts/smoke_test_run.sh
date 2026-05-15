@@ -113,9 +113,10 @@ cleanup() {
         kill "$FEPID_BG" 2>/dev/null || true
         wait "$FEPID_BG" 2>/dev/null || true
     fi
-    # proc_monitor under sudo exits on its own via --duration-seconds.
-    # If it's still around (e.g. NO-GO before duration elapsed), it will
-    # exit when its parent (this script) does, since we did NOT use setsid.
+    # run_monitors.py handles its own duration via SIGTERM to child monitors
+    # (gpu, proc-under-sudo, system). If we abort early via cleanup, the
+    # run_monitors child inherits this script's process group and will be
+    # SIGTERMed indirectly when this script exits.
     # The smoke container is always torn down here.
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     # Kill any tmux session we may have created (we don't, but defensive)
@@ -375,23 +376,30 @@ check_c() {
         fi
     fi
 
-    # C.2 start proc_monitor under sudo with auto-shutdown at 60s
-    sudo -n "$WOSAR_PY" "$REPO_ROOT/monitoring/proc_monitor.py" \
+    # C.2 spawn run_monitors.py (orchestrator with built-in duration). It
+    # spawns gpu/proc/system monitors, with proc wrapped in sudo -n. At
+    # duration expiry run_monitors sends SIGTERM to the monitor process
+    # groups; proc_monitor exits cleanly on its existing SIGTERM handler.
+    # No new flags or signaling burdens for proc_monitor.
+    local SMOKE_PARENT SMOKE_RUN_ID
+    SMOKE_PARENT=$(dirname "$SMOKE_DIR")
+    SMOKE_RUN_ID=$(basename "$SMOKE_DIR")
+    "$WOSAR_PY" "$REPO_ROOT/monitoring/run_monitors.py" \
+        --run-id "$SMOKE_RUN_ID" \
+        --runs-root "$SMOKE_PARENT" \
+        --gpu-index "$GPU" \
         --pidfile "$pid_file" \
-        --label "$LBL" \
-        --output-dir "$SMOKE_DIR" \
-        --period-seconds 5 \
-        --rotation-seconds 60 \
-        --duration-seconds 65 \
-        >"$SMOKE_DIR/proc_monitor.log" 2>&1 &
-    local PROC_BG=$!
+        --duration-seconds 60 \
+        --label-engine "$LBL" \
+        >"$SMOKE_DIR/run_monitors.log" 2>&1 &
+    local RUN_MON_BG=$!
 
     sleep 5
-    if ! kill -0 "$PROC_BG" 2>/dev/null; then
-        record FAIL "C.proc.start" "proc_monitor exited early (likely sudo denied); see $SMOKE_DIR/proc_monitor.log"
+    if ! kill -0 "$RUN_MON_BG" 2>/dev/null; then
+        record FAIL "C.run_monitors.start" "run_monitors exited early; see $SMOKE_DIR/run_monitors.log"
         return
     fi
-    record PASS "C.proc.start" "proc_monitor running (sudo wrapped, sample period 5s)"
+    record PASS "C.run_monitors.start" "run_monitors orchestrator running (gpu+proc+system, proc via sudo)"
 
     # C.3 send one inference request mid-sampling
     local resp_status=""
@@ -426,9 +434,9 @@ check_c() {
         return
     fi
 
-    # C.4 wait for proc_monitor to finish (it auto-exits at 65s)
-    echo "[smoke_run] sampling for 60s..."
-    wait "$PROC_BG" 2>/dev/null || true
+    # C.4 wait for run_monitors to finish (it auto-exits at duration + grace)
+    echo "[smoke_run] sampling for 60s (run_monitors will auto-exit)..."
+    wait "$RUN_MON_BG" 2>/dev/null || true
     sleep 2
 
     # C.5 analyze the proc CSV
