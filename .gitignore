@@ -103,3 +103,6 @@ docker-compose.override.yml
 
 # Local backup files from in-place patches
 *.backup_pre_*
+
+# Claude Code local config
+.claude/
