@@ -17,11 +17,13 @@ description: |
 engine:
   # Image identity. tag is the wosar2026 pin produced by
   # scripts/utils/pin_images.sh; digest is recorded in
-  # engines/vllm_standalone/image_pin.json and copied verbatim into
-  # the run manifest by launch_cell.sh.
+  # engines/vllm_standalone/image_pin_e1.json and copied verbatim into
+  # the run manifest by launch_cell.sh. (E1 and A1 use distinct pin
+  # files in the same engine directory because they pin different
+  # vLLM versions, V1 latest vs V0 v0.7.3.)
   image_repo: vllm/vllm-openai
   image_tag: wosar2026_e1
-  digest_pin_file: engines/vllm_standalone/image_pin.json
+  digest_pin_file: engines/vllm_standalone/image_pin_e1.json
 
   # Container name template. {replica} is replaced by launch_cell.sh
   # with the zero-padded replica index (01, 02, 03). Unique per run
