@@ -264,6 +264,13 @@ def main() -> None:
     p.add_argument("--period-seconds", type=float, default=5.0)
     p.add_argument("--rotation-seconds", type=int, default=60)
     p.add_argument("--watchdog-timeout-s", type=float, default=30.0)
+    p.add_argument(
+        "--duration-seconds",
+        type=int,
+        default=0,
+        help="If >0, auto-exit after this many seconds. Lets bash drivers run "
+             "a bounded smoke without sending SIGTERM/SIGINT to a root process.",
+    )
     args = p.parse_args()
 
     resolver = PidResolver(pid=args.pid, pidfile=args.pidfile)
@@ -278,6 +285,18 @@ def main() -> None:
         )
     )
     shutdown = ShutdownEvent()
+
+    # Auto-shutdown timer (background thread). Lets a non-root caller run a
+    # bounded proc_monitor under sudo without needing kill privileges.
+    if args.duration_seconds > 0:
+        import threading
+        import time as _time
+
+        def _stopper():
+            _time.sleep(args.duration_seconds)
+            shutdown._event.set()
+
+        threading.Thread(target=_stopper, daemon=True).start()
 
     def guarded_sample():
         return watchdog.call(sampler)
