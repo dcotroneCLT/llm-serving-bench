@@ -376,6 +376,16 @@ def materialize_client_config(
 ) -> Path:
     base_config_path = repo_root / "client" / "config.yaml"
     base_cfg = yaml.safe_load(base_config_path.read_text())
+
+    # Path-valued fields in the base config are RELATIVE to the base
+    # config's directory (client/). When we materialize the run-specific
+    # config in run_dir, the run_client.py resolver would look for those
+    # paths relative to run_dir and fail. Pre-resolve to absolute here.
+    if "corpus_path" in base_cfg:
+        corpus = Path(base_cfg["corpus_path"])
+        if not corpus.is_absolute():
+            base_cfg["corpus_path"] = str((base_config_path.parent / corpus).resolve())
+
     overrides = render_in_obj(
         cell["workload"]["client_config_overrides"], replica=str(replica)
     )
