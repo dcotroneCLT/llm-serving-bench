@@ -1,0 +1,83 @@
+# E2 - Triton Inference Server + vLLM backend, V0 (default in Triton 25.09).
+# Production cell. n=1 paper finding: process RSS +2.04 MB/h.
+#
+# Note on PID strategy. Container PID 1 is `tritonserver`, but the
+# engine state (KV cache, scheduler, generation loop) lives in a
+# Python child that the Triton vLLM backend spawns. proc_monitor must
+# track the Python child, not tritonserver, otherwise RSS/FD/thread
+# slopes under-estimate the leak. find_engine_pid.py walks the
+# descendants of tritonserver and picks the one matching the regex.
+
+cell_id: e2
+short_label: triton_vllm_v0
+description: |
+  NVIDIA Triton Inference Server (25.09) with vLLM Python backend,
+  serving Qwen2.5-7B-Instruct from a local model_repository.
+  V0 vLLM scheduler (default in Triton 25.09).
+  Hosting-layer arm of the 2x2 factorial at fixed engine generation V0.
+
+engine:
+  image_repo: tritonserver
+  image_tag: wosar2026_e2_a2
+  digest_pin_file: engines/triton_vllm/image_pin.json
+
+  container_name_template: "wosar2026_e2_r{replica:02d}"
+
+  # tritonserver command. Args after the image.
+  command:
+    - tritonserver
+    - --model-repository=/models
+    - --log-verbose=1
+
+  # No VLLM_USE_V1 env: defaults to V0 in Triton 25.09.
+  env:
+    HF_HOME: /root/.cache/huggingface
+
+  shm_size: 8g
+  gpu_device: 1
+  port_mapping:
+    - "8000:8000"       # HTTP
+    - "8001:8001"       # gRPC
+    - "8002:8002"       # Prometheus metrics
+  volumes:
+    - "{repo_root}/engines/triton_vllm/model_repository:/models"
+    - "{hf_cache_host}:/root/.cache/huggingface"
+
+  readyz:
+    # Triton readiness endpoint. Returns 200 when the model is loaded.
+    url: "http://localhost:8000/v2/health/ready"
+    timeout_s: 900     # vLLM warmup inside Triton can take longer than standalone
+
+  pid_strategy:
+    type: triton_child
+    # Regex matched against the cmdline of descendants of tritonserver.
+    # The Triton Python backend stub launches a python process that
+    # imports the vLLM EngineCore; matching either keyword identifies it.
+    process_pattern: "EngineCore|triton_python_backend_stub"
+
+monitors:
+  gpu_index_inherits_from_engine: true
+  proc:
+    label: triton_vllm_v0
+    period_s: 5
+  gpu:
+    period_s: 1
+  system:
+    period_s: 5
+  rotation_s: 60
+
+workload:
+  client_config_overrides:
+    protocol: triton_vllm
+    base_url: "http://localhost:8000"
+    model: qwen                       # name of the model in model_repository
+    target_rate_rps: 2.172            # empirical mean from n=1 run
+    concurrency_cap: 64
+    streaming_prob: 0.7
+    request_distribution: poisson
+    request_timeout_s: 600
+    seed_template: "{replica}"
+
+duration_s: 86400
+warmup_discard_s: 3600
+post_run_cooldown_s: 600

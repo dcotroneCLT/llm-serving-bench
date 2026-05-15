@@ -1,0 +1,78 @@
+# E3 - PyTorch + HuggingFace Transformers, naive FastAPI serving.
+# Production cell, unoptimized baseline. n=1 paper finding: process RSS +170 KB/h.
+#
+# Custom image built from engines/pytorch_naive/Dockerfile.
+# Saturating workload: 0.174 rps is the empirical mean from n=1 (PyTorch HF
+# without continuous batching saturates at this rate on a 7B BF16 model
+# with long prompts on a single L40S).
+
+cell_id: e3
+short_label: pytorch_naive
+description: |
+  PyTorch + HuggingFace Transformers, served by a minimal FastAPI loop.
+  No PagedAttention, no continuous batching, single-request processing.
+  Represents the unoptimized baseline.
+
+engine:
+  # Built locally on the server (and rebuildable from
+  # engines/pytorch_naive/Dockerfile + requirements.txt + server/).
+  image_repo: pytorch_naive
+  image_tag: wosar2026
+  digest_pin_file: engines/pytorch_naive/image_pin.json
+
+  container_name_template: "wosar2026_e3_r{replica:02d}"
+
+  command: []           # uvicorn args are baked into the Dockerfile CMD
+
+  env:
+    MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
+    MAX_MODEL_LEN: "8192"
+    DTYPE: bfloat16
+    GPU_DEVICE: "cuda:0"
+    HF_HOME: /cache/huggingface
+
+  shm_size: 8g
+  gpu_device: 2
+  port_mapping:
+    - "8000:8000"
+  volumes:
+    - "{hf_cache_host}:/cache/huggingface"
+
+  readyz:
+    url: "http://localhost:8000/readyz"
+    timeout_s: 600
+
+  pid_strategy:
+    # uvicorn is PID 1 in the container (exec form CMD). docker inspect
+    # gives us the engine PID directly; no descendant walking needed.
+    type: container_pid1
+
+monitors:
+  gpu_index_inherits_from_engine: true
+  proc:
+    label: pytorch_naive
+    period_s: 5
+  gpu:
+    period_s: 1
+  system:
+    period_s: 5
+  rotation_s: 60
+
+workload:
+  client_config_overrides:
+    protocol: pytorch_hf
+    base_url: "http://localhost:8000"
+    model: Qwen/Qwen2.5-7B-Instruct
+    # Saturation point of the naive engine on long prompts. Going higher
+    # produces unbounded queue growth and client-side timeouts, so this
+    # IS the operational ceiling, not an arbitrary calibration.
+    target_rate_rps: 0.174
+    concurrency_cap: 64
+    streaming_prob: 0.7
+    request_distribution: poisson
+    request_timeout_s: 600
+    seed_template: "{replica}"
+
+duration_s: 86400
+warmup_discard_s: 3600
+post_run_cooldown_s: 600

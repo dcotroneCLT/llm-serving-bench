@@ -1,0 +1,93 @@
+# Top-level campaign descriptor for the WoSAR 2026 n=3 replication.
+#
+# Drives scripts/campaign.py:
+#   - reads the cell list and the parallel-slot topology
+#   - dispatches launch_cell.sh per (cell, replica)
+#   - writes state/campaign_state.json after each run for checkpoint/resume
+#   - retries each run once on failure, then surfaces the error
+#
+# Topology C (3-way parallel across GPU 0, 1, 2). Each GPU runs 6 runs
+# sequentially (3 cells x 2 cells per GPU, kept as in the n=1 baseline
+# except for E2 which moves from GPU 0 to GPU 1 to balance across GPUs).
+# Calendar: max(6, 6, 6) sequential runs per GPU = 6 days at ~26h/run
+# wallclock (24h aging + 1h startup + 1h cooldown).
+
+campaign_id: wosar2026
+description: |
+  Clean n=3 replication campaign for the WoSAR 2026 submission.
+  18 runs total, 6 cells x 3 replicas, 3-way parallel across GPUs 0/1/2.
+
+# Cell yaml paths, relative to this file.
+cells:
+  - cells/e1.yaml
+  - cells/e2.yaml
+  - cells/e3.yaml
+  - cells/e3b.yaml
+  - cells/a1.yaml
+  - cells/a2.yaml
+
+# Number of replicas to run per cell.
+replicas_per_cell: 3
+
+# Parallel slot definition. Each slot is a GPU and the cells it can run.
+# campaign.py walks the (cell, replica) cross-product, assigning each
+# (cell, replica) to the slot whose gpu_index matches cell.engine.gpu_device.
+# Within a slot, runs are sequential; across slots they overlap.
+slots:
+  - name: gpu0
+    gpu_device: 0
+    cells: [e1, a1]               # both originally on GPU 0 in n=1
+  - name: gpu1
+    gpu_device: 1
+    cells: [e2, a2]               # A2 was on GPU 1 in n=1; E2 moves from 0 to 1
+  - name: gpu2
+    gpu_device: 2
+    cells: [e3, e3b]              # both originally on GPU 2 in n=1
+
+# Execution order within each slot. "round_robin" cycles cells: r1 of
+# cell A, r1 of cell B, ..., r2 of A, r2 of B, ... This is preferred
+# over "cell_at_a_time" because day-to-day environmental drift (lab
+# temperature, network background load) is then absorbed symmetrically
+# across cells rather than concentrated on one cell's slope estimate.
+intra_slot_order: round_robin
+
+# Inter-run cooldown enforced by launch_cell.sh teardown. The slot
+# does not start the next run until VRAM on its gpu_device has
+# returned to within +/- 200 MiB of pre-run baseline, OR the cell's
+# post_run_cooldown_s has elapsed, whichever comes later.
+vram_baseline_quiescence_mib: 200
+
+# Retry policy. Each (cell, replica) gets one automatic retry on
+# failure (e.g. readyz timeout, client crash, monitor exit). After
+# the retry, the run is logged as FAILED in campaign_state.json and
+# the slot moves on. The slot does NOT block waiting for human
+# intervention; campaign.py prints a banner and continues.
+retry_policy:
+  max_retries: 1
+  on_repeated_failure: log_and_continue   # alternatives: log_and_halt_slot
+
+# Sanity verification: one short cross-GPU run for cell E2 on GPU 0
+# at the end of the campaign. Used in V (Threats to Validity) to
+# argue that the GPU index does not materially shift slope estimates.
+sanity_runs:
+  - cell: e2
+    replica_id: sanity_gpu0
+    gpu_device_override: 0
+    duration_s_override: 21600     # 6h instead of 24h
+
+# Runs root. Each (cell, replica) gets a subdirectory
+# <runs_root>/<campaign_id>_<cell_id>_r<NN>/
+# matching the convention used by analysis pipelines.
+runs_root: /home/dcotrone/wosar/runs
+
+# Path templates resolved by launch_cell.sh.
+paths:
+  hf_cache_host: /home/dcotrone/wosar/hf_cache
+  repo_root: /home/dcotrone/wosar/llm-serving-bench
+
+# Where checkpoint state lives. campaign.py reads it on startup; if
+# present, it resumes from the last completed run.
+state_file: state/campaign_state.json
+
+# tmux session naming. campaign.py creates one session per slot.
+tmux_session_template: "wosar2026_{slot_name}"

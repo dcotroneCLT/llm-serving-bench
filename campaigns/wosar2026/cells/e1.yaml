@@ -1,0 +1,109 @@
+# E1 - vLLM standalone, engine V1 (default in vllm/vllm-openai:latest as of
+# May 2026). Production cell, n=1 paper finding: process RSS +9.15 MB/h.
+#
+# Single source of truth for the cell. Everything downstream
+# (launch_cell.sh, monitors, client, manifest) derives its inputs from
+# this file. In particular, the GPU index used by the GPU monitor is
+# the same field consumed by the docker --gpus flag; the two cannot
+# diverge by construction.
+
+cell_id: e1
+short_label: vllm_v1_standalone
+description: |
+  vLLM stand-alone serving Qwen2.5-7B-Instruct, BF16, on a single L40S.
+  Engine generation V1 (default in vllm/vllm-openai:latest at pin time).
+  Baseline production cell for the cross-engine comparison.
+
+engine:
+  # Image identity. tag is the wosar2026 pin produced by
+  # scripts/utils/pin_images.sh; digest is recorded in
+  # engines/vllm_standalone/image_pin.json and copied verbatim into
+  # the run manifest by launch_cell.sh.
+  image_repo: vllm/vllm-openai
+  image_tag: wosar2026_e1
+  digest_pin_file: engines/vllm_standalone/image_pin.json
+
+  # Container name template. {replica} is replaced by launch_cell.sh
+  # with the zero-padded replica index (01, 02, 03). Unique per run
+  # so a stale container from a previous replica does not collide.
+  container_name_template: "wosar2026_e1_r{replica:02d}"
+
+  # Args after the image, passed to vllm/vllm-openai's entrypoint.
+  command:
+    - --model
+    - Qwen/Qwen2.5-7B-Instruct
+    - --dtype
+    - bfloat16
+    - --max-model-len
+    - "8192"
+    - --gpu-memory-utilization
+    - "0.9"
+    - --port
+    - "8000"
+
+  # docker run -e KEY=VALUE
+  env: {}
+
+  # docker run --shm-size, --gpus, -p, -v
+  shm_size: 8g
+  gpu_device: 0
+  port_mapping:
+    - "8000:8000"
+  volumes:
+    - "{hf_cache_host}:/root/.cache/huggingface"
+
+  # Readiness gate. The cell timer (duration_s) starts AFTER the engine
+  # passes this check; cold loads do not eat into the 24h aging window.
+  readyz:
+    url: "http://localhost:8000/health"
+    timeout_s: 600
+
+  # How to resolve the engine worker PID.
+  #   container_pid1: docker inspect gives the engine PID directly.
+  #                    Used for E1, E3, E3b, A1 (single-process engines,
+  #                    or where the entrypoint exec's the worker).
+  #   triton_child:   container PID 1 is tritonserver, find the Python
+  #                    vLLM backend worker via cmdline regex.
+  pid_strategy:
+    type: container_pid1
+
+monitors:
+  # gpu_index for the GPU monitor is NOT a separate knob: it is
+  # forced to engine.gpu_device by launch_cell.sh. Listed here only
+  # so the manifest captures the canonical value.
+  gpu_index_inherits_from_engine: true
+  proc:
+    label: vllm_v1_standalone
+    period_s: 5
+  gpu:
+    period_s: 1
+  system:
+    period_s: 5
+  rotation_s: 60
+
+workload:
+  # Client invocation. Uses client/run_client.py with config overrides.
+  # The base_url is the host-side endpoint mapped from port_mapping[0].
+  client_config_overrides:
+    protocol: vllm_openai
+    base_url: "http://localhost:8000/v1"
+    model: Qwen/Qwen2.5-7B-Instruct
+    target_rate_rps: 2.545          # empirical mean from n=1 run (see analysis)
+    concurrency_cap: 64
+    streaming_prob: 0.7
+    request_distribution: poisson
+    request_timeout_s: 600
+    # Seed for the arrival-process RNG. Distinct per replica so r1/r2/r3
+    # see different arrival sequences but the SAME workload distribution.
+    seed_template: "{replica}"
+
+# Run-level timing knobs.
+#   duration_s: 24h aging window, starts after readyz passes.
+#   warmup_discard_s: first hour of metrics excluded from slope estimation
+#                     (matches paper protocol; not enforced by the
+#                     run, only by the analysis pipeline).
+#   post_run_cooldown_s: time between container teardown and the next
+#                       run on the same GPU, for VRAM/RSS quiescence.
+duration_s: 86400
+warmup_discard_s: 3600
+post_run_cooldown_s: 600

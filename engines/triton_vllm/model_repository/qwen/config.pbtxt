@@ -1,0 +1,12 @@
+backend: "vllm"
+
+# vLLM backend uses the model.json in the version directory
+# instead of input/output config from this file.
+# The instance_group below tells Triton to run on GPU.
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_MODEL
+  }
+]

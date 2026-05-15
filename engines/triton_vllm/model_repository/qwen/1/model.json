@@ -1,0 +1,7 @@
+{
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "gpu_memory_utilization": 0.9,
+    "tensor_parallel_size": 1,
+    "max_model_len": 8192,
+    "dtype": "bfloat16"
+}

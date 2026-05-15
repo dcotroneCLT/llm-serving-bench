@@ -1,0 +1,71 @@
+# A2 - Triton Inference Server + vLLM backend, V1 (forced via env).
+# Ablation cell for hosting_layer x engine_gen 2x2 factorial.
+# n=1 paper finding: process RSS +20 KB/h.
+
+cell_id: a2
+short_label: triton_vllm_v1
+description: |
+  NVIDIA Triton Inference Server (25.09) with vLLM Python backend,
+  V1 scheduler forced via VLLM_USE_V1=1.
+  Triton 25.09 ships V0 as default; this env var flips it.
+
+engine:
+  image_repo: tritonserver
+  image_tag: wosar2026_e2_a2
+  digest_pin_file: engines/triton_vllm/image_pin.json
+
+  container_name_template: "wosar2026_a2_r{replica:02d}"
+
+  command:
+    - tritonserver
+    - --model-repository=/models
+    - --log-verbose=1
+
+  env:
+    HF_HOME: /root/.cache/huggingface
+    VLLM_USE_V1: "1"
+
+  shm_size: 8g
+  gpu_device: 1
+  port_mapping:
+    - "8000:8000"
+    - "8001:8001"
+    - "8002:8002"
+  volumes:
+    - "{repo_root}/engines/triton_vllm/model_repository:/models"
+    - "{hf_cache_host}:/root/.cache/huggingface"
+
+  readyz:
+    url: "http://localhost:8000/v2/health/ready"
+    timeout_s: 900
+
+  pid_strategy:
+    type: triton_child
+    process_pattern: "EngineCore|triton_python_backend_stub"
+
+monitors:
+  gpu_index_inherits_from_engine: true
+  proc:
+    label: triton_vllm_v1
+    period_s: 5
+  gpu:
+    period_s: 1
+  system:
+    period_s: 5
+  rotation_s: 60
+
+workload:
+  client_config_overrides:
+    protocol: triton_vllm
+    base_url: "http://localhost:8000"
+    model: qwen
+    target_rate_rps: 0.897
+    concurrency_cap: 64
+    streaming_prob: 0.7
+    request_distribution: poisson
+    request_timeout_s: 600
+    seed_template: "{replica}"
+
+duration_s: 86400
+warmup_discard_s: 3600
+post_run_cooldown_s: 600

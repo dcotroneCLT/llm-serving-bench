@@ -1,0 +1,70 @@
+# E3b - PyTorch + HuggingFace Transformers, naive, LOW request rate.
+# Workload-regime ablation of E3. Same engine container, ~3x lower rate.
+# n=1 paper finding: process RSS +179 KB/h (almost identical to E3 saturating).
+# The negligible difference is itself the finding: PyTorch-naive aging
+# is rate-independent in this regime, distinguishing it from queue-driven
+# leaks in continuous-batching engines.
+
+cell_id: e3b
+short_label: pytorch_naive_low_rate
+description: |
+  Identical engine container to E3. Only the client target_rate_rps differs.
+  Ablation arm: tests whether the aging slope of the naive baseline depends
+  on the input rate.
+
+engine:
+  image_repo: pytorch_naive
+  image_tag: wosar2026
+  digest_pin_file: engines/pytorch_naive/image_pin.json
+
+  container_name_template: "wosar2026_e3b_r{replica:02d}"
+
+  command: []
+
+  env:
+    MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
+    MAX_MODEL_LEN: "8192"
+    DTYPE: bfloat16
+    GPU_DEVICE: "cuda:0"
+    HF_HOME: /cache/huggingface
+
+  shm_size: 8g
+  gpu_device: 2
+  port_mapping:
+    - "8000:8000"
+  volumes:
+    - "{hf_cache_host}:/cache/huggingface"
+
+  readyz:
+    url: "http://localhost:8000/readyz"
+    timeout_s: 600
+
+  pid_strategy:
+    type: container_pid1
+
+monitors:
+  gpu_index_inherits_from_engine: true
+  proc:
+    label: pytorch_naive
+    period_s: 5
+  gpu:
+    period_s: 1
+  system:
+    period_s: 5
+  rotation_s: 60
+
+workload:
+  client_config_overrides:
+    protocol: pytorch_hf
+    base_url: "http://localhost:8000"
+    model: Qwen/Qwen2.5-7B-Instruct
+    target_rate_rps: 0.050           # ~3x lower than E3, empirical mean from n=1
+    concurrency_cap: 64
+    streaming_prob: 0.7
+    request_distribution: poisson
+    request_timeout_s: 600
+    seed_template: "{replica}"
+
+duration_s: 86400
+warmup_discard_s: 3600
+post_run_cooldown_s: 600

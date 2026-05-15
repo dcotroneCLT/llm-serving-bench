@@ -1,0 +1,78 @@
+# A1 - vLLM standalone, engine V0 (ablation cell for V0 vs V1 contrast).
+# Same engine container family as E1, but pinned to vLLM v0.7.3 (last
+# release where V0 was the default scheduler).
+# n=1 paper finding: process RSS +530 KB/h, VRAM +124 MB/h.
+
+cell_id: a1
+short_label: vllm_v0_standalone
+description: |
+  vLLM stand-alone, V0 scheduler, Qwen2.5-7B-Instruct, BF16, on a single L40S.
+  V0 ablation arm of the 2x2 factorial (engine_gen x hosting_layer).
+  Pinned to v0.7.3 because V0 was removed as default in later versions.
+
+engine:
+  image_repo: vllm/vllm-openai
+  image_tag: wosar2026_a1
+  digest_pin_file: engines/vllm_standalone/image_pin.json
+
+  container_name_template: "wosar2026_a1_r{replica:02d}"
+
+  command:
+    - --model
+    - Qwen/Qwen2.5-7B-Instruct
+    - --dtype
+    - bfloat16
+    - --max-model-len
+    - "8192"
+    - --gpu-memory-utilization
+    - "0.9"
+    - --port
+    - "8000"
+
+  # No VLLM_USE_V1=0 needed: in v0.7.3 V0 is the default scheduler.
+  env:
+    HF_HOME: /root/.cache/huggingface
+
+  shm_size: 8g
+  gpu_device: 0
+  port_mapping:
+    - "8000:8000"
+  volumes:
+    - "{hf_cache_host}:/root/.cache/huggingface"
+
+  readyz:
+    url: "http://localhost:8000/health"
+    timeout_s: 600
+
+  pid_strategy:
+    type: container_pid1
+
+monitors:
+  gpu_index_inherits_from_engine: true
+  proc:
+    label: vllm_v0_standalone
+    period_s: 5
+  gpu:
+    period_s: 1
+  system:
+    period_s: 5
+  rotation_s: 60
+
+workload:
+  client_config_overrides:
+    protocol: vllm_openai
+    base_url: "http://localhost:8000/v1"
+    model: Qwen/Qwen2.5-7B-Instruct
+    # 85% of V0 saturation is much lower than V1: V0 has no continuous
+    # batching v2 or new scheduling primitives. Rate is the n=1 mean,
+    # which is the calibration we want to replicate for direct comparability.
+    target_rate_rps: 0.796
+    concurrency_cap: 64
+    streaming_prob: 0.7
+    request_distribution: poisson
+    request_timeout_s: 600
+    seed_template: "{replica}"
+
+duration_s: 86400
+warmup_discard_s: 3600
+post_run_cooldown_s: 600

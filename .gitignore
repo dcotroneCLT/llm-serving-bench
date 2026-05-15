@@ -106,3 +106,8 @@ docker-compose.override.yml
 
 # Claude Code local config
 .claude/
+
+# Campaign runtime state (regenerated each run)
+campaigns/*/state/
+*.pyc
+__pycache__/
