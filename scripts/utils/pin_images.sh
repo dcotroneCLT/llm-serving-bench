@@ -51,10 +51,15 @@ pin_image() {
     docker pull "$source_ref"
   fi
 
+  # Use a conditional template so empty RepoDigests does not raise
+  # "index out of range" (which would abort the script under set -e).
+  # For locally built images RepoDigests is [], the template emits "",
+  # and we fall through to the image ID fallback.
   local digest
-  digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$source_ref" 2>/dev/null | sed 's/.*@//')
+  digest=$(docker inspect \
+    --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' \
+    "$source_ref" 2>/dev/null | sed 's/.*@//')
   if [ -z "$digest" ]; then
-    # Locally built image: no RepoDigest. Use image ID prefixed with sha256:.
     digest=$(docker inspect --format '{{.Id}}' "$source_ref")
   fi
 
