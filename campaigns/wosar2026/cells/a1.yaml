@@ -35,13 +35,14 @@ engine:
 
   shm_size: 8g
   gpu_device: 0
+  # Host port 8100 for slot gpu0 (a1 shares slot with e1; sequential within slot).
   port_mapping:
-    - "8000:8000"
+    - "8100:8000"
   volumes:
     - "{hf_cache_host}:/root/.cache/huggingface"
 
   readyz:
-    url: "http://localhost:8000/health"
+    url: "http://localhost:8100/health"
     timeout_s: 600
 
   pid_strategy:
@@ -61,7 +62,7 @@ monitors:
 workload:
   client_config_overrides:
     protocol: vllm_openai
-    base_url: "http://localhost:8000/v1"
+    base_url: "http://localhost:8100/v1"
     model: Qwen/Qwen2.5-7B-Instruct
     # 85% of V0 saturation is much lower than V1: V0 has no continuous
     # batching v2 or new scheduling primitives. Rate is the n=1 mean,

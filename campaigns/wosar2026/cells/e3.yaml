@@ -33,13 +33,15 @@ engine:
 
   shm_size: 8g
   gpu_device: 2
+  # Host port 8300 for slot gpu2. Distinct per slot so e3/e3b do not
+  # collide with cells on GPU 0 or GPU 1 when running in parallel.
   port_mapping:
-    - "8000:8000"
+    - "8300:8000"
   volumes:
     - "{hf_cache_host}:/cache/huggingface"
 
   readyz:
-    url: "http://localhost:8000/readyz"
+    url: "http://localhost:8300/readyz"
     timeout_s: 600
 
   pid_strategy:
@@ -61,7 +63,7 @@ monitors:
 workload:
   client_config_overrides:
     protocol: pytorch_hf
-    base_url: "http://localhost:8000"
+    base_url: "http://localhost:8300"
     model: Qwen/Qwen2.5-7B-Instruct
     # Saturation point of the naive engine on long prompts. Going higher
     # produces unbounded queue growth and client-side timeouts, so this
