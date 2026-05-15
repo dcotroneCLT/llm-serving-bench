@@ -15,7 +15,7 @@ engine:
   image_tag: wosar2026_a1
   digest_pin_file: engines/vllm_standalone/image_pin_a1.json
 
-  container_name_template: "wosar2026_a1_r{replica:02d}"
+  container_name_template: "wosar2026_a1_r{replica}"
 
   command:
     - --model

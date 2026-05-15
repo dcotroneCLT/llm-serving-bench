@@ -20,7 +20,7 @@ engine:
   image_tag: wosar2026
   digest_pin_file: engines/pytorch_naive/image_pin.json
 
-  container_name_template: "wosar2026_e3_r{replica:02d}"
+  container_name_template: "wosar2026_e3_r{replica}"
 
   command: []           # uvicorn args are baked into the Dockerfile CMD
 

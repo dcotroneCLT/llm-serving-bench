@@ -579,12 +579,19 @@ def main() -> None:
     args = p.parse_args()
 
     # 1. Load and substitute placeholders.
+    #
+    # replica is zero-padded HERE (Python side) and the cell yamls use
+    # plain {replica} placeholders. Doing the format spec in YAML
+    # ({replica:02d}) would require a Python-format-aware renderer; we
+    # keep the renderer trivial (literal {key} replacement) and centralize
+    # the formatting in this one line.
     cell_raw = yaml.safe_load(args.cell_yaml.read_text())
+    replica_padded = f"{args.replica:02d}"
     cell = render_in_obj(
         cell_raw,
         repo_root=str(args.repo_root),
         hf_cache_host=str(args.hf_cache_host),
-        replica=str(args.replica),
+        replica=replica_padded,
     )
     if args.gpu_device_override is not None:
         cell["engine"]["gpu_device"] = args.gpu_device_override
@@ -611,8 +618,8 @@ def main() -> None:
     (run_dir / "image_digest.txt").write_text(pin["digest"] + "\n")
     log(f"image: {image_full}  digest: {pin['digest']}")
 
-    # 3. Container name with replica substituted.
-    container_name = render(cell["engine"]["container_name_template"], replica=f"{replica:02d}")
+    # 3. Container name (already substituted via render_in_obj above).
+    container_name = cell["engine"]["container_name_template"]
     teardown_container(container_name)
 
     # 4. Capture pre-run VRAM baseline on the cell's GPU.

@@ -28,7 +28,7 @@ engine:
   # Container name template. {replica} is replaced by launch_cell.sh
   # with the zero-padded replica index (01, 02, 03). Unique per run
   # so a stale container from a previous replica does not collide.
-  container_name_template: "wosar2026_e1_r{replica:02d}"
+  container_name_template: "wosar2026_e1_r{replica}"
 
   # Args after the image, passed to vllm/vllm-openai's entrypoint.
   command:

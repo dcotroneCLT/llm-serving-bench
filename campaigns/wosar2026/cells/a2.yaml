@@ -14,7 +14,7 @@ engine:
   image_tag: wosar2026_e2_a2
   digest_pin_file: engines/triton_vllm/image_pin.json
 
-  container_name_template: "wosar2026_a2_r{replica:02d}"
+  container_name_template: "wosar2026_a2_r{replica}"
 
   command:
     - tritonserver
