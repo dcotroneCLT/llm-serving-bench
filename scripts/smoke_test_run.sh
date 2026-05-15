@@ -291,35 +291,63 @@ check_b() {
     fi
     record PASS "B.engine.flag_check" "VLLM_USE_V1 not flagged as unknown"
 
-    # B.3b expected engine generation per cell
+    # B.3b expected engine generation per cell.
+    # The authoritative line is the vllm "Initializing a V[01] LLM engine"
+    # message. Earlier patterns matched substrings inside fallback messages
+    # (e.g. "VLLM_USE_V1=1. Falling back to V0 Engine") and produced false
+    # FAILs. We now require the explicit initialization log line.
+    local initialized_v0 initialized_v1
+    initialized_v0=$(grep -cE "Initializing a V0 LLM engine" "$SMOKE_DIR/container_logs.txt" || true)
+    initialized_v1=$(grep -cE "Initializing a V1 LLM engine" "$SMOKE_DIR/container_logs.txt" || true)
     case "$CELL_ID" in
         e1)
-            if grep -qiE "v1[^a-z0-9]*llm engine|v1 llm engine|engine.*v1" "$SMOKE_DIR/container_logs.txt"; then
-                record PASS "B.engine.version" "V1 detected (expected for e1)"
+            if [ "$initialized_v1" -gt 0 ]; then
+                record PASS "B.engine.version" "V1 LLM engine initialized (expected for e1)"
+            elif [ "$initialized_v0" -gt 0 ]; then
+                record FAIL "B.engine.version" "V0 initialized but e1 must be V1 (latest vllm-openai)"
+                return
             else
-                record WARN "B.engine.version" "V1 marker not detected; inspect container_logs.txt"
+                record WARN "B.engine.version" "no 'Initializing a V[01] LLM engine' line found; inspect logs"
             fi
             ;;
         a1)
-            if grep -qiE "v1[^a-z0-9]*llm engine|v1 llm engine" "$SMOKE_DIR/container_logs.txt"; then
-                record FAIL "B.engine.version" "V1 detected but a1 must be V0 (vllm 0.7.3)"
+            if [ "$initialized_v0" -gt 0 ]; then
+                record PASS "B.engine.version" "V0 LLM engine initialized (expected for a1, vllm v0.7.3)"
+            elif [ "$initialized_v1" -gt 0 ]; then
+                record FAIL "B.engine.version" "V1 initialized but a1 must be V0"
                 return
-            fi
-            record PASS "B.engine.version" "no V1 marker (expected V0 for a1)"
-            ;;
-        a2)
-            if grep -qiE "VLLM_USE_V1.*1|v1[^a-z0-9]*llm engine" "$SMOKE_DIR/container_logs.txt"; then
-                record PASS "B.engine.version" "V1 effective (expected for a2 with VLLM_USE_V1=1)"
             else
-                record WARN "B.engine.version" "V1 marker not detected for a2; inspect container_logs.txt"
+                record WARN "B.engine.version" "no init line; inspect logs"
             fi
             ;;
         e2)
-            if grep -qiE "v1[^a-z0-9]*llm engine|VLLM_USE_V1.*1" "$SMOKE_DIR/container_logs.txt"; then
-                record FAIL "B.engine.version" "V1 marker present but e2 must be V0 (Triton 25.09 default)"
+            if [ "$initialized_v0" -gt 0 ]; then
+                record PASS "B.engine.version" "V0 LLM engine initialized (expected for e2)"
+            elif [ "$initialized_v1" -gt 0 ]; then
+                record FAIL "B.engine.version" "V1 initialized but e2 must be V0 (Triton default)"
                 return
+            else
+                record WARN "B.engine.version" "no init line; inspect logs"
             fi
-            record PASS "B.engine.version" "no V1 marker (expected V0 for e2)"
+            ;;
+        a2)
+            # vLLM 0.10.x in Triton 25.09 falls back to V0 when AsyncLLMEngine
+            # is run in background thread, even with VLLM_USE_V1=1 set. Surface
+            # the fallback explicitly: if we asked for V1 but got V0, that is
+            # a methodological FAIL (not a smoke test FAIL of the framework).
+            local fell_back
+            fell_back=$(grep -cE "Engine in background thread is experimental.*VLLM_USE_V1=1.*Falling back to V0" "$SMOKE_DIR/container_logs.txt" || true)
+            if [ "$initialized_v1" -gt 0 ]; then
+                record PASS "B.engine.version" "V1 LLM engine initialized (expected for a2)"
+            elif [ "$fell_back" -gt 0 ] && [ "$initialized_v0" -gt 0 ]; then
+                record FAIL "B.engine.version" "vLLM fell back to V0 despite VLLM_USE_V1=1 (Triton 25.09 + vLLM 0.10.x does not support V1 in background thread). 2x2 factorial cannot be realized with this image. See paper note."
+                return
+            elif [ "$initialized_v0" -gt 0 ]; then
+                record FAIL "B.engine.version" "V0 initialized but a2 must be V1"
+                return
+            else
+                record WARN "B.engine.version" "no init line; inspect logs"
+            fi
             ;;
         e3|e3b)
             record PASS "B.engine.version" "n/a (PyTorch HF naive, no scheduler)"
