@@ -60,6 +60,25 @@ class CsvRotatingWriter:
             self._file.close()
         path = self.cfg.output_dir / f"{self.cfg.base_name}_{self._seq:06d}.csv"
         self._file = path.open("w", newline="")
+        # When proc_monitor runs under sudo (root), the CSV would otherwise
+        # be owned by root with restrictive permissions, breaking analysis
+        # done by the original user. We chmod 0644 (world-readable) and
+        # chown back to the SUDO_USER when present. Failures are swallowed
+        # because (1) when not running under sudo, no chown is needed and
+        # (2) chmod on a file we just opened should always succeed for the
+        # owning process.
+        try:
+            os.chmod(path, 0o644)
+        except OSError:
+            pass
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user:
+            try:
+                import pwd
+                pwent = pwd.getpwnam(sudo_user)
+                os.chown(str(path), pwent.pw_uid, pwent.pw_gid)
+            except (KeyError, OSError):
+                pass
         self._writer = None  # delayed until we know fieldnames
         self._opened_at = time.monotonic()
         self._seq += 1

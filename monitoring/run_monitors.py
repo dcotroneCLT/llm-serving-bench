@@ -169,7 +169,16 @@ def main() -> None:
         ),
         (
             "proc",
+            # proc_monitor reads /proc/<pid>/smaps_rollup which requires
+            # PTRACE_MODE_READ_FSCREDS. On hosts with ptrace_scope=1 and a
+            # nosuid /home (which disables file capabilities for python),
+            # the only practical path is sudo. We invoke proc_monitor.py
+            # via sudo -n with a NOPASSWD entry in /etc/sudoers.d/.
+            # The CsvRotatingWriter chmods/chowns its output files so
+            # the resulting CSVs are readable by the original (non-root)
+            # user under SUDO_USER.
             [
+                "sudo", "-n", "--",
                 sys.executable,
                 str(here / "proc_monitor.py"),
                 "--pidfile",
