@@ -89,11 +89,15 @@ def host_port_from_mapping(port_mapping: str) -> Optional[str]:
 
 
 def container_running(name: str) -> bool:
-    result = subprocess.run(
-        ["docker", "ps", "--format", "{{.Names}}"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.SubprocessError:
+        return False
     return result.returncode == 0 and name in result.stdout.split()
 
 

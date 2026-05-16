@@ -178,6 +178,9 @@ def steady_sampler(
         sample_started = time.monotonic()
         sample = sampler()
         sample_ended = time.monotonic()
+        # Watchdog sentinels skip the sampler and may lack ts_unix; backfill
+        # so every CSV row has a timestamp usable by continuity checks.
+        sample.setdefault("ts_unix", time.time())
         sample["_sample_duration_s"] = sample_ended - sample_started
         sample["_overrun"] = (sample_ended - deadline) > period_seconds
         sample["_wall_clock_unix"] = time.time()

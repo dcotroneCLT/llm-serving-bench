@@ -103,12 +103,19 @@ def find_matching_descendant(
             cpu_total = times.user + times.system
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             cpu_total = 0.0
-        candidates.append((cpu_total, proc))
+        try:
+            rss = proc.memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            rss = 0
+        candidates.append((rss, cpu_total, proc))
 
     if not candidates:
         return None
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
+    # Prefer the descendant with the model loaded (multi-GB RSS) over a
+    # lightweight wrapper/stub that matches the same regex; use CPU time
+    # as a tiebreak when RSS is comparable.
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return candidates[0][2]
 
 
 def write_pidfile_atomic(pidfile: Path, pid: int) -> None:
@@ -192,14 +199,22 @@ def main() -> None:
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     worker_pid = None
                     worker_cmdline = ""
-                if worker_pid is not None and worker_pid != last_published_pid:
-                    try:
-                        write_pidfile_atomic(args.pidfile, worker_pid)
-                    except OSError as e:
-                        _log(f"failed to write pidfile {args.pidfile}: {e}")
+                if worker_pid is not None:
+                    if worker_pid != last_published_pid:
+                        try:
+                            write_pidfile_atomic(args.pidfile, worker_pid)
+                        except OSError as e:
+                            _log(f"failed to write pidfile {args.pidfile}: {e}")
+                        else:
+                            _log(f"resolved pid={worker_pid} (prev={last_published_pid}) cmdline={worker_cmdline!r}")
+                            last_published_pid = worker_pid
                     else:
-                        _log(f"resolved pid={worker_pid} (prev={last_published_pid}) cmdline={worker_cmdline!r}")
-                        last_published_pid = worker_pid
+                        # Refresh pidfile mtime so health checks can tell a
+                        # healthy daemon (stable PID) apart from a stalled one.
+                        try:
+                            os.utime(args.pidfile, None)
+                        except OSError:
+                            pass
 
         if deadline is not None and time.monotonic() >= deadline:
             _log("duration elapsed, exiting")

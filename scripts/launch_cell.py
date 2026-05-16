@@ -114,7 +114,7 @@ def cleanup_after_abort() -> None:
     except Exception:
         pass
     try:
-        subprocess.run(["docker", "rm", "-f", _ABORT_CONTAINER_NAME], check=False, capture_output=True)
+        subprocess.run(["docker", "rm", "-f", _ABORT_CONTAINER_NAME], check=False, capture_output=True, timeout=60)
     except Exception:
         pass
 
@@ -160,19 +160,22 @@ def assert_run_dir_fresh(run_dir: Path) -> None:
         )
 
 
-def save_docker_logs(container_name: str, out_path: Path) -> None:
-    """Best-effort docker logs capture before the container is removed."""
+def save_docker_logs(container_name: str, out_path: Path, tail: int = 50000) -> None:
+    """Best-effort docker logs capture before the container is removed.
+
+    --tail caps captured volume: a 36 h verbose engine log can reach
+    multiple GB, and buffering it in the supervisor would risk OOM.
+    """
     try:
-        result = subprocess.run(
-            ["docker", "logs", container_name],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        with out_path.open("wb") as f:
+            subprocess.run(
+                ["docker", "logs", "--tail", str(tail), container_name],
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+            )
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         out_path.write_text(f"docker logs failed: {e}\n")
-        return
-    out_path.write_text(result.stdout + result.stderr)
 
 
 def summarize_client_csvs(client_dir: Path) -> dict[str, Any]:
@@ -240,6 +243,7 @@ def verify_image_present(image_tag: str) -> None:
     rc = subprocess.run(
         ["docker", "image", "inspect", image_tag],
         capture_output=True,
+        timeout=30,
     ).returncode
     if rc != 0:
         die(f"image not present locally: {image_tag}. Run scripts/utils/pin_images.sh.")
@@ -257,12 +261,13 @@ def teardown_container(name: str, log_path: Optional[Path] = None) -> None:
         capture_output=True,
         text=True,
         check=True,
+        timeout=30,
     )
     if name in result.stdout.split():
         log(f"removing existing container {name}")
         if log_path is not None:
             save_docker_logs(name, log_path)
-        subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True)
+        subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True, timeout=60)
 
 
 def build_docker_run_cmd(
@@ -293,6 +298,7 @@ def docker_inspect(container_name: str) -> dict:
         capture_output=True,
         text=True,
         check=True,
+        timeout=30,
     )
     arr = json.loads(result.stdout)
     return arr[0] if arr else {}
@@ -303,6 +309,7 @@ def get_container_pid(container_name: str) -> Optional[int]:
         ["docker", "inspect", "--format", "{{.State.Pid}}", container_name],
         capture_output=True,
         text=True,
+        timeout=30,
     )
     if result.returncode != 0:
         return None
@@ -336,6 +343,7 @@ def wait_for_readyz(url: str, timeout_s: int, container_name: str) -> None:
             ["docker", "ps", "--format", "{{.Names}}"],
             capture_output=True,
             text=True,
+            timeout=30,
         )
         if container_name not in result.stdout.split():
             die(f"container {container_name} exited during startup", rc=2)
@@ -508,8 +516,17 @@ def materialize_client_config(
     if "seed_template" in overrides:
         seed_str = overrides.pop("seed_template")
         overrides["seed"] = int(seed_str)
+    # One-level deep merge: a cell override `prompt_len: {median: 50}` should
+    # keep the base config's p95/min/max instead of silently dropping them.
     merged = dict(base_cfg)
-    merged.update(overrides)
+    for k, v in overrides.items():
+        base_v = merged.get(k)
+        if isinstance(base_v, dict) and isinstance(v, dict):
+            child = dict(base_v)
+            child.update(v)
+            merged[k] = child
+        else:
+            merged[k] = v
     out = run_dir / "client_config.yaml"
     out.write_text(yaml.safe_dump(merged, sort_keys=False))
     return out
@@ -760,7 +777,7 @@ def main() -> None:
     # 5. Start container.
     docker_cmd = build_docker_run_cmd(cell, container_name)
     log("docker run cmd: " + " ".join(docker_cmd))
-    result = subprocess.run(docker_cmd, capture_output=True, text=True)
+    result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         die(f"docker run failed rc={result.returncode}\nstderr: {result.stderr}")
     enable_abort_cleanup(container_name, log_dir)
@@ -893,7 +910,7 @@ def main() -> None:
             stop_subprocess(pid_daemon, "pid_daemon")
         save_docker_logs(container_name, log_dir / "docker.log")
         log(f"removing container {container_name}")
-        subprocess.run(["docker", "rm", "-f", container_name], check=False, capture_output=True)
+        subprocess.run(["docker", "rm", "-f", container_name], check=False, capture_output=True, timeout=60)
         disable_abort_cleanup()
 
         # 14. Wait for VRAM quiescence on the cell's GPU.

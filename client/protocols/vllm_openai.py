@@ -84,15 +84,14 @@ class VLLMOpenAIAdapter(ProtocolAdapter):
                             chunk = json.loads(data)
                         except json.JSONDecodeError:
                             continue
-                        if result.first_token_at_unix is None:
-                            result.first_token_at_unix = time.time()
-                        # Count only chunks that carry text to avoid usage-only frames.
+                        # Anchor TTFT to the first chunk that actually carries
+                        # generated text: usage-only frames (and empty-choices
+                        # framing chunks some builds emit) would otherwise bias
+                        # TTFT by tens of ms — a primary aging signal.
                         choices = chunk.get("choices") or []
-                        for c in choices:
-                            txt = c.get("text") or ""
-                            if txt:
-                                # Rough output token accounting: defer to usage if engine reports it.
-                                pass
+                        got_text = any((c.get("text") or "") for c in choices)
+                        if got_text and result.first_token_at_unix is None:
+                            result.first_token_at_unix = time.time()
                         usage = chunk.get("usage")
                         if usage:
                             actual_input_tokens = usage.get("prompt_tokens", actual_input_tokens)

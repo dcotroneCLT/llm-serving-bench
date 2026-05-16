@@ -110,9 +110,11 @@ class TritonVLLMAdapter(ProtocolAdapter):
                             obj = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        if result.first_token_at_unix is None:
-                            result.first_token_at_unix = time.time()
                         text = obj.get("text_output") or ""
+                        # Anchor TTFT to the first frame with actual text so
+                        # framing/heartbeat chunks do not bias the measurement.
+                        if text and result.first_token_at_unix is None:
+                            result.first_token_at_unix = time.time()
                         output_chars += len(text)
                     result.finished_at_unix = time.time()
                     # Char-based estimate, refined later by the orchestrator using the tokenizer.
