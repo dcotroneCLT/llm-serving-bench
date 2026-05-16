@@ -68,6 +68,15 @@ HEALTH_RATE_TOLERANCE="${HEALTH_RATE_TOLERANCE:-0.40}"
 HEALTH_OK_STATUSES="${HEALTH_OK_STATUSES:-ok success completed streamed_ok ok_streaming}"
 HEALTH_WARN_DROPPED_PCT="${HEALTH_WARN_DROPPED_PCT:-1}"
 HEALTH_FAIL_DROPPED_PCT="${HEALTH_FAIL_DROPPED_PCT:-5}"
+# Saturating cells (PyTorch naive) are calibrated at the operational ceiling
+# of the engine; some drops are by design. Per-cell overrides keep the
+# tighter 5%/1% rule for vLLM/Triton cells but allow e3/e3b to age before
+# tripping. ${!varname} indirect lookup resolves HEALTH_FAIL_DROPPED_PCT_E3
+# etc. at check time; falls back to the global default when unset.
+HEALTH_FAIL_DROPPED_PCT_E3="${HEALTH_FAIL_DROPPED_PCT_E3:-25}"
+HEALTH_FAIL_DROPPED_PCT_E3B="${HEALTH_FAIL_DROPPED_PCT_E3B:-25}"
+HEALTH_WARN_DROPPED_PCT_E3="${HEALTH_WARN_DROPPED_PCT_E3:-10}"
+HEALTH_WARN_DROPPED_PCT_E3B="${HEALTH_WARN_DROPPED_PCT_E3B:-10}"
 HEALTH_FATAL_GREP="${HEALTH_FATAL_GREP:-FATAL|Traceback|Exception|panic|out of memory|oom|oom-killer|CUDA out of memory}"
 # Container/engine stdout is noisy: vLLM/Triton legitimately emit Python
 # tracebacks for benign per-request errors. Apply a tighter regex there.
@@ -1065,10 +1074,15 @@ print('descendant' if pids & compute else 'no')
                 record WARN "${section}.client.errors" "error/timeout responses = ${err_pct}% (>5%); dropped=${n_dropped}/${n_total}"
             fi
             dropped_pct=$(awk -v d=$n_dropped -v t=$n_total 'BEGIN{printf "%.1f", 100*d/t}')
-            if awk -v p=$dropped_pct -v f=$HEALTH_FAIL_DROPPED_PCT 'BEGIN{exit !(p>f)}'; then
-                record FAIL "${section}.client.dropped" "dropped requests = ${dropped_pct}% > ${HEALTH_FAIL_DROPPED_PCT}%"
-            elif awk -v p=$dropped_pct -v w=$HEALTH_WARN_DROPPED_PCT 'BEGIN{exit !(p>w)}'; then
-                record WARN "${section}.client.dropped" "dropped requests = ${dropped_pct}% > ${HEALTH_WARN_DROPPED_PCT}%"
+            cell_upper=$(printf '%s' "$CELL_ID" | tr '[:lower:]' '[:upper:]')
+            fail_var="HEALTH_FAIL_DROPPED_PCT_${cell_upper}"
+            warn_var="HEALTH_WARN_DROPPED_PCT_${cell_upper}"
+            fail_threshold="${!fail_var:-$HEALTH_FAIL_DROPPED_PCT}"
+            warn_threshold="${!warn_var:-$HEALTH_WARN_DROPPED_PCT}"
+            if awk -v p=$dropped_pct -v f=$fail_threshold 'BEGIN{exit !(p>f)}'; then
+                record FAIL "${section}.client.dropped" "dropped requests = ${dropped_pct}% > ${fail_threshold}% (cell=${CELL_ID})"
+            elif awk -v p=$dropped_pct -v w=$warn_threshold 'BEGIN{exit !(p>w)}'; then
+                record WARN "${section}.client.dropped" "dropped requests = ${dropped_pct}% > ${warn_threshold}% (cell=${CELL_ID})"
             fi
         fi
     fi
