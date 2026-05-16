@@ -1,12 +1,23 @@
-# Running a 24-hour aging experiment
+# Running a Containerized Aging Experiment
 
 This document codifies the launch procedure for any aging run that
-targets a *containerized* serving engine. It is the result of the
-2026-05-12/13 ablation runs where a static PID-capture broke the
-per-process indicators (see [README.md](README.md) for context).
+targets a *containerized* serving engine. The production WoSAR 2026 path
+is `scripts/campaign.py` -> `scripts/launch_cell.py`; this file is the
+manual/debug runbook for operating the same components by hand.
 
-The procedure uses four independent tmux sessions so each component
-can be inspected or restarted in isolation.
+The dynamic PID-tracking requirement comes from the 2026-05-12/13
+ablation runs, where a static PID capture broke the per-process
+indicators for the rest of the run.
+
+The manual procedure uses four independent tmux sessions so each
+component can be inspected or restarted in isolation.
+
+For production, prefer:
+
+```
+python3 scripts/campaign.py --campaign-yaml campaigns/wosar2026/campaign.yaml --start
+python3 scripts/campaign.py --campaign-yaml campaigns/wosar2026/campaign.yaml --resume
+```
 
 ## Components
 
@@ -29,9 +40,9 @@ that matches the engine generation you are testing.
 
 | Engine                                         | Pattern                            | Notes                                              |
 | ---------------------------------------------- | ---------------------------------- | -------------------------------------------------- |
-| Triton 25.09 + vLLM V1 (VLLM_USE_V1=1)         | `EngineCore`                       | V1's dedicated async engine subprocess             |
-| vLLM v0.7.3 standalone (V0 engine, mp backend) | `spawn_main`                       | The multiprocessing worker hosting V0              |
-| Triton + in-process V0 (e.g. our E2 baseline)  | `triton_python_backend_stub`       | V0 ran inside the Triton Python backend, no spawn  |
+| Triton 25.09 + vLLM V1 (`a2`)                  | `EngineCore`                       | V1's dedicated async engine subprocess             |
+| vLLM v0.7.3 standalone (`a1`)                  | `spawn_main`                       | Multiprocessing worker hosting V0                  |
+| Triton + in-process V0 (`e2`)                  | `triton_python_backend_stub`       | V0 runs inside the Triton Python backend           |
 
 If you add a new engine generation, identify the pattern by hand once:
 
@@ -83,12 +94,12 @@ worker PID.
 
 ```
 mkdir -p <run_dir>
-python monitoring/find_engine_pid.py \
+python3 monitoring/find_engine_pid.py \
   --container-name <engine_container> \
   --process-pattern <pattern_from_table_above> \
   --pidfile <run_dir>/engine.pid \
   --poll-seconds 30 \
-  --duration-seconds 86400
+  --duration-seconds 129600
 ```
 
 The script writes each resolved PID atomically to `<run_dir>/engine.pid`
@@ -99,12 +110,12 @@ resolution event.
 ### Session 3 — host monitors
 
 ```
-python monitoring/run_monitors.py \
+python3 monitoring/run_monitors.py \
   --run-id <run_id> \
   --runs-root <runs_root> \
   --gpu-index <gpu_index> \
   --pidfile <run_dir>/engine.pid \
-  --duration-seconds 86400 \
+  --duration-seconds 129600 \
   --label-engine <engine_label>
 ```
 
@@ -115,13 +126,17 @@ proc-monitor CSV (e.g. `triton_v1`, `vllm_v0`).
 ### Session 4 — client
 
 ```
-python client/run_client.py \
+python3 client/run_client.py \
   --config <config.yaml> \
   --output-dir <run_dir>/client \
-  --duration-seconds 86400
+  --duration-seconds 129600
 ```
 
 The client config specifies target RPS, prompt corpus, and protocol.
+
+For WoSAR 2026, the same duration value is stored in every production
+cell YAML as `duration_s: 129600`, and the analysis warmup discard is
+stored as `warmup_discard_s: 3600`.
 
 ## Validation, first 5 minutes
 
@@ -147,6 +162,27 @@ causes are:
   the worker from the host `/proc`. This is rare with the standard
   `docker run` invocations above but can happen with custom
   `--security-opt` flags.
+
+## Production Validation
+
+Before a real 36h slot, run the campaign smoke gate:
+
+```
+bash scripts/smoke_test.sh campaigns/wosar2026/cells/<cell_id>.yaml
+```
+
+After a completed run, check the self-contained run directory:
+
+```
+python3 analysis/validation_check.py --run-dir <run_dir>
+python3 analysis/aging_trends.py <run_dir> --alpha 0.10 --downsample-seconds 60
+```
+
+For campaign figures:
+
+```
+python3 analysis/plot_rss_2x2.py --campaign-yaml campaigns/wosar2026/campaign.yaml --runs-root <runs_root> --replicas all
+```
 
 ## Why a static PID is not enough
 

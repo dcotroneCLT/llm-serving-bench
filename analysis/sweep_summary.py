@@ -1,7 +1,7 @@
 """Quick summary of a single rate-sweep run.
 
 Usage:
-    python analysis/sweep_summary.py <run_dir>
+    python3 analysis/sweep_summary.py <run_dir>
 
 Where <run_dir> is a directory containing requests_*.csv files produced
 by the benchmark client. Prints request counts, effective RPS, latency

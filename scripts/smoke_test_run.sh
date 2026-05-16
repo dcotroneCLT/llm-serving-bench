@@ -12,7 +12,7 @@
 #     replica_n  : 1|2|3 (replica index for the long run; used only for naming)
 #
 # Exit codes:
-#   0  GO   : all hard checks PASS. Safe to launch the 24h/36h run.
+#   0  GO   : all hard checks PASS. Safe to launch the 36h production run.
 #   1  NO-GO: at least one hard check FAILED. Details printed.
 #
 # This script is INDEPENDENT of campaign.py and launch_cell.py. It is meant

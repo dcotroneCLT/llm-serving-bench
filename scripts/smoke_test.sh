@@ -113,18 +113,44 @@ if [ -n "$STALE_LOCKS" ]; then
   fi
 fi
 
-# Host port availability for the cell's ports. Parse the cell yaml.
+# Host port availability for the cell's ports. Parse the cell yaml via
+# Python so we do not rely on fragile awk range patterns (the previous
+# awk attempt failed because the start line ITSELF matches the end
+# pattern, exiting the range immediately and producing an empty list).
 echo "[smoke]   checking host ports for cell..."
-PORTS_TO_CHECK=$(awk '/^  port_mapping:/,/^  [a-z]/' "$CELL_YAML" | \
-                 grep -oE '"[0-9]+:[0-9]+"' | cut -d: -f1 | tr -d '"' || true)
-for port in $PORTS_TO_CHECK; do
-  if ss -tlnp 2>/dev/null | grep -qE ":${port}\s"; then
-    echo "[smoke]   HARD FAIL: host port $port is in use:"
-    ss -tlnp 2>/dev/null | grep -E ":${port}\s"
-    exit 1
-  fi
-done
-echo "[smoke]   ports OK: $PORTS_TO_CHECK"
+# Ensure we have a yaml-capable python available BEFORE conda activate.
+# The wosar env python has PyYAML; fall back to system python3 if needed.
+WOSAR_PY="$HOME/miniconda3/envs/wosar/bin/python"
+if [ -x "$WOSAR_PY" ]; then
+  YAML_PY="$WOSAR_PY"
+else
+  YAML_PY=$(command -v python3)
+fi
+PORTS_TO_CHECK=$("$YAML_PY" - "$CELL_YAML" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    cell = yaml.safe_load(f)
+ports = []
+for p in cell.get("engine", {}).get("port_mapping", []) or []:
+    # Port mapping format "HOST:CONTAINER"; take the host side.
+    host = str(p).split(":", 1)[0].strip().strip('"')
+    if host:
+        ports.append(host)
+print(" ".join(ports))
+PY
+)
+if [ -z "$PORTS_TO_CHECK" ]; then
+  echo "[smoke]   WARN: no port_mapping parsed from $CELL_YAML; skipping port check."
+else
+  for port in $PORTS_TO_CHECK; do
+    if ss -tlnp 2>/dev/null | grep -qE ":${port}\s"; then
+      echo "[smoke]   HARD FAIL: host port $port is in use:"
+      ss -tlnp 2>/dev/null | grep -E ":${port}\s"
+      exit 1
+    fi
+  done
+  echo "[smoke]   ports OK: $PORTS_TO_CHECK"
+fi
 
 # Ensure wosar conda env is active (idempotent).
 if [ -z "${CONDA_DEFAULT_ENV:-}" ] || [ "$CONDA_DEFAULT_ENV" != "wosar" ]; then

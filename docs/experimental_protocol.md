@@ -1,115 +1,243 @@
-# Experimental Protocol: Aging in LLM Serving Engines on GPU
+# Experimental Protocol: Software Aging in LLM Serving on GPU
 
-WoSAR 2026 submission. Working document, v0.1.
+WoSAR 2026 submission. Working document, v0.2.
 
-## 1. Research questions
+## 1. Research Questions
 
-RQ1. Do modern LLM serving engines exhibit statistically significant aging signatures under sustained, accelerated stress on GPU?
+RQ1. Do modern LLM serving stacks exhibit statistically significant
+software-aging signatures under sustained GPU inference workloads?
 
-RQ2. Do the signatures differ qualitatively across engines with different memory-management architectures, and on which indicators?
+RQ2. How do the signatures differ across engine generation, hosting
+layer, and naive baseline implementations?
 
-RQ3. Which classical SAR effect categories remain relevant in this setting, and which novel categories emerge that call for indicators not currently part of the SAR vocabulary?
+RQ3. Which indicators are most informative for GPU-era software aging,
+and where do classical SAR categories need to be extended?
 
-## 2. System under test
+## 2. Campaign Under Test
 
-Three configurations, each run on a dedicated NVIDIA L40 (46 GB usable VRAM).
+The production campaign is described by
+`campaigns/wosar2026/campaign.yaml`. Each cell YAML is the single source
+of truth for image tag, digest pin, GPU assignment, workload target,
+monitor labels, duration, warmup discard, and cooldown.
 
-C1. PyTorch + HuggingFace Transformers, served via a minimal FastAPI/uvicorn loop. No continuous batching, naive caching allocator, single-request processing with a small request queue. Represents the unoptimized baseline.
+Model. All production cells serve `Qwen/Qwen2.5-7B-Instruct` in BF16.
+The model scale fits comfortably on one L40S while leaving enough VRAM
+for KV-cache and allocator dynamics to be visible.
 
-C2. vLLM stand-alone, default configuration. PagedAttention, continuous batching, vLLM's own memory manager. Represents the state-of-the-art LLM-specialized engine.
+Hardware. Server `cci-csgpu11`, 4 x NVIDIA L40S, 256 GB RAM, Ubuntu
+24.04 LTS. Production runs use three parallel GPU slots; GPU assignment
+is fixed by the cell YAML and inherited by the GPU monitor.
 
-C3. NVIDIA Triton Inference Server with vLLM backend. Same vLLM core as C2, wrapped by Triton's request scheduling, dynamic batching layer, and HTTP/gRPC frontend. Isolates the effect of the serving wrapper at fixed engine.
+Software. Engine images are locally tagged with `wosar2026_*` and
+recorded via image-pin JSON files. The run manifest stores the resolved
+image digest and Docker command for provenance.
 
-Hardware. Server with 4 x NVIDIA L40 (46 GB VRAM each), 256 GB RAM, Ubuntu. C1, C2, C3 run in parallel on GPU 0, 1, 2 respectively. GPU 3 reserved for pilots, sensitivity, and recovery from failed runs.
+## 3. Experimental Cells
 
-Software. CUDA driver and runtime versions to be pinned and reported. vLLM, Triton, PyTorch, Transformers versions pinned via Docker images for reproducibility. Same Python and CUDA versions across the three configurations to the extent possible; deviations to be documented.
+The current production matrix has six cells:
 
-## 3. Models
+| Cell | Serving stack | Purpose |
+| ---- | ------------- | ------- |
+| `e1` | vLLM standalone, V1 engine | Production vLLM baseline |
+| `a1` | vLLM standalone, V0 engine | Engine-generation ablation |
+| `e2` | Triton + vLLM backend, V0 engine | Hosting-layer baseline |
+| `a2` | Triton + vLLM backend, V1 engine | Hosting x generation ablation |
+| `e3` | PyTorch + HuggingFace naive server | Unoptimized baseline |
+| `e3b` | PyTorch naive, lower offered rate | Rate-sensitivity ablation |
 
-Primary: Llama-3-8B-Instruct, BF16. Supported as a first-class citizen by all three engines, well-known baseline in serving literature.
-
-Sensitivity: Qwen2.5-7B-Instruct, BF16. Same parameter scale, different family and tokenizer, to test generalization of findings.
-
-Rationale for staying at 7-8B. With 46 GB per GPU, an 8B model in BF16 occupies roughly 16 GB for weights, leaving ~30 GB for KV-cache and activations. This headroom is the resource we want to stress; loading larger models would saturate VRAM with weights and mask the memory-management phenomena we aim to study.
+The core 2x2 factorial is `e1`, `a1`, `e2`, `a2`, crossing vLLM engine
+generation (V0/V1) with hosting layer (standalone/Triton). `e3` and
+`e3b` provide the naive baseline and a rate-sensitivity check.
 
 ## 4. Workload
 
-Accelerated stress workload, constant in time. Workload shift is intentionally excluded from this paper (already covered by Moura, Nascimento, Machida, Andrade, arXiv 2511.03103).
+The workload is constant in time and uses a Poisson arrival process.
+Each cell's target RPS is calibrated from saturation sweeps and stored
+as `workload.client_config_overrides.target_rate_rps` in the cell YAML.
+The default aging target is 85% of the last sustainable effective RPS.
 
-Request rate. Calibrated per-engine in pilot at 85% of measured saturation throughput. Each engine is stressed relative to its own ceiling, not in absolute terms; this is a deliberate methodological choice and will be declared explicitly in the paper.
+Client configuration is generated by `scripts/launch_cell.py` from the
+cell YAML. Production settings include:
 
-Prompt length distribution. Skewed toward long prompts to stress KV-cache: median 1500 tokens, P95 around 3500, capped at the model context window minus 512 to leave room for generation. Sampled from a curated mix of long-form sources (arXiv abstracts, news articles, code snippets) to avoid degenerate repetition.
+- Protocol matched to the engine (`vllm_openai`, `triton_vllm`, or the
+  naive PyTorch endpoint).
+- 70% streaming requests.
+- Per-replica arrival-process seed.
+- Concurrency cap and request timeout fixed per cell.
+- Per-request CSV logging under `<run_dir>/client/`.
 
-Output length distribution. Variable, sampled from a truncated log-normal with median 200 tokens and P95 around 800, to exercise both short- and long-generation paths.
+Rate sweeps are summarized with `analysis/sweep_curve.py`; the
+recommended aging rate is then copied into the corresponding cell YAML.
 
-Streaming/non-streaming mix. 70/30 streaming to non-streaming, to exercise both response paths.
+## 5. Run Plan
 
-Client. Asynchronous Python client (httpx + asyncio), running on a separate machine on the same LAN to avoid contaminating server-side measurements with client-side aging. State persisted to disk every minute so it can be restarted without losing progress.
+Production replication:
 
-## 5. Run plan
+- 6 cells.
+- 3 replicas per cell.
+- 18 production runs total.
+- 36h measured aging window per run (`duration_s=129600`), starting
+  after the engine readiness probe passes.
+- 1h warmup discard (`warmup_discard_s=3600`) for slope estimation and
+  RSS/VMS figure normalization.
+- 600s post-run cooldown, plus VRAM baseline quiescence check.
 
-Phase 1 (days 1-3). Setup, model verification, monitoring scripts, client implementation.
+Campaign topology:
 
-Phase 2 (day 3). Pilot runs, 2-3 hours per engine, parallel on three GPUs. Outputs: saturation throughput per engine, validated monitoring stack, request-rate calibration.
+- Slot `gpu0`: `e1`, `a1`.
+- Slot `gpu1`: `e2`, `a2`.
+- Slot `gpu2`: `e3`, `e3b`.
+- Within each slot, runs execute round-robin by replica so day-to-day
+  environmental drift is shared across cells.
 
-Phase 3 (days 4-7). Primary campaign. Llama-3-8B on C1, C2, C3 in parallel. Three replicates of 24 hours each. Total: 9 run-days in ~4 calendar days.
+The campaign orchestrator checkpoints every run in
+`campaigns/wosar2026/state/campaign_state.json` and retries each failed
+run once. A 6h E2-on-GPU0 sanity run is scheduled after the main
+campaign to assess GPU-index sensitivity.
 
-Phase 4 (days 8-11). Sensitivity campaign. Qwen2.5-7B, same structure, three replicates of 24 hours. Same total.
+## 6. Launch Procedure
 
-Phase 5 (days 12-14). Buffer for re-runs, full statistical analysis, paper drafting kickoff.
+Before production, run the smoke gate for each cell:
 
-## 6. Measurement instrumentation
+```bash
+bash scripts/smoke_test.sh campaigns/wosar2026/cells/e1.yaml
+```
 
-System level (sampling 5 s). Free physical memory, swap usage, file descriptor count, thread count, CPU utilization. Tool: collectl + custom /proc readers.
+Preview the campaign schedule:
 
-Process level (sampling 5 s). RSS, VSS of the serving process. Python-level heap and live tensor counts where engine cooperates. Tool: psutil keyed on engine PID.
+```bash
+python3 scripts/campaign.py \
+  --campaign-yaml campaigns/wosar2026/campaign.yaml \
+  --dry-run
+```
 
-GPU level (sampling 1 s). Per GPU: VRAM allocated, VRAM reserved, fragmentation proxy = (reserved - allocated) / reserved, GPU utilization, SM occupancy, memory bandwidth utilization, temperature. Tool: pynvml + torch.cuda.memory_stats() for the PyTorch-based engines, augmented with engine-native metrics where available (vLLM Prometheus endpoint exposes KV-cache block usage, preemption count, num_running, num_waiting; Triton exposes queue depth, batcher stats).
+Launch or resume:
 
-Application level (per request). Time-to-first-token, inter-token-latency, end-to-end latency, input and output token counts, error code if any. Logged by the client; throughput aggregated post-hoc.
+```bash
+python3 scripts/campaign.py \
+  --campaign-yaml campaigns/wosar2026/campaign.yaml \
+  --start
 
-Storage. All metrics streamed to local Parquet files with 1-minute rotation, plus a backup mirror on a second disk. Sufficient given the modest data volume (well under 100 MB per run-day).
+python3 scripts/campaign.py \
+  --campaign-yaml campaigns/wosar2026/campaign.yaml \
+  --resume
+```
 
-## 7. Statistical analysis
+`scripts/launch_cell.py` is the lower-level single-run launcher used by
+the orchestrator. It starts the container, resolves the engine PID,
+spawns monitors and client, supervises the run, tears down the
+container, waits for VRAM quiescence, and finalizes the manifest.
 
-Per indicator, per engine, per run.
+## 7. Measurement Instrumentation
 
-Preprocessing. Discard the first 60 minutes (warm-up: JIT, KV-cache fill, first GC cycles). Downsample by minute-level mean for trend tests; keep raw for tail analysis.
+All monitors write rotating CSVs into the run directory.
 
-Trend tests. Modified Mann-Kendall with Hamed-Rao correction for autocorrelation (system-monitoring time series are strongly autocorrelated; vanilla MK over-rejects). Significance threshold p < 0.01 to be conservative.
+System level, every 5s. Host memory, swap, load, CPU, and file
+descriptor indicators via `monitoring/system_monitor.py`.
 
-Effect size. Sen's slope with 95% confidence interval via bootstrap (10000 resamples).
+Process level, every 5s. Engine worker RSS, VMS, USS, PSS, threads,
+FDs, CPU, context-switch rates, I/O counters, and child count via
+`monitoring/proc_monitor.py`. For Triton/vLLM children, the dynamic PID
+tracker keeps `engine.pid` pointed at the live backend worker.
 
-Cross-engine comparison. Two engines are considered to differ on a given indicator iff the 95% CIs of their Sen's slopes do not overlap. Same approach as Andrade et al. (LLM aging on CPU, JSS 2025); ensures direct methodological comparability.
+GPU level, every 1s. VRAM, utilization, temperature, power draw, clocks,
+and ECC counters via `monitoring/gpu_monitor.py`.
 
-Replicate aggregation. Each engine x indicator yields 3 slope estimates. Report median slope and the union/intersection of the three CIs; flag indicators where replicates disagree as candidates for additional discussion.
+Application level, per request. Status, HTTP status, queue time, TTFT,
+end-to-end latency, inter-token latency, requested tokens, actual input
+tokens, and actual output tokens via `client/run_client.py`.
 
-## 8. Risks and mitigations
+Run metadata. `manifest.json` records campaign id, cell id, replica,
+host facts, git SHA, image digest, Docker command, engine config,
+monitor config, workload config, duration, warmup, and interruption
+status.
 
-R1. Setup complexity for Triton+vLLM. Mitigation: use NGC pre-built containers (nvcr.io/nvidia/tritonserver:<ver>-vllm-python-py3), no custom builds.
+## 8. Statistical Analysis
 
-R2. Workload-rate calibration error. If 85% of saturation is too aggressive and an engine collapses mid-run, the run is wasted. Mitigation: pilot enforces sustained 2-hour stability at the chosen rate before phase 3 begins; if any engine fails, lower target to 75% globally for fairness.
+Primary per-run trend analysis is implemented by
+`analysis/aging_trends.py`.
 
-R3. Single-point monitoring failures. nvidia-smi can hang; pynvml can deadlock under heavy contention. Mitigation: monitoring agent runs in a separate process with a watchdog and a 30-second sample timeout that emits a sentinel value rather than blocking.
+Preprocessing:
 
-R4. Disk saturation. 24-hour runs at 1 Hz GPU sampling produce manageable volumes, but logs from the engines themselves can balloon. Mitigation: log rotation enforced via journald, with size caps; pre-flight disk check before each run.
+- Load and concatenate rotating CSVs.
+- Filter process samples to `process_alive=True`.
+- Discard the configured warmup window.
+- Downsample monitor indicators by time window, default 60s.
+- Compute client latency percentiles and token throughput per window.
 
-R5. Client-side aging contaminating measurements. Mitigation: client on separate LAN-attached machine; client process restarted at every replicate boundary; client-side metrics logged and inspected for drift as a sanity check.
+Trend testing:
 
-## 9. Deliverable structure (forward-look at the paper)
+- Hamed-Rao-corrected Mann-Kendall test for autocorrelated time series.
+- Sen slope per hour with confidence interval based on pairwise slope
+  order statistics and an AR(1) variance-inflation correction.
+- Benjamini-Hochberg FDR correction across indicators.
+- A trend is significant when the adjusted q-value is below `alpha` and
+  the Sen confidence interval excludes zero.
 
-Section 1, Introduction. Frame: SAR has matured on classical systems; LLM serving on GPU is a new frontier with its own memory-management primitives that have not yet been studied through an aging lens.
+Figure generation:
 
-Section 2, Background and related work. Concise SAR primer pointing to the canon; recent LLM-aging work (Andrade et al. JSS 2025; Santos, Andrade, Natella arXiv 2510.24188; Moura et al. arXiv 2511.03103) and gap statement on the GPU side.
+- `analysis/plot_rss_2x2.py` for factorial RSS deltas.
+- `analysis/plot_rss_combined.py` for the combined RSS and RSS/VMS
+  lock-step figure.
+- `analysis/diagnose_step_patterns.py` for RSS vs VMS, CPU, request
+  rate, and voluntary context-switch diagnostics.
 
-Section 3, Experimental design. From this protocol.
+## 9. Integrity Checks
 
-Section 4, Results. Per-RQ structure. RQ1 establishes presence of aging in all three configurations; RQ2 contrasts signatures; RQ3 reads off the indicators that traditional SAR vocabulary does not cover.
+Before long runs:
 
-Section 5, Discussion: open challenges for SAR research in LLM serving systems. The core message of the paper. Three to four open problems framed as a research agenda for the community.
+- `scripts/smoke_test.sh` checks image identity, readiness, GPU binding,
+  client success, monitor output, and RSS magnitude.
+- `scripts/smoke_test_run.sh` is the older independent GO/NO-GO gate
+  retained for manual checks.
 
-Section 6, Threats to validity. Single hardware platform, two models, fixed workload, version-pinned engines.
+After runs:
+
+- `analysis/validation_check.py` verifies required files, duration,
+  process liveness, RSS trend, client successes, and clean teardown.
+- Inspect `manifest.json` for `interrupted_early=false`.
+- Inspect monitor logs under `<run_dir>/logs/` if any subprocess exits
+  early.
+
+## 10. Risks and Mitigations
+
+R1. Monitoring the wrong PID. Mitigation: PID strategy is encoded in
+the cell YAML. Triton child workers use `find_engine_pid.py`; standalone
+single-process cells use `container_pid1`.
+
+R2. GPU assignment drift. Mitigation: `launch_cell.py` verifies the
+container PID appears in compute apps for the configured GPU before the
+aging timer starts.
+
+R3. Workload-rate calibration error. Mitigation: saturation sweeps feed
+cell-specific target rates; smoke tests catch collapse before 36h runs.
+
+R4. Driver or container drift. Mitigation: local image tags and digest
+pin files; host driver/toolkit version pinning documented in ADR 002.
+
+R5. Environmental drift across days. Mitigation: round-robin ordering
+within each GPU slot and n=3 replication.
+
+R6. Resource quiescence between runs. Mitigation: post-run cooldown and
+VRAM baseline quiescence check before starting the next run on a slot.
+
+## 11. Paper Mapping
+
+Section 1, Introduction. Software aging in GPU-era LLM serving.
+
+Section 2, Background and related work. SAR foundations and recent LLM
+aging work.
+
+Section 3, Experimental design. Campaign cells, workload, monitoring,
+and statistical protocol.
+
+Section 4, Results. Per-RQ presentation of slopes, significance, and
+cross-cell differences.
+
+Section 5, Discussion. Implications for SAR indicators and serving
+engine design.
+
+Section 6, Threats to validity. Single server, one primary model,
+fixed workload, image pins, and GPU-index sanity check.
 
 Section 7, Conclusion.
-
-Target length: 7 pages, full paper track.

@@ -39,7 +39,7 @@ The run directory is fully self-contained after launch_cell.py exits:
 
 Invocation:
 
-  python scripts/launch_cell.py \
+  python3 scripts/launch_cell.py \
       --cell-yaml campaigns/wosar2026/cells/e1.yaml \
       --replica 1 \
       --runs-root /home/dcotrone/wosar/runs \

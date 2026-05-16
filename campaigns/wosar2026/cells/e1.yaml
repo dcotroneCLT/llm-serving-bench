@@ -57,7 +57,7 @@ engine:
     - "{hf_cache_host}:/root/.cache/huggingface"
 
   # Readiness gate. The cell timer (duration_s) starts AFTER the engine
-  # passes this check; cold loads do not eat into the 24h aging window.
+  # passes this check; cold loads do not eat into the 36h aging window.
   readyz:
     url: "http://localhost:8100/health"
     timeout_s: 600
@@ -102,12 +102,12 @@ workload:
     seed_template: "{replica}"
 
 # Run-level timing knobs.
-#   duration_s: 24h aging window, starts after readyz passes.
+#   duration_s: 36h aging window, starts after readyz passes.
 #   warmup_discard_s: first hour of metrics excluded from slope estimation
 #                     (matches paper protocol; not enforced by the
 #                     run, only by the analysis pipeline).
 #   post_run_cooldown_s: time between container teardown and the next
 #                       run on the same GPU, for VRAM/RSS quiescence.
-duration_s: 86400
+duration_s: 129600
 warmup_discard_s: 3600
 post_run_cooldown_s: 600

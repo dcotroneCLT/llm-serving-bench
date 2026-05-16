@@ -1,6 +1,6 @@
 # ADR 001: Choice of serving engines
 
-Status: accepted
+Status: accepted; amended for WoSAR 2026 campaign
 Date: 2026-05-05
 
 ## Context
@@ -16,11 +16,25 @@ NVIDIA L40 GPUs).
 
 ## Decision
 
-Three configurations selected:
+Three base configurations selected:
 
 C1. PyTorch + HuggingFace Transformers, served via a minimal FastAPI loop.
 C2. vLLM stand-alone, default configuration.
 C3. NVIDIA Triton Inference Server with vLLM backend.
+
+For the WoSAR 2026 production campaign, this base decision is expanded
+into six cells:
+
+- `e1`: vLLM standalone, V1 engine.
+- `a1`: vLLM standalone, V0 engine.
+- `e2`: Triton + vLLM backend, V0 engine.
+- `a2`: Triton + vLLM backend, V1 engine.
+- `e3`: PyTorch + HuggingFace naive server.
+- `e3b`: PyTorch naive at lower offered rate.
+
+The 2x2 factorial (`e1`, `a1`, `e2`, `a2`) crosses engine generation
+with hosting layer. The PyTorch cells retain the original naive
+baseline role and add a rate-sensitivity ablation.
 
 ## Rationale
 
@@ -57,7 +71,8 @@ the paper can make and defend:
 
 - The setup of C3 relies on the official NGC pre-built container with the
   vLLM backend, avoiding custom builds.
-- The vLLM core in C2 and C3 must be the same version, pinned and
-  declared in the paper, otherwise the C2 vs C3 comparison is confounded.
+- The vLLM generation used by each cell must be pinned and declared in
+  the paper. The C2/C3-style comparison is now expressed explicitly by
+  the factorial cells rather than by assuming a single shared vLLM core.
 - Future work can add a fourth configuration (e.g., Triton +
   TensorRT-LLM) without invalidating the present results.

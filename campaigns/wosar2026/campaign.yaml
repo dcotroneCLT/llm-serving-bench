@@ -9,13 +9,15 @@
 # Topology C (3-way parallel across GPU 0, 1, 2). Each GPU runs 6 runs
 # sequentially (3 cells x 2 cells per GPU, kept as in the n=1 baseline
 # except for E2 which moves from GPU 0 to GPU 1 to balance across GPUs).
-# Calendar: max(6, 6, 6) sequential runs per GPU = 6 days at ~26h/run
-# wallclock (24h aging + 1h startup + 1h cooldown).
+# Calendar: max(6, 6, 6) sequential runs per GPU = 9.5 days at ~38h/run
+# wallclock (36h aging + 1h startup + 1h cooldown).
 
 campaign_id: wosar2026
 description: |
   Clean n=3 replication campaign for the WoSAR 2026 submission.
   18 runs total, 6 cells x 3 replicas, 3-way parallel across GPUs 0/1/2.
+  Each cell runs for 36h (duration_s=129600 in cell yamls), plus ~2h
+  startup + cooldown overhead. Calendar: ~9.5 days with the 3-slot topology.
 
 # Cell yaml paths, relative to this file.
 cells:
@@ -73,7 +75,7 @@ sanity_runs:
   - cell: e2
     replica_id: sanity_gpu0
     gpu_device_override: 0
-    duration_s_override: 21600     # 6h instead of 24h
+    duration_s_override: 21600     # 6h sanity probe (vs 36h production runs)
 
 # Runs root. Each (cell, replica) gets a subdirectory
 # <runs_root>/<campaign_id>_<cell_id>_r<NN>/
@@ -86,8 +88,6 @@ paths:
   repo_root: /home/dcotrone/wosar/llm-serving-bench
 
 # Where checkpoint state lives. campaign.py reads it on startup; if
-# present, it resumes from the last completed run.
+# present, it resumes from the last completed run. The file is written
+# atomically (write-then-rename) so a crash mid-write does not corrupt it.
 state_file: state/campaign_state.json
-
-# tmux session naming. campaign.py creates one session per slot.
-tmux_session_template: "wosar2026_{slot_name}"

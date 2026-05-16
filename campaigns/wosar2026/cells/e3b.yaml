@@ -66,6 +66,6 @@ workload:
     request_timeout_s: 600
     seed_template: "{replica}"
 
-duration_s: 86400
+duration_s: 129600
 warmup_discard_s: 3600
 post_run_cooldown_s: 600

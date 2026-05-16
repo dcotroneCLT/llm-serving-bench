@@ -10,7 +10,8 @@ Topology comes from campaign.yaml. For the WoSAR 2026 campaign:
   slot gpu2: cells [e3, e3b] -> 6 runs sequentially on GPU 2
 
 Slots run in parallel; runs within a slot run sequentially. Calendar:
-max(per-slot sequential time) = 6 runs * ~26h = ~6.5 days.
+max(per-slot sequential time) = 6 runs * ~38h = ~9.5 days
+(36h aging + startup/cooldown overhead).
 
 Checkpointing:
 
@@ -32,22 +33,22 @@ Sanity runs:
 
 Usage:
 
-  python scripts/campaign.py \
+  python3 scripts/campaign.py \
       --campaign-yaml campaigns/wosar2026/campaign.yaml \
       --dry-run                  # print schedule and exit
 
-  python scripts/campaign.py \
+  python3 scripts/campaign.py \
       --campaign-yaml campaigns/wosar2026/campaign.yaml \
       --start
 
-  python scripts/campaign.py \
+  python3 scripts/campaign.py \
       --campaign-yaml campaigns/wosar2026/campaign.yaml \
       --resume                   # pick up from state file
 
 Recommended deployment:
 
   tmux new -d -s wosar_campaign \\
-      'python scripts/campaign.py --campaign-yaml ... --start \\
+      'python3 scripts/campaign.py --campaign-yaml ... --start \\
            > /home/dcotrone/wosar/runs/campaign.log 2>&1'
 
   Survives ssh disconnect. Reattach: `tmux attach -t wosar_campaign`.
@@ -250,7 +251,13 @@ class SlotWorker(threading.Thread):
     def _persist_state(self) -> None:
         with self.state_lock:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(json.dumps(self.state.to_dict(), indent=2))
+            # Atomic write: write to tmp file then rename, so a crash
+            # mid-write does not leave campaign_state.json half-written.
+            # On the same filesystem, rename(2) is atomic.
+            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self.state.to_dict(), indent=2))
+            import os as _os
+            _os.replace(tmp, self.state_path)
 
     def _run_one(self, spec: RunSpec) -> int:
         status = self.state.runs.setdefault(spec.run_key, RunStatus())

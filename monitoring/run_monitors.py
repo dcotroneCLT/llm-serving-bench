@@ -2,12 +2,12 @@
 
 Usage:
 
-  python run_monitors.py \\
+  python3 monitoring/run_monitors.py \\
       --run-id pilot_vllm_replicate1 \\
       --runs-root ./runs \\
       --gpu-index 1 \\
       --pidfile ./runs/pilot_vllm_replicate1/engine.pid \\
-      --duration-seconds 86400 \\
+      --duration-seconds 129600 \\
       --label-engine vllm_standalone
 
 The orchestrator creates a fresh subdirectory under runs-root/run-id and
@@ -122,7 +122,7 @@ def main() -> None:
     p.add_argument("--runs-root", type=Path, required=True)
     p.add_argument("--gpu-index", type=int, required=True)
     p.add_argument("--pidfile", type=Path, required=True, help="File where the engine's PID will appear.")
-    p.add_argument("--duration-seconds", type=int, default=86400, help="Monitoring duration; 0 means run forever until signaled.")
+    p.add_argument("--duration-seconds", type=int, default=129600, help="Monitoring duration in seconds (default 36h to match the WoSAR 2026 campaign duration_s); 0 means run forever until signaled.")
     p.add_argument("--label-engine", type=str, required=True, help="Engine label for the proc monitor CSV name.")
     p.add_argument("--gpu-period", type=float, default=1.0)
     p.add_argument("--proc-period", type=float, default=5.0)
@@ -174,12 +174,19 @@ def main() -> None:
             # nosuid /home (which disables file capabilities for python),
             # the only practical path is sudo. We invoke proc_monitor.py
             # via sudo -n with a NOPASSWD entry in /etc/sudoers.d/.
-            # The CsvRotatingWriter chmods/chowns its output files so
-            # the resulting CSVs are readable by the original (non-root)
-            # user under SUDO_USER.
+            #
+            # Use realpath(sys.executable) so the path passed to sudo matches
+            # the sudoers entry regardless of how Python was invoked: sudo
+            # path matching is strict and does NOT follow symlinks, so
+            # /home/.../envs/wosar/bin/python (symlink) would not match an
+            # entry for /home/.../envs/wosar/bin/python3.11 (the real binary).
+            #
+            # The CsvRotatingWriter chmods/chowns its output files so the
+            # resulting CSVs are readable by the original (non-root) user
+            # under SUDO_USER.
             [
                 "sudo", "-n", "--",
-                sys.executable,
+                os.path.realpath(sys.executable),
                 str(here / "proc_monitor.py"),
                 "--pidfile",
                 str(args.pidfile),

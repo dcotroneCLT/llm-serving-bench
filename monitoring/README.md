@@ -12,7 +12,9 @@ directory.
 - `system_monitor.py` system-wide metrics, default 5 s
 - `run_monitors.py` orchestrator that spawns all three and writes manifest
 - `find_engine_pid.py` dynamic engine-PID resolver for containerized engines
-- `RUN_AGING.md` 4-tmux-session launch procedure for 24-hour aging runs
+- `RUN_AGING.md` manual 4-tmux-session launch procedure for containerized
+  aging runs; production runs should use `scripts/launch_cell.py` or
+  `scripts/campaign.py`
 
 ## Prerequisites
 
@@ -34,14 +36,14 @@ Standalone run of the GPU monitor for 10 seconds on GPU 0, writing to
 `/tmp/mon`:
 
 ```
-python gpu_monitor.py --gpu-index 0 --output-dir /tmp/mon --period-seconds 1
+python3 gpu_monitor.py --gpu-index 0 --output-dir /tmp/mon --period-seconds 1
 # in another terminal: send SIGTERM after 10 s
 ```
 
 The system monitor needs no privileges and is the easiest to validate:
 
 ```
-python system_monitor.py --output-dir /tmp/mon --period-seconds 1
+python3 system_monitor.py --output-dir /tmp/mon --period-seconds 1
 ```
 
 After 30 s, kill it with Ctrl-C and inspect:
@@ -54,19 +56,22 @@ head /tmp/mon/system_000000.csv
 You should see one CSV file per ~60 s of run time, each with a header
 row and one data row per sample.
 
-## Full run
+## Full Monitor Run
 
-The orchestrator handles a real run. The serving engine must be started
-separately by the caller; once it is up, write its PID into a pidfile,
-then launch:
+`run_monitors.py` handles only the host-side monitors. For production,
+prefer `scripts/launch_cell.py`, which starts the container, resolves
+the PID, spawns monitors, runs the client, and finalizes the manifest.
+
+For manual/debug runs, the serving engine must be started separately by
+the caller; once it is up, write its PID into a pidfile, then launch:
 
 ```
-python run_monitors.py \
+python3 run_monitors.py \
     --run-id pilot_vllm_replicate1 \
     --runs-root ../runs \
     --gpu-index 1 \
     --pidfile ../runs/pilot_vllm_replicate1/engine.pid \
-    --duration-seconds 7200 \
+    --duration-seconds 129600 \
     --label-engine vllm_standalone
 ```
 
@@ -85,7 +90,7 @@ inspects the container's descendant tree every N seconds and rewrites
 re-reads the pidfile on each sample and follows the new PID
 transparently.
 
-See `RUN_AGING.md` for the full 4-tmux-session launch procedure
+See `RUN_AGING.md` for the full manual 4-tmux-session launch procedure
 (engine container, pid tracker, host monitors, client) and a table of
 per-engine `--process-pattern` regexes.
 
@@ -117,7 +122,7 @@ deadlocks. A timed-out sample is still written to CSV with empty
 measurement fields and `_overrun` set to True; the time series remains
 aligned in time.
 
-## Pre-flight before a long run
+## Pre-flight Before a Long Run
 
 ```
 df -h ../runs        # disk space
@@ -126,4 +131,13 @@ free -g              # available memory
 nvidia-smi           # GPU present and idle
 ```
 
-Two-hour smoke run before each 24-hour campaign run is recommended.
+Production GO/NO-GO gate:
+
+```
+bash scripts/smoke_test.sh campaigns/wosar2026/cells/e1.yaml
+```
+
+The WoSAR 2026 production campaign uses 36h measured aging windows
+(`duration_s=129600`) and 1h analysis warmup discard per cell. Monitor
+CSV rotation remains 60s by default, so a completed run contains about
+2160 proc/system CSV files and 2160 GPU CSV files per run.

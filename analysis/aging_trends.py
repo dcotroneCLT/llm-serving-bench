@@ -7,7 +7,7 @@ table with: indicator, mean, Sen slope (per hour) and 95% CI, MK p-value
 (Hamed-Rao corrected), BH-adjusted q-value, and final decision.
 
 Usage:
-    python aging_trends.py <run_dir> [--alpha 0.10]
+    python3 analysis/aging_trends.py <run_dir> [--alpha 0.10]
                                      [--downsample-seconds 60]
 
 Pipeline:

@@ -5,7 +5,7 @@ benchmark campaign. Target host: Ubuntu LTS, 4 x NVIDIA L40S, 256 GB
 RAM, dedicated for two weeks. NVIDIA driver 580+, CUDA 13.0 runtime
 already installed.
 
-The procedure is split into eight numbered steps. Each step ends with a
+The procedure is split into nine numbered steps. Each step ends with a
 verification command whose expected output is described. If a step
 fails, stop and resolve before proceeding.
 
@@ -198,7 +198,7 @@ conda install -y -c conda-forge pandas numpy scipy statsmodels \
 Verification:
 
 ```bash
-python -c "import psutil, pynvml, httpx, yaml, tiktoken, pandas, scipy, statsmodels, pymannkendall; print('all ok')"
+python3 -c "import psutil, pynvml, httpx, yaml, tiktoken, pandas, scipy, statsmodels, pymannkendall; print('all ok')"
 ```
 
 Expected output: `all ok`.
@@ -213,7 +213,7 @@ session whenever you reconnect to the server.
 
 Now we validate the three monitoring agents on the real hardware. This
 is what will catch any L40S-specific NVML quirks before they bite us
-during a 24-hour run.
+during a 36-hour production run.
 
 Three short tests, ~1 minute each.
 
@@ -222,7 +222,7 @@ Three short tests, ~1 minute each.
 ```bash
 cd ~/wosar/llm-serving-bench/monitoring
 mkdir -p /tmp/mon_smoke
-timeout 30 python system_monitor.py --output-dir /tmp/mon_smoke --period-seconds 1
+timeout 30 python3 system_monitor.py --output-dir /tmp/mon_smoke --period-seconds 1
 ls -la /tmp/mon_smoke/
 head -3 /tmp/mon_smoke/system_000000.csv
 ```
@@ -237,7 +237,7 @@ back.
 
 ```bash
 mkdir -p /tmp/gpu_smoke
-timeout 30 python gpu_monitor.py --gpu-index 0 --output-dir /tmp/gpu_smoke --period-seconds 1
+timeout 30 python3 gpu_monitor.py --gpu-index 0 --output-dir /tmp/gpu_smoke --period-seconds 1
 head -3 /tmp/gpu_smoke/gpu0_000000.csv
 ```
 
@@ -256,7 +256,7 @@ expected.
 mkdir -p /tmp/proc_smoke
 sleep 100 &
 SLEEP_PID=$!
-timeout 30 python proc_monitor.py --pid $SLEEP_PID \
+timeout 30 python3 proc_monitor.py --pid $SLEEP_PID \
     --output-dir /tmp/proc_smoke --label sleeptest --period-seconds 2
 head -3 /tmp/proc_smoke/sleeptest_000000.csv
 kill $SLEEP_PID 2>/dev/null
@@ -280,10 +280,10 @@ minutes.
 
 ```bash
 cd ~/wosar/llm-serving-bench/client
-python build_corpus.py --output prompts/arxiv_corpus.jsonl --target 3000
+python3 build_corpus.py --output prompts/arxiv_corpus.jsonl --target 3000
 ls -la prompts/
 wc -l prompts/arxiv_corpus.jsonl
-head -1 prompts/arxiv_corpus.jsonl | python -c "import sys, json; d=json.loads(sys.stdin.read()); print('keys:', list(d.keys())); print('text length:', len(d['text']), 'chars')"
+head -1 prompts/arxiv_corpus.jsonl | python3 -c "import sys, json; d=json.loads(sys.stdin.read()); print('keys:', list(d.keys())); print('text length:', len(d['text']), 'chars')"
 ```
 
 Expected: ~3000 lines, each a JSON object with at least `text`. Average
@@ -300,13 +300,53 @@ git push
 
 ---
 
-## Step 8. Verify the client end-to-end (without a real engine)
+## Step 8. Verify campaign tooling
 
-We use a tiny mock vLLM-compatible server (~80 lines, included as a
-helper) to confirm the client's plumbing works on the server.
+From the repo root, verify that the campaign descriptor parses and the
+slot schedule is sane:
 
-[We will add this helper in the next commit. For now, skip step 8 and
-proceed to engine setup once steps 0-7 are green.]
+```bash
+cd ~/wosar/llm-serving-bench
+python3 scripts/campaign.py \
+  --campaign-yaml campaigns/wosar2026/campaign.yaml \
+  --dry-run
+```
+
+Expected: 18 production runs plus the configured sanity run, split
+across GPU slots `gpu0`, `gpu1`, and `gpu2`.
+
+Run a short smoke gate before any production launch:
+
+```bash
+bash scripts/smoke_test.sh campaigns/wosar2026/cells/e1.yaml
+```
+
+Expected: the script exits 0 and reports GO. If it fails, inspect the
+printed hard-fail line before launching the 36h campaign slot.
+
+## Step 9. Pin images and launch
+
+Pin or verify the engine images:
+
+```bash
+bash scripts/utils/pin_images.sh
+```
+
+Then launch the campaign through the orchestrator:
+
+```bash
+python3 scripts/campaign.py \
+  --campaign-yaml campaigns/wosar2026/campaign.yaml \
+  --start
+```
+
+Resume after interruption:
+
+```bash
+python3 scripts/campaign.py \
+  --campaign-yaml campaigns/wosar2026/campaign.yaml \
+  --resume
+```
 
 ---
 

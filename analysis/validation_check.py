@@ -14,7 +14,7 @@ a one-page verdict on whether the framework is sane:
 
 Usage:
 
-  python analysis/validation_check.py \\
+  python3 analysis/validation_check.py \\
       --run-dir /tmp/wosar_validation/validation_e1_r99
 
 Outputs a multi-line verdict to stdout and exits with rc=0 if all

@@ -9,7 +9,7 @@ Experimental campaign requires a stable, reproducible server
 environment for two consecutive weeks. The server (cci-csgpu11) is a
 shared lab machine with 4 x NVIDIA L40S, 256 GB RAM, Ubuntu 24.04.4 LTS,
 under administrative auto-update policies that include the NVIDIA
-driver. Long-running benchmark runs (24 h each) cannot tolerate
+driver. Long-running benchmark runs (36 h production aging windows) cannot tolerate
 mid-run kernel-module or library swaps, and require GPU-enabled Docker
 containers.
 
