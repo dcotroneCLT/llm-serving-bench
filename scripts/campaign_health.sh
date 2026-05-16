@@ -83,6 +83,10 @@ HEALTH_FATAL_GREP="${HEALTH_FATAL_GREP:-FATAL|Traceback|Exception|panic|out of m
 HEALTH_CONTAINER_FATAL_GREP="${HEALTH_CONTAINER_FATAL_GREP:-CUDA out of memory|oom-killer|terminate called|FATAL|panic|Killed|Segmentation fault}"
 HEALTH_RATE_MIN_ELAPSED_S="${HEALTH_RATE_MIN_ELAPSED_S:-600}"
 HEALTH_PROC_ALIVE_GRACE_S="${HEALTH_PROC_ALIVE_GRACE_S:-120}"
+# The CSV writer is block-buffered: until the first rotation (~60s) the
+# on-disk file may have only the header. Health-check FAILs on "no rows"
+# during this window are false positives — emit WARN instead.
+HEALTH_MONITOR_WARMUP_S="${HEALTH_MONITOR_WARMUP_S:-120}"
 HEALTH_HARD_SAMPLE_ERR_PCT="${HEALTH_HARD_SAMPLE_ERR_PCT:-1}"
 HEALTH_RESPAWN_TOLERANCE_S="${HEALTH_RESPAWN_TOLERANCE_S:-90}"
 
@@ -885,7 +889,11 @@ print('descendant' if pids & compute else 'no')
     else
         gpu_rows=$(awk -F, 'FNR>1 {n++} END {print n+0}' $gpu_csvs)
         if [ "$gpu_rows" -eq 0 ]; then
-            record FAIL "${section}.gpu.csv" "gpu CSV files exist but contain no samples"
+            if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_MONITOR_WARMUP_S" ]; then
+                record WARN "${section}.gpu.csv" "no gpu samples on disk yet (elapsed=${ELAPSED}s, monitor buffer not flushed)"
+            else
+                record FAIL "${section}.gpu.csv" "gpu CSV files exist but contain no samples"
+            fi
         fi
         # VRAM max + UUID
         gpu_stats=$(awk -F, '
@@ -903,7 +911,11 @@ print('descendant' if pids & compute else 'no')
         ' $gpu_csvs)
         vram_max=$(echo "$gpu_stats" | grep -oE "vram_max=[0-9]+" | cut -d= -f2)
         if [ -z "$vram_max" ]; then
-            record FAIL "${section}.gpu.vram" "no populated vram_used_bytes samples"
+            if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_MONITOR_WARMUP_S" ]; then
+                record WARN "${section}.gpu.vram" "no vram samples on disk yet (elapsed=${ELAPSED}s, monitor buffer not flushed)"
+            else
+                record FAIL "${section}.gpu.vram" "no populated vram_used_bytes samples"
+            fi
         elif [ "$vram_max" -lt "$HEALTH_MIN_VRAM_MIB" ]; then
             record FAIL "${section}.gpu.vram" "vram_max=${vram_max}MiB < ${HEALTH_MIN_VRAM_MIB}MiB"
         else
@@ -933,7 +945,11 @@ print('descendant' if pids & compute else 'no')
     else
         sys_rows=$(awk -F, 'FNR>1 {n++} END {print n+0}' $sys_csvs)
         if [ "$sys_rows" -eq 0 ]; then
-            record FAIL "${section}.system.csv" "system CSV files exist but contain no samples"
+            if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_MONITOR_WARMUP_S" ]; then
+                record WARN "${section}.system.csv" "no system samples on disk yet (elapsed=${ELAPSED}s, monitor buffer not flushed)"
+            else
+                record FAIL "${section}.system.csv" "system CSV files exist but contain no samples"
+            fi
         else
             record PASS "${section}.system.csv" "${sys_rows} samples"
             # Check swap column (look for any non-zero non-empty value)
