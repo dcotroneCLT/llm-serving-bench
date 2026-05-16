@@ -60,7 +60,13 @@ workload:
     protocol: triton_vllm
     base_url: "http://localhost:8200"
     model: qwen
-    target_rate_rps: 0.897
+    # Recalibrated from n=1 (0.897 rps) to 1.753 rps after confirming that
+    # vLLM V1 is actually initialized in Triton 25.09 with VLLM_USE_V1=1
+    # (see smoke_test_run.sh B.engine.version check on a2). The n=1 rate
+    # was derived from a pilot that may have run against V0 fallback;
+    # 1.753 rps corresponds to 85% of empirical saturation throughput for
+    # V1-in-Triton measured by scripts/calibrate_rate.sh on 2026-05-15.
+    target_rate_rps: 1.753
     concurrency_cap: 64
     streaming_prob: 0.7
     request_distribution: poisson
