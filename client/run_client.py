@@ -65,6 +65,12 @@ def main() -> None:
         model=model,
         timeout_s=float(cfg.get("request_timeout_s", 600)),
     )
+    print(
+        f"[run_client] protocol={protocol} base_url={base_url} "
+        f"endpoint={adapter.diagnostic_url} model={model} "
+        f"target_rate_rps={target_rate_rps}",
+        flush=True,
+    )
 
     corpus_path = Path(cfg["corpus_path"])
     if not corpus_path.is_absolute():

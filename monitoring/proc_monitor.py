@@ -84,6 +84,8 @@ FIELDNAMES = [
     "io_write_count",
     "io_write_count_rate",
     "num_children",
+    "sample_error",
+    "sample_error_detail",
     "_sample_duration_s",
     "_overrun",
     "_wall_clock_unix",
@@ -104,6 +106,8 @@ class PidResolver:
         self.pidfile = pidfile
         self.last_pid: Optional[int] = pid
         self._proc: Optional[psutil.Process] = None
+        self.last_error: Optional[str] = None
+        self.last_error_detail: Optional[str] = None
         if pid is not None:
             self._attach(pid)
 
@@ -113,24 +117,44 @@ class PidResolver:
             # First call returns 0.0; prime the cpu_percent counter.
             self._proc.cpu_percent(interval=None)
             self.last_pid = pid
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            self.last_error = None
+            self.last_error_detail = None
+        except psutil.NoSuchProcess:
             self._proc = None
+            self.last_pid = pid
+            self.last_error = "no_such_process"
+            self.last_error_detail = f"pid {pid} does not exist"
+        except psutil.AccessDenied as e:
+            self._proc = None
+            self.last_pid = pid
+            self.last_error = "access_denied"
+            self.last_error_detail = str(e)
 
     def get(self) -> tuple[Optional[psutil.Process], Optional[int]]:
         if self.pidfile is not None:
             current = _read_pidfile(self.pidfile)
-            if current is not None and current != self.last_pid:
+            if current is not None and (current != self.last_pid or self._proc is None):
                 self._attach(current)
             elif current is None:
                 self._proc = None
                 self.last_pid = None
+                self.last_error = "pidfile_unreadable"
+                self.last_error_detail = str(self.pidfile)
         # Verify the process is still alive.
         if self._proc is not None:
             try:
                 if not self._proc.is_running():
                     self._proc = None
-            except psutil.Error:
+                    self.last_error = "not_running"
+                    self.last_error_detail = f"pid {self.last_pid} is not running"
+            except psutil.AccessDenied as e:
                 self._proc = None
+                self.last_error = "access_denied"
+                self.last_error_detail = str(e)
+            except psutil.NoSuchProcess:
+                self._proc = None
+                self.last_error = "no_such_process"
+                self.last_error_detail = f"pid {self.last_pid} disappeared"
         return self._proc, self.last_pid
 
 
@@ -155,6 +179,8 @@ def make_sampler(resolver: PidResolver):
                 "ts_unix": ts,
                 "pid": pid,
                 "process_alive": False,
+                "sample_error": resolver.last_error,
+                "sample_error_detail": resolver.last_error_detail,
             }
 
         if pid != previous_pid:
@@ -194,6 +220,8 @@ def make_sampler(resolver: PidResolver):
                 "io_read_count": io.read_count if io else None,
                 "io_write_count": io.write_count if io else None,
                 "num_children": children,
+                "sample_error": None,
+                "sample_error_detail": None,
             }
 
             if previous_sample is None:
@@ -244,11 +272,21 @@ def make_sampler(resolver: PidResolver):
             previous_sample = sample_data
             previous_pid = pid
             return sample_data
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except psutil.NoSuchProcess:
             return {
                 "ts_unix": ts,
                 "pid": pid,
                 "process_alive": False,
+                "sample_error": "no_such_process",
+                "sample_error_detail": f"pid {pid} disappeared during sample",
+            }
+        except psutil.AccessDenied as e:
+            return {
+                "ts_unix": ts,
+                "pid": pid,
+                "process_alive": False,
+                "sample_error": "access_denied",
+                "sample_error_detail": str(e),
             }
 
     return sample
@@ -268,7 +306,10 @@ def main() -> None:
 
     resolver = PidResolver(pid=args.pid, pidfile=args.pidfile)
     sampler = make_sampler(resolver)
-    watchdog = Watchdog(timeout_seconds=args.watchdog_timeout_s, sentinel={"process_alive": False})
+    watchdog = Watchdog(
+        timeout_seconds=args.watchdog_timeout_s,
+        sentinel={"process_alive": False, "sample_error": "watchdog_timeout"},
+    )
     writer = CsvRotatingWriter(
         WriterConfig(
             output_dir=args.output_dir,

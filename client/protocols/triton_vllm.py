@@ -35,6 +35,28 @@ from . import ProtocolAdapter
 class TritonVLLMAdapter(ProtocolAdapter):
     name = "triton_vllm"
 
+    @property
+    def triton_api_base(self) -> str:
+        if self.base_url.endswith("/v2"):
+            return self.base_url[:-3]
+        return self.base_url
+
+    def generate_url(self, stream: bool) -> str:
+        route = "generate_stream" if stream else "generate"
+        return "/".join(
+            [
+                self.triton_api_base,
+                "v2",
+                "models",
+                self.model.strip("/"),
+                route,
+            ]
+        )
+
+    @property
+    def diagnostic_url(self) -> str:
+        return self.generate_url(stream=False)
+
     async def request(
         self,
         http: httpx.AsyncClient,
@@ -65,7 +87,7 @@ class TritonVLLMAdapter(ProtocolAdapter):
         }
         try:
             if stream:
-                url = f"{self.base_url}/v2/models/{self.model}/generate_stream"
+                url = self.generate_url(stream=True)
                 async with http.stream("POST", url, json=body_payload, timeout=self.timeout_s) as r:
                     result.started_at_unix = time.time()
                     result.http_status = r.status_code
@@ -97,7 +119,7 @@ class TritonVLLMAdapter(ProtocolAdapter):
                     result.extras["output_chars"] = output_chars
                     result.status = "ok"
             else:
-                url = f"{self.base_url}/v2/models/{self.model}/generate"
+                url = self.generate_url(stream=False)
                 result.started_at_unix = time.time()
                 r = await http.post(url, json=body_payload, timeout=self.timeout_s)
                 result.finished_at_unix = time.time()

@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import json
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -77,6 +78,56 @@ def utc_iso() -> str:
 
 def log(msg: str) -> None:
     print(f"[campaign] {utc_iso()} {msg}", flush=True)
+
+
+def host_port_from_mapping(port_mapping: str) -> Optional[str]:
+    """Return host port from Docker -p syntax [ip:]host:container[/proto]."""
+    parts = str(port_mapping).split(":")
+    if len(parts) < 2:
+        return None
+    return parts[-2]
+
+
+def container_running(name: str) -> bool:
+    result = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and name in result.stdout.split()
+
+
+def run_dir_looks_active(run_dir: Path, container_name: str) -> bool:
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if manifest.get("ended_at"):
+        return False
+    return manifest.get("container", {}).get("name") == container_name and container_running(container_name)
+
+
+def expected_container_name(cell_yaml: str, replica: int) -> str:
+    cell = yaml.safe_load(Path(cell_yaml).read_text())
+    template = cell["engine"]["container_name_template"]
+    return str(template).replace("{replica}", f"{replica:02d}")
+
+
+def archive_existing_run_dir(run_dir: Path, attempt: int) -> Optional[Path]:
+    if not run_dir.exists():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = run_dir.with_name(f"{run_dir.name}_stale_attempt{attempt}_{stamp}")
+    archive = base
+    suffix = 1
+    while archive.exists():
+        suffix += 1
+        archive = base.with_name(f"{base.name}_{suffix}")
+    shutil.move(str(run_dir), str(archive))
+    return archive
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +187,25 @@ class State:
 def build_schedule(campaign: dict, campaign_yaml_path: Path) -> dict[str, list[RunSpec]]:
     """Return a dict slot_name -> list of RunSpec, in execution order."""
     cells_by_id: dict[str, str] = {}
+    cell_gpu_by_id: dict[str, int] = {}
+    cell_ports_by_id: dict[str, set[str]] = {}
     for cell_rel in campaign["cells"]:
         cell_path = (campaign_yaml_path.parent / cell_rel).resolve()
         cell = yaml.safe_load(cell_path.read_text())
-        cells_by_id[cell["cell_id"]] = str(cell_path)
+        cid = cell["cell_id"]
+        cells_by_id[cid] = str(cell_path)
+        cell_gpu_by_id[cid] = int(cell["engine"]["gpu_device"])
+        cell_ports_by_id[cid] = {
+            p for p in (host_port_from_mapping(x) for x in cell["engine"].get("port_mapping", [])) if p
+        }
+
+    port_owners: dict[str, list[tuple[str, int]]] = {}
+    for cid, ports in cell_ports_by_id.items():
+        for port in ports:
+            port_owners.setdefault(port, []).append((cid, cell_gpu_by_id[cid]))
+    for port, owners in port_owners.items():
+        if len({gpu for _, gpu in owners}) > 1:
+            raise ValueError(f"host port {port} is used across parallel GPU slots: {owners}")
 
     replicas = int(campaign["replicas_per_cell"])
     order = campaign.get("intra_slot_order", "round_robin")
@@ -149,6 +215,14 @@ def build_schedule(campaign: dict, campaign_yaml_path: Path) -> dict[str, list[R
         slot_name = slot["name"]
         gpu_device = int(slot["gpu_device"])
         cell_ids = list(slot["cells"])
+        for cid in cell_ids:
+            if cid not in cells_by_id:
+                raise ValueError(f"slot {slot_name} references unknown cell {cid}")
+            if cell_gpu_by_id[cid] != gpu_device:
+                raise ValueError(
+                    f"slot {slot_name} gpu_device={gpu_device} but cell {cid} "
+                    f"engine.gpu_device={cell_gpu_by_id[cid]}"
+                )
 
         if order == "round_robin":
             # r1 of cell A, r1 of B, ..., r2 of A, r2 of B, ...
@@ -266,9 +340,21 @@ class SlotWorker(threading.Thread):
         status.last_started_at = utc_iso()
         self._persist_state()
 
-        log_dir = self.runs_root / f"{self.campaign['campaign_id']}_{spec.cell_id}_r{spec.replica:02d}"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        launch_log = log_dir / "launch_cell.log"
+        run_dir = self.runs_root / f"{self.campaign['campaign_id']}_{spec.cell_id}_r{spec.replica:02d}"
+        container_name = expected_container_name(spec.cell_yaml, spec.replica)
+        if run_dir_looks_active(run_dir, container_name):
+            log(f"[{self.slot_name}] refusing to start {spec.run_key}: run_dir and container {container_name} look active")
+            status.last_ended_at = utc_iso()
+            status.last_rc = 125
+            self._persist_state()
+            return 125
+        if container_running(container_name):
+            log(f"[{self.slot_name}] container {container_name} is already running; launch_cell will tear it down before retry")
+        archived = archive_existing_run_dir(run_dir, status.attempts)
+        if archived is not None:
+            log(f"[{self.slot_name}] archived pre-existing run_dir for {spec.run_key}: {archived}")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        launch_log = run_dir / "launch_cell.log"
         status.log_path = str(launch_log)
 
         cmd = [
@@ -280,6 +366,7 @@ class SlotWorker(threading.Thread):
             "--repo-root", str(self.repo_root),
             "--hf-cache-host", str(self.hf_cache_host),
             "--campaign-id", self.campaign["campaign_id"],
+            "--attempt", str(status.attempts),
         ]
         if spec.gpu_device_override is not None:
             cmd += ["--gpu-device-override", str(spec.gpu_device_override)]
@@ -452,9 +539,9 @@ def main() -> None:
     # Dispatch sanity runs sequentially (single thread)
     for spec in sanity:
         log(f"sanity: {spec.run_key} on gpu {spec.gpu_device_override}")
-        existing = state.runs.get(f"{spec.run_key}_{spec.slot_name}")
+        existing = state.runs.get(spec.run_key)
         if existing and existing.status == "completed":
-            log(f"sanity {spec.run_key}_{spec.slot_name} already completed, skipping")
+            log(f"sanity {spec.run_key} already completed, skipping")
             continue
         # Reuse slot worker logic for the sanity run on a one-off basis.
         sanity_worker = SlotWorker(

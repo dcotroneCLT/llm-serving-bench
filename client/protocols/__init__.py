@@ -27,6 +27,13 @@ class ProtocolAdapter(ABC):
         self.model = model
         self.timeout_s = timeout_s
 
+    def endpoint_url(self, *parts: str) -> str:
+        return "/".join([self.base_url, *[p.strip("/") for p in parts if p.strip("/")]])
+
+    @property
+    def diagnostic_url(self) -> str:
+        return self.base_url
+
     @abstractmethod
     async def request(
         self,

@@ -532,6 +532,24 @@ print('descendant' if pids & compute else 'no')
         else
             record PASS "${section}.proc.alive" "alive=${alive}/${tot} = ${alive_pct}% (${n_proc_files} rotated files)"
         fi
+        sample_errors=$(awk -F, '
+            FNR==1 {
+                err_col=0
+                for(i=1;i<=NF;i++) if($i=="sample_error") err_col=i
+                next
+            }
+            err_col && $err_col!="" && $err_col!="None" {
+                counts[$err_col]++
+            }
+            END {
+                for (k in counts) printf "%s=%d ", k, counts[k]
+            }
+        ' $proc_csvs)
+        if echo "$sample_errors" | grep -qE "access_denied|watchdog_timeout|pidfile_unreadable"; then
+            record FAIL "${section}.proc.sample_error" "$sample_errors"
+        elif [ -n "$sample_errors" ]; then
+            record WARN "${section}.proc.sample_error" "$sample_errors"
+        fi
         # Field completeness flagging
         for field in rss_bytes vms_bytes uss_bytes pss_bytes num_threads num_fds cpu_percent voluntary_ctx_switches io_read_bytes io_write_bytes num_children; do
             pct=$(echo "$proc_stats" | grep -oE "${field}=[0-9.]+%" | grep -oE "[0-9.]+")
@@ -662,7 +680,11 @@ print('descendant' if pids & compute else 'no')
     # ---- B.8 client throughput vs target ----
     client_csvs=$(ls "$run_dir"/client/requests_*.csv 2>/dev/null)
     if [ -z "$client_csvs" ]; then
-        record WARN "${section}.client.csv" "no client CSV (run not yet generating requests?)"
+        if [ "$IS_RUNNING" -eq 0 ] || [ "${ELAPSED:-0}" -gt 120 ]; then
+            record FAIL "${section}.client.csv" "no client CSV after elapsed=${ELAPSED}s"
+        else
+            record WARN "${section}.client.csv" "no client CSV yet (elapsed=${ELAPSED}s)"
+        fi
     else
         client_stats=$(awk -F, '
             FNR==1 {
@@ -677,6 +699,9 @@ print('descendant' if pids & compute else 'no')
                 total++
                 status = status_col ? $status_col : ""
                 if(status=="ok" || status=="success") ok++
+                else if(status=="timeout") timeout++
+                else if(status=="dropped") dropped++
+                else if(status!="") error++
                 ts = 0
                 if(finished_col && $finished_col!="") ts = $finished_col + 0
                 else if(submitted_col && $submitted_col!="") ts = $submitted_col + 0
@@ -688,14 +713,23 @@ print('descendant' if pids & compute else 'no')
             }
             END {
                 span = (nts>1) ? (mx-mn) : 0
-                printf "total=%d ok=%d span=%.3f", total, ok, span
+                printf "total=%d ok=%d error=%d timeout=%d dropped=%d span=%.3f", total, ok, error, timeout, dropped, span
             }
         ' $client_csvs)
         n_total=$(echo "$client_stats" | sed 's/.*total=\([0-9]*\).*/\1/')
         n_ok=$(echo "$client_stats" | sed 's/.*ok=\([0-9]*\).*/\1/')
+        n_error=$(echo "$client_stats" | sed 's/.*error=\([0-9]*\).*/\1/')
+        n_timeout=$(echo "$client_stats" | sed 's/.*timeout=\([0-9]*\).*/\1/')
+        n_dropped=$(echo "$client_stats" | sed 's/.*dropped=\([0-9]*\).*/\1/')
         client_span=$(echo "$client_stats" | sed 's/.*span=\([0-9.]*\).*/\1/')
         if [ "$n_total" -eq 0 ]; then
-            record WARN "${section}.client.csv" "client CSV files exist but contain no request rows"
+            if [ "$IS_RUNNING" -eq 0 ] || [ "${ELAPSED:-0}" -gt 120 ]; then
+                record FAIL "${section}.client.csv" "client CSV files exist but contain no request rows after elapsed=${ELAPSED}s"
+            else
+                record WARN "${section}.client.csv" "client CSV files exist but contain no request rows yet"
+            fi
+        elif [ "$n_ok" -eq 0 ] && [ "${ELAPSED:-0}" -gt 120 ]; then
+            record FAIL "${section}.client.ok" "zero successful client rows: total=${n_total} error=${n_error} timeout=${n_timeout} dropped=${n_dropped}"
         fi
         issued_rate=$(awk -v n=$n_total -v s=$client_span 'BEGIN{if(s>0) printf "%.3f", n/s; else print 0}')
         # target from cell yaml
@@ -713,9 +747,9 @@ print('descendant' if pids & compute else 'no')
         fi
         # Error rate
         if [ "$n_total" -gt 100 ]; then
-            err_pct=$(awk -v ok=$n_ok -v t=$n_total 'BEGIN{printf "%.1f", 100*(t-ok)/t}')
+            err_pct=$(awk -v e=$n_error -v to=$n_timeout -v t=$n_total 'BEGIN{printf "%.1f", 100*(e+to)/t}')
             if awk -v p=$err_pct 'BEGIN{exit !(p>5)}'; then
-                record WARN "${section}.client.errors" "non-OK responses = ${err_pct}% (>5%)"
+                record WARN "${section}.client.errors" "error/timeout responses = ${err_pct}% (>5%); dropped=${n_dropped}/${n_total}"
             fi
         fi
     fi

@@ -56,6 +56,7 @@ tmux sessions).
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import platform
@@ -79,6 +80,11 @@ import yaml  # type: ignore
 # ---------------------------------------------------------------------------
 
 
+_ABORT_CLEANUP_ENABLED = False
+_ABORT_CONTAINER_NAME: Optional[str] = None
+_ABORT_LOG_DIR: Optional[Path] = None
+
+
 def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -87,8 +93,35 @@ def log(msg: str) -> None:
     print(f"[launch_cell] {utc_iso()} {msg}", flush=True)
 
 
+def enable_abort_cleanup(container_name: str, log_dir: Path) -> None:
+    global _ABORT_CLEANUP_ENABLED, _ABORT_CONTAINER_NAME, _ABORT_LOG_DIR
+    _ABORT_CLEANUP_ENABLED = True
+    _ABORT_CONTAINER_NAME = container_name
+    _ABORT_LOG_DIR = log_dir
+
+
+def disable_abort_cleanup() -> None:
+    global _ABORT_CLEANUP_ENABLED
+    _ABORT_CLEANUP_ENABLED = False
+
+
+def cleanup_after_abort() -> None:
+    if not _ABORT_CLEANUP_ENABLED or not _ABORT_CONTAINER_NAME or not _ABORT_LOG_DIR:
+        return
+    try:
+        _ABORT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        save_docker_logs(_ABORT_CONTAINER_NAME, _ABORT_LOG_DIR / "docker_abort.log")
+    except Exception:
+        pass
+    try:
+        subprocess.run(["docker", "rm", "-f", _ABORT_CONTAINER_NAME], check=False, capture_output=True)
+    except Exception:
+        pass
+
+
 def die(msg: str, rc: int = 1) -> None:
     print(f"[launch_cell] FATAL {msg}", flush=True, file=sys.stderr)
+    cleanup_after_abort()
     sys.exit(rc)
 
 
@@ -109,6 +142,87 @@ def render_in_obj(obj: Any, **subs: str) -> Any:
     if isinstance(obj, dict):
         return {k: render_in_obj(v, **subs) for k, v in obj.items()}
     return obj
+
+
+def assert_run_dir_fresh(run_dir: Path) -> None:
+    """Refuse to mix a new attempt with old CSVs/manifests/state."""
+    if not run_dir.exists():
+        return
+    allowed_precreated = {"launch_cell.log"}
+    entries = [p.name for p in run_dir.iterdir()]
+    stale = [name for name in entries if name not in allowed_precreated]
+    if stale:
+        preview = ", ".join(sorted(stale)[:8])
+        die(
+            f"run_dir already contains campaign artifacts: {run_dir} ({preview}). "
+            "Archive or remove it before relaunching this run.",
+            rc=6,
+        )
+
+
+def save_docker_logs(container_name: str, out_path: Path) -> None:
+    """Best-effort docker logs capture before the container is removed."""
+    try:
+        result = subprocess.run(
+            ["docker", "logs", container_name],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        out_path.write_text(f"docker logs failed: {e}\n")
+        return
+    out_path.write_text(result.stdout + result.stderr)
+
+
+def summarize_client_csvs(client_dir: Path) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "total": 0,
+        "ok": 0,
+        "error": 0,
+        "timeout": 0,
+        "dropped": 0,
+        "status_counts": {},
+        "first_ts_unix": None,
+        "last_ts_unix": None,
+    }
+    for path in sorted(client_dir.glob("requests_*.csv")):
+        try:
+            with path.open(newline="") as f:
+                for row in csv.DictReader(f):
+                    summary["total"] += 1
+                    status = (row.get("status") or "").strip()
+                    counts = summary["status_counts"]
+                    counts[status] = counts.get(status, 0) + 1
+                    if status == "ok":
+                        summary["ok"] += 1
+                    elif status == "timeout":
+                        summary["timeout"] += 1
+                    elif status == "dropped":
+                        summary["dropped"] += 1
+                    elif status:
+                        summary["error"] += 1
+                    ts_text = row.get("finished_at_unix") or row.get("submitted_at_unix") or ""
+                    try:
+                        ts = float(ts_text)
+                    except ValueError:
+                        continue
+                    if summary["first_ts_unix"] is None or ts < summary["first_ts_unix"]:
+                        summary["first_ts_unix"] = ts
+                    if summary["last_ts_unix"] is None or ts > summary["last_ts_unix"]:
+                        summary["last_ts_unix"] = ts
+        except OSError as e:
+            counts = summary["status_counts"]
+            counts[f"csv_read_error:{path.name}"] = str(e)
+    first_ts = summary["first_ts_unix"]
+    last_ts = summary["last_ts_unix"]
+    if first_ts is not None and last_ts is not None and last_ts > first_ts:
+        summary["span_s"] = last_ts - first_ts
+        summary["issued_rate_rps"] = summary["total"] / summary["span_s"]
+    else:
+        summary["span_s"] = 0.0
+        summary["issued_rate_rps"] = 0.0
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +250,7 @@ def verify_image_present(image_tag: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def teardown_container(name: str) -> None:
+def teardown_container(name: str, log_path: Optional[Path] = None) -> None:
     """Remove any stale container with the same name. No-op if absent."""
     result = subprocess.run(
         ["docker", "ps", "-a", "--format", "{{.Names}}"],
@@ -146,6 +260,8 @@ def teardown_container(name: str) -> None:
     )
     if name in result.stdout.split():
         log(f"removing existing container {name}")
+        if log_path is not None:
+            save_docker_logs(name, log_path)
         subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True)
 
 
@@ -240,8 +356,7 @@ def gpu_sanity_check(container_pid: int, gpu_device: int) -> None:
         text=True,
     )
     if result.returncode != 0:
-        log(f"WARNING: nvidia-smi failed for gpu {gpu_device}: {result.stderr.strip()}")
-        return
+        die(f"nvidia-smi failed for gpu {gpu_device}: {result.stderr.strip()}", rc=3)
     pids_on_gpu = [int(x.strip()) for x in result.stdout.split() if x.strip().isdigit()]
     if container_pid in pids_on_gpu:
         log(f"GPU sanity OK: container pid {container_pid} on gpu {gpu_device}")
@@ -542,14 +657,15 @@ def wait_vram_quiescence(
 # ---------------------------------------------------------------------------
 
 
-def stop_subprocess(proc: subprocess.Popen, name: str, grace_s: float = 30.0) -> None:
+def stop_subprocess(proc: subprocess.Popen, name: str, grace_s: float = 30.0) -> bool:
+    """Terminate a process group. Returns True if SIGKILL was needed."""
     if proc.poll() is not None:
-        return
+        return False
     log(f"stopping {name} (pid={proc.pid})")
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
     except ProcessLookupError:
-        return
+        return False
     try:
         proc.wait(timeout=grace_s)
     except subprocess.TimeoutExpired:
@@ -559,6 +675,8 @@ def stop_subprocess(proc: subprocess.Popen, name: str, grace_s: float = 30.0) ->
         except ProcessLookupError:
             pass
         proc.wait()
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +692,7 @@ def main() -> None:
     p.add_argument("--repo-root", type=Path, required=True)
     p.add_argument("--hf-cache-host", type=Path, required=True)
     p.add_argument("--campaign-id", type=str, default="wosar2026")
+    p.add_argument("--attempt", type=int, default=1, help="Attempt number for provenance.")
     p.add_argument(
         "--gpu-device-override",
         type=int,
@@ -612,6 +731,7 @@ def main() -> None:
     replica = args.replica
     run_id = f"{args.campaign_id}_{cell_id}_r{replica:02d}"
     run_dir = args.runs_root / run_id
+    assert_run_dir_fresh(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir = run_dir / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -630,7 +750,7 @@ def main() -> None:
 
     # 3. Container name (already substituted via render_in_obj above).
     container_name = cell["engine"]["container_name_template"]
-    teardown_container(container_name)
+    teardown_container(container_name, log_dir / "docker_stale_before_teardown.log")
 
     # 4. Capture pre-run VRAM baseline on the cell's GPU.
     gpu_device = cell["engine"]["gpu_device"]
@@ -643,6 +763,7 @@ def main() -> None:
     result = subprocess.run(docker_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         die(f"docker run failed rc={result.returncode}\nstderr: {result.stderr}")
+    enable_abort_cleanup(container_name, log_dir)
     time.sleep(2)  # let docker assign host PID
 
     # 6. Persist docker inspect snapshot for provenance.
@@ -661,6 +782,8 @@ def main() -> None:
 
     # 9. Resolve engine worker PID.
     pidfile = run_dir / "engine.pid"
+    if pidfile.exists():
+        pidfile.unlink()
     pid_daemon = setup_pid_strategy(cell, container_name, pidfile, args.repo_root, log_dir)
 
     # 10. Write the run manifest (started_at).
@@ -670,6 +793,7 @@ def main() -> None:
         "campaign_id": args.campaign_id,
         "cell_id": cell_id,
         "replica": replica,
+        "attempt": args.attempt,
         "started_at": utc_iso(),
         "started_at_unix": started_at_unix,
         "host": host_info(gpu_device),
@@ -703,6 +827,8 @@ def main() -> None:
     log(f"monitors orchestrator pid={monitors_proc.pid}")
 
     client_config = materialize_client_config(args.repo_root, run_dir, cell, replica)
+    manifest["client_config_path"] = str(client_config)
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
     client_proc = spawn_client(args.repo_root, run_dir, client_config, duration_s, log_dir)
     log(f"client pid={client_proc.pid}")
 
@@ -717,6 +843,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
+    client_forced_kill = False
+    client_summary: dict[str, Any] = {}
     try:
         while not interrupted:
             time.sleep(5)
@@ -733,12 +861,40 @@ def main() -> None:
                 interrupted = True
     finally:
         # 13. Graceful teardown.
-        stop_subprocess(client_proc, "client")
+        if interrupted:
+            client_forced_kill = stop_subprocess(client_proc, "client")
+        elif client_proc.poll() is None:
+            cfg = yaml.safe_load(client_config.read_text())
+            request_timeout_s = float(cfg.get("request_timeout_s", 600))
+            client_grace_s = max(120.0, request_timeout_s + 90.0)
+            log(f"waiting for client to finish and flush (grace={client_grace_s:.0f}s)")
+            try:
+                client_proc.wait(timeout=client_grace_s)
+            except subprocess.TimeoutExpired:
+                log("client did not finish after duration; forcing shutdown")
+                client_forced_kill = stop_subprocess(client_proc, "client", grace_s=30.0)
+                interrupted = True
+
+        client_summary = summarize_client_csvs(run_dir / "client")
+        log(
+            "client summary: "
+            f"total={client_summary['total']} ok={client_summary['ok']} "
+            f"statuses={client_summary['status_counts']}"
+        )
+        if client_summary["total"] == 0:
+            log("WARNING: client produced zero request rows")
+            interrupted = True
+        elif client_summary["ok"] == 0:
+            log("WARNING: client produced request rows but zero status=ok rows")
+            interrupted = True
+
         stop_subprocess(monitors_proc, "monitors", grace_s=60.0)
         if pid_daemon is not None:
             stop_subprocess(pid_daemon, "pid_daemon")
+        save_docker_logs(container_name, log_dir / "docker.log")
         log(f"removing container {container_name}")
         subprocess.run(["docker", "rm", "-f", container_name], check=False, capture_output=True)
+        disable_abort_cleanup()
 
         # 14. Wait for VRAM quiescence on the cell's GPU.
         cooldown = int(cell.get("post_run_cooldown_s", 600))
@@ -750,6 +906,9 @@ def main() -> None:
         manifest["ended_at_unix"] = ended_at_unix
         manifest["duration_seconds_actual"] = ended_at_unix - started_at_unix
         manifest["interrupted_early"] = interrupted
+        manifest["client_forced_kill"] = client_forced_kill
+        manifest["client_summary"] = client_summary
+        manifest["docker_log_path"] = str(log_dir / "docker.log")
         manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
         log(f"done. duration={manifest['duration_seconds_actual']:.0f}s interrupted={interrupted}")
 

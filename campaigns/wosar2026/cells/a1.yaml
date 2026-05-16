@@ -62,7 +62,7 @@ monitors:
 workload:
   client_config_overrides:
     protocol: vllm_openai
-    base_url: "http://localhost:8100/v1"
+    base_url: "http://localhost:8100"
     model: Qwen/Qwen2.5-7B-Instruct
     # 85% of V0 saturation is much lower than V1: V0 has no continuous
     # batching v2 or new scheduling primitives. Rate is the n=1 mean,

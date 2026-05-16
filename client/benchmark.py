@@ -197,6 +197,37 @@ class BenchmarkEngine:
             result.requested_input_tokens = approx_in
             fill_derived_latencies(result)
             self.writer.write(result.to_csv_row())
+        except asyncio.CancelledError:
+            result = RequestResult(
+                req_id=req_id,
+                submitted_at_unix=submitted_at_unix,
+                started_at_unix=None,
+                first_token_at_unix=None,
+                finished_at_unix=time.time(),
+                status="error",
+                error_message="client task cancelled",
+                requested_input_tokens=approx_in,
+                requested_max_output_tokens=target_out,
+                streaming=stream,
+            )
+            fill_derived_latencies(result)
+            self.writer.write(result.to_csv_row())
+            raise
+        except Exception as e:
+            result = RequestResult(
+                req_id=req_id,
+                submitted_at_unix=submitted_at_unix,
+                started_at_unix=None,
+                first_token_at_unix=None,
+                finished_at_unix=time.time(),
+                status="error",
+                error_message=f"{type(e).__name__}: {str(e)[:500]}",
+                requested_input_tokens=approx_in,
+                requested_max_output_tokens=target_out,
+                streaming=stream,
+            )
+            fill_derived_latencies(result)
+            self.writer.write(result.to_csv_row())
         finally:
             self.in_flight -= 1
 

@@ -32,6 +32,16 @@ from . import ProtocolAdapter
 class PyTorchHFAdapter(ProtocolAdapter):
     name = "pytorch_hf"
 
+    @property
+    def generate_url(self) -> str:
+        if self.base_url.endswith("/generate"):
+            return self.base_url
+        return self.endpoint_url("generate")
+
+    @property
+    def diagnostic_url(self) -> str:
+        return self.generate_url
+
     async def request(
         self,
         http: httpx.AsyncClient,
@@ -41,7 +51,7 @@ class PyTorchHFAdapter(ProtocolAdapter):
         max_tokens: int,
         stream: bool,
     ) -> RequestResult:
-        url = f"{self.base_url}/generate"
+        url = self.generate_url
         payload = {"prompt": prompt, "max_tokens": max_tokens, "stream": stream}
         result = RequestResult(
             req_id=req_id,

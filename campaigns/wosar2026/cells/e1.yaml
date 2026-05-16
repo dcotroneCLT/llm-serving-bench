@@ -90,7 +90,7 @@ workload:
   # The base_url is the host-side endpoint mapped from port_mapping[0].
   client_config_overrides:
     protocol: vllm_openai
-    base_url: "http://localhost:8100/v1"
+    base_url: "http://localhost:8100"
     model: Qwen/Qwen2.5-7B-Instruct
     target_rate_rps: 2.545          # empirical mean from n=1 run (see analysis)
     concurrency_cap: 64

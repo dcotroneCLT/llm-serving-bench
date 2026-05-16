@@ -23,6 +23,16 @@ from . import ProtocolAdapter
 class VLLMOpenAIAdapter(ProtocolAdapter):
     name = "vllm_openai"
 
+    @property
+    def completions_url(self) -> str:
+        if self.base_url.endswith("/v1"):
+            return f"{self.base_url}/completions"
+        return self.endpoint_url("v1", "completions")
+
+    @property
+    def diagnostic_url(self) -> str:
+        return self.completions_url
+
     async def request(
         self,
         http: httpx.AsyncClient,
@@ -32,7 +42,7 @@ class VLLMOpenAIAdapter(ProtocolAdapter):
         max_tokens: int,
         stream: bool,
     ) -> RequestResult:
-        url = f"{self.base_url}/v1/completions"
+        url = self.completions_url
         payload: dict = {
             "model": self.model,
             "prompt": prompt,

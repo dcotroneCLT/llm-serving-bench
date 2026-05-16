@@ -241,6 +241,7 @@ def main() -> None:
 
     # Supervise. Stop conditions: signal received, duration elapsed, or any child exits.
     stop = False
+    failed = False
 
     def handle(_sig, _frame):
         nonlocal stop
@@ -261,6 +262,7 @@ def main() -> None:
                 if rc is not None:
                     print(f"[run_monitors] monitor {name} exited unexpectedly with rc={rc}", flush=True)
                     stop = True
+                    failed = True
                     break
     finally:
         # Send SIGTERM to all monitors and wait for graceful shutdown.
@@ -286,8 +288,11 @@ def main() -> None:
         manifest["ended_at"] = utc_iso()
         manifest["ended_at_unix"] = ended_at_unix
         manifest["duration_seconds_actual"] = ended_at_unix - started_at_unix
+        manifest["failed"] = failed
         manifest_path.write_text(json.dumps(manifest, indent=2))
         print(f"[run_monitors] done. duration={manifest['duration_seconds_actual']:.1f}s", flush=True)
+    if failed:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -462,6 +462,73 @@ check_c() {
         return
     fi
 
+    # C.3b exercise the real campaign client path, not just a hand-written curl.
+    # This catches config/adapter URL bugs such as base_url=/v1 plus adapter
+    # appending /v1/completions again.
+    local client_protocol client_base_url client_model client_cfg client_out
+    client_out="$SMOKE_DIR/client"
+    client_cfg="$SMOKE_DIR/client_config.yaml"
+    mkdir -p "$client_out"
+    case "$CELL_ID" in
+        e1|a1)
+            client_protocol="vllm_openai"
+            client_base_url="http://localhost:${PORT}"
+            client_model="Qwen/Qwen2.5-7B-Instruct"
+            ;;
+        e2|a2)
+            client_protocol="triton_vllm"
+            client_base_url="http://localhost:${PORT}"
+            client_model="qwen"
+            ;;
+        e3|e3b)
+            client_protocol="pytorch_hf"
+            client_base_url="http://localhost:${PORT}"
+            client_model="Qwen/Qwen2.5-7B-Instruct"
+            ;;
+    esac
+    cat >"$client_cfg" <<EOF
+protocol: ${client_protocol}
+base_url: ${client_base_url}
+model: ${client_model}
+target_rate_rps: 0.2
+concurrency_cap: 2
+prompt_len:
+  median: 24
+  p95: 32
+  min: 8
+  max: 64
+max_tokens:
+  median: 5
+  p95: 8
+  min: 1
+  max: 12
+streaming_prob: 0.0
+request_distribution: poisson
+request_timeout_s: 120
+rotation_seconds: 60
+seed: ${REPLICA}
+tokenizer: cl100k_base
+corpus_path: ${REPO_ROOT}/client/prompts/arxiv_corpus.jsonl
+EOF
+    if ! "$WOSAR_PY" "$REPO_ROOT/client/run_client.py" \
+        --config "$client_cfg" \
+        --output-dir "$client_out" \
+        --duration-seconds 20 \
+        >"$SMOKE_DIR/run_client.log" 2>&1; then
+        record FAIL "C.client.path" "run_client.py failed; see $SMOKE_DIR/run_client.log"
+        return
+    fi
+    local client_rows client_ok client_statuses
+    client_rows=$(awk -F, 'FNR>1 {n++} END{print n+0}' "$client_out"/requests_*.csv 2>/dev/null)
+    client_ok=$(awk -F, 'FNR==1 {for(i=1;i<=NF;i++) if($i=="status") c=i; next} FNR>1 && c && $c=="ok" {n++} END{print n+0}' "$client_out"/requests_*.csv 2>/dev/null)
+    client_statuses=$(awk -F, 'FNR==1 {for(i=1;i<=NF;i++) if($i=="status") c=i; next} FNR>1 && c {s[$c]++} END{for(k in s) printf "%s=%d ", k, s[k]}' "$client_out"/requests_*.csv 2>/dev/null)
+    if [ "${client_rows:-0}" -gt 0 ] && [ "${client_ok:-0}" -gt 0 ]; then
+        record PASS "C.client.path" "run_client.py produced ok=${client_ok}/${client_rows}; statuses: ${client_statuses}"
+    else
+        record FAIL "C.client.path" "run_client.py produced no OK rows; rows=${client_rows:-0}; statuses: ${client_statuses:-none}; see $SMOKE_DIR/run_client.log"
+        return
+    fi
+
     # C.4 wait for run_monitors to finish (it auto-exits at duration + grace)
     echo "[smoke_run] sampling for 60s (run_monitors will auto-exit)..."
     wait "$RUN_MON_BG" 2>/dev/null || true
