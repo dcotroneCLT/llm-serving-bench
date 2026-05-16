@@ -228,7 +228,13 @@ def main() -> None:
             "log": str(log_path),
         })
 
-    manifest_path = run_dir / "manifest.json"
+    # In production launch_cell.py owns run_dir/manifest.json. When this
+    # monitor orchestrator is launched inside a cell run, keep our own
+    # manifest separate so periodic health checks can still read the
+    # campaign-level manifest while the run is in flight. Standalone
+    # invocations keep the historical manifest.json path.
+    manifest_name = "monitor_manifest.json" if (run_dir / "manifest.json").exists() else "manifest.json"
+    manifest_path = run_dir / manifest_name
     manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"[run_monitors] run_dir={run_dir}", flush=True)
     print(f"[run_monitors] spawned: " + ", ".join(f"{n}(pid={p.pid})" for n, p, _ in procs), flush=True)
