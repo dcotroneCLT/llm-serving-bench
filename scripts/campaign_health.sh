@@ -83,6 +83,13 @@ CAMPAIGN_YAML="$REPO_ROOT/campaigns/wosar2026/campaign.yaml"
 CAMPAIGN_RUNS_ROOT=$(awk -F': *' '/^runs_root:/ {print $2; exit}' "$CAMPAIGN_YAML" 2>/dev/null | tr -d '"' || true)
 RUNS_ROOT="${RUNS_ROOT:-${CAMPAIGN_RUNS_ROOT:-$HOME/wosar/runs}}"
 STATE_FILE="$REPO_ROOT/campaigns/wosar2026/state/campaign_state.json"
+# Inspection mode: pointed at an archive (RUNS_ROOT overridden away from the
+# campaign default). State file absence is expected, not a hard failure.
+if [ -n "${CAMPAIGN_RUNS_ROOT:-}" ] && [ "$RUNS_ROOT" != "$CAMPAIGN_RUNS_ROOT" ]; then
+    INSPECT_MODE=1
+else
+    INSPECT_MODE=0
+fi
 
 # ---------- Findings accumulator ----------
 declare -a FINDINGS
@@ -376,8 +383,21 @@ fi
 # A.2 state file presence and parseable
 if ! have_python; then
     record FAIL "A.python" "python3 not found; JSON checks cannot run"
+else
+    if python3 -c "import yaml" 2>/dev/null; then
+        record PASS "A.pyyaml" "PyYAML available (yaml_path fallbacks operational)"
+    else
+        record WARN "A.pyyaml" "PyYAML missing in $(command -v python3); yaml_path fallbacks degraded — run from wosar conda env or 'pip install pyyaml'"
+    fi
+fi
+if ! have_python; then
+    :
 elif [ ! -f "$STATE_FILE" ]; then
-    record FAIL "A.state.file" "$STATE_FILE missing (campaign never started or path wrong)"
+    if [ "$INSPECT_MODE" -eq 1 ]; then
+        record WARN "A.state.file" "$STATE_FILE missing (inspection mode: RUNS_ROOT=$RUNS_ROOT != campaign default)"
+    else
+        record FAIL "A.state.file" "$STATE_FILE missing (campaign never started or path wrong)"
+    fi
 else
     if ! STATE_FILE="$STATE_FILE" python3 - <<'PY' 2>/dev/null
 import json
@@ -431,6 +451,8 @@ else
 fi
 if ! command -v docker >/dev/null 2>&1; then
     :
+elif [ "$INSPECT_MODE" -eq 1 ]; then
+    record PASS "A.docker.containers" "inspection mode: $N_CONTAINERS wosar2026 container(s) running (not gated against live state)"
 elif [ "$N_CONTAINERS" -eq 0 ]; then
     if [ "${STATE_RUNNING_COUNT:-0}" -gt 0 ]; then
         record WARN "A.docker.containers" "no wosar2026 container running while state has ${STATE_RUNNING_COUNT} running run(s); per-run checks decide if cooldown vs failure"
@@ -656,7 +678,8 @@ print('descendant' if pids & compute else 'no')
                     record FAIL "${section}.engine.pid_alive" "pid=$engine_pid not in /proc (engine died)"
                 fi
                 if [ -n "$CURRENT_CONTAINER_PID" ] && [[ "$CURRENT_CONTAINER_PID" =~ ^[0-9]+$ ]] && have_python; then
-                    PROCESS_PATTERN=$(yaml_path "$CELL_YAML" "engine.pid_strategy.process_pattern")
+                    PROCESS_PATTERN=$(json_get "$manifest" "engine.pid_strategy.process_pattern")
+                    [ -n "$PROCESS_PATTERN" ] || PROCESS_PATTERN=$(yaml_path "$CELL_YAML" "engine.pid_strategy.process_pattern")
                     pid_check=$(pid_container_check "$CURRENT_CONTAINER_PID" "$engine_pid" "$PROCESS_PATTERN")
                     case "$pid_check" in
                         ok)
@@ -922,7 +945,8 @@ print('descendant' if pids & compute else 'no')
 
     # ---- B.8 client throughput vs target ----
     client_csvs=$(ls "$run_dir"/client/requests_*.csv 2>/dev/null)
-    request_timeout_s=$(yaml_path "$CELL_YAML" "workload.client_config_overrides.request_timeout_s")
+    request_timeout_s=$(json_get "$manifest" "workload.client_config_overrides.request_timeout_s")
+    [ -n "$request_timeout_s" ] || request_timeout_s=$(yaml_path "$CELL_YAML" "workload.client_config_overrides.request_timeout_s")
     request_timeout_s=${request_timeout_s:-600}
     request_timeout_i=${request_timeout_s%.*}
     is_int "$request_timeout_i" || request_timeout_i=600
@@ -1007,8 +1031,11 @@ print('descendant' if pids & compute else 'no')
         fi
         check_freshness "$section" "client" "$client_last_ts" "$client_staleness_s" "$ELAPSED" "$IS_RUNNING"
         issued_rate=$(awk -v n=$n_total -v s=$client_span 'BEGIN{if(s>0) printf "%.3f", n/s; else print 0}')
-        # target from cell yaml
-        target=$(yaml_path "$CELL_YAML" "workload.client_config_overrides.target_rate_rps")
+        # Prefer manifest (json, stdlib-only) so the rate check works even when
+        # PyYAML is unavailable in the invoking python3 (e.g. running from the
+        # conda base env instead of the wosar env).
+        target=$(json_get "$manifest" "workload.client_config_overrides.target_rate_rps")
+        [ -n "$target" ] || target=$(yaml_path "$CELL_YAML" "workload.client_config_overrides.target_rate_rps")
         if [ -n "$target" ] && [ "$target" != "0" ] && awk -v s=$client_span 'BEGIN{exit !(s>0)}'; then
             # Below HEALTH_RATE_MIN_ELAPSED_S, a Poisson stream is too sparse
             # to estimate a meaningful ratio (e3b at 0.05 rps needs ~10 min
