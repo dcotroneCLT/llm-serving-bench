@@ -28,6 +28,7 @@
 # Tunable thresholds (env vars override):
 #   HEALTH_MIN_RUNS_ROOT_GB=5     runs_root free, hard fail if below
 #   HEALTH_MIN_VAR_LIB_GB=10      host /var/lib free, hard fail if below
+#   HEALTH_WARN_VAR_LIB_GB=20     host /var/lib free, early warn if below
 #   HEALTH_MIN_ALIVE_PCT=95       proc_alive threshold, fail if below
 #   HEALTH_MIN_RSS_MB=100         per-cell RSS floor, fail if below (wrong PID)
 #   HEALTH_MIN_VRAM_MIB=1000      per-cell VRAM floor, fail if below
@@ -55,6 +56,7 @@ fi
 # ---------- Thresholds ----------
 HEALTH_MIN_RUNS_ROOT_GB="${HEALTH_MIN_RUNS_ROOT_GB:-${HEALTH_MIN_HOME_GB:-5}}"
 HEALTH_MIN_VAR_LIB_GB="${HEALTH_MIN_VAR_LIB_GB:-10}"
+HEALTH_WARN_VAR_LIB_GB="${HEALTH_WARN_VAR_LIB_GB:-20}"
 HEALTH_MIN_ALIVE_PCT="${HEALTH_MIN_ALIVE_PCT:-95}"
 HEALTH_MIN_RSS_MB="${HEALTH_MIN_RSS_MB:-100}"
 HEALTH_MIN_VRAM_MIB="${HEALTH_MIN_VRAM_MIB:-1000}"
@@ -96,6 +98,10 @@ CAMPAIGN_YAML="$REPO_ROOT/campaigns/wosar2026/campaign.yaml"
 CAMPAIGN_RUNS_ROOT=$(awk -F': *' '/^runs_root:/ {print $2; exit}' "$CAMPAIGN_YAML" 2>/dev/null | tr -d '"' || true)
 RUNS_ROOT="${RUNS_ROOT:-${CAMPAIGN_RUNS_ROOT:-$HOME/wosar/runs}}"
 STATE_FILE="$REPO_ROOT/campaigns/wosar2026/state/campaign_state.json"
+# Append-only log of manual operator interventions during the campaign.
+# Written only by scripts/log_mitigation.sh (fixed taxonomy of 6 categories);
+# this script only reads the tail to surface recent interventions in REPORT.
+MITIGATIONS_LOG="${MITIGATIONS_LOG:-$REPO_ROOT/campaigns/wosar2026/state/mitigations.log}"
 # Inspection mode: pointed at an archive (RUNS_ROOT overridden away from the
 # campaign default). State file absence is expected, not a hard failure.
 if [ -n "${CAMPAIGN_RUNS_ROOT:-}" ] && [ "$RUNS_ROOT" != "$CAMPAIGN_RUNS_ROOT" ]; then
@@ -369,7 +375,7 @@ find_proc_csvs() {
 # Section A: campaign-wide
 # ============================================================
 echo "${BOLD}========================================================"
-echo "WoSAR 2026 campaign health: $(date -Iseconds)"
+echo "WoSAR 2026 campaign health: $(date "+%Y-%m-%dT%H:%M:%S%z")"
 echo "========================================================${RESET}"
 echo ""
 
@@ -387,8 +393,19 @@ else
 fi
 if ! is_int "$VAR_LIB_GB"; then
     record WARN "A.disk.var_lib" "could not read free space for /var/lib"
-elif [ "$VAR_LIB_GB" -lt "$HEALTH_MIN_VAR_LIB_GB" ]; then
-    record FAIL "A.disk.var_lib" "free=${VAR_LIB_GB}GB < ${HEALTH_MIN_VAR_LIB_GB}GB"
+elif [ "$VAR_LIB_GB" -lt "$HEALTH_WARN_VAR_LIB_GB" ]; then
+    # Below WARN line — append a one-line docker storage snapshot and a
+    # mitigation hint so the message is self-explanatory. docker system df
+    # is read-only and returns in <100ms; safe to call here.
+    docker_df_line=$(docker system df 2>/dev/null \
+        | awk '/^Images/ {printf "Images=%s reclaimable=%s", $4, $5; exit}')
+    [ -z "$docker_df_line" ] && docker_df_line="docker df unavailable"
+    mit_hint="mitigation: docker system prune -f (safe during live runs; log via scripts/log_mitigation.sh)"
+    if [ "$VAR_LIB_GB" -lt "$HEALTH_MIN_VAR_LIB_GB" ]; then
+        record FAIL "A.disk.var_lib" "free=${VAR_LIB_GB}GB < ${HEALTH_MIN_VAR_LIB_GB}GB | ${docker_df_line} | ${mit_hint}"
+    else
+        record WARN "A.disk.var_lib" "free=${VAR_LIB_GB}GB < ${HEALTH_WARN_VAR_LIB_GB}GB (early signal) | ${docker_df_line} | ${mit_hint}"
+    fi
 else
     record PASS "A.disk.var_lib" "free=${VAR_LIB_GB}GB"
 fi
@@ -1171,6 +1188,17 @@ echo "========================================================${RESET}"
 for line in "${FINDINGS[@]}"; do
     echo "$line"
 done
+
+# Manual mitigations log (operator-curated; convention only, no auto-write).
+# Surfacing the tail here gives the operator — and future-self reading the
+# REPORT to write the paper's Threats to Validity — immediate context for
+# any anomaly seen above. Absence of the file is normal (zero interventions).
+if [ -f "$MITIGATIONS_LOG" ]; then
+    n_mit=$(wc -l < "$MITIGATIONS_LOG" 2>/dev/null | tr -d ' ')
+    echo ""
+    echo "${BOLD}-- Manual mitigations (last 3 of ${n_mit:-0}) --${RESET}"
+    tail -3 "$MITIGATIONS_LOG"
+fi
 
 echo ""
 echo "${BOLD}========================================================"
