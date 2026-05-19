@@ -102,17 +102,27 @@ and strengthen.
    pages mapped via mmap from the kernel) increase TOGETHER, perfectly
    correlated. This signature is consistent with the engine
    periodically requesting NEW memory blocks from the kernel via mmap
-   (or sbrk-extended heap) and never releasing them. The same pattern
-   shows up qualitatively in three of the four factorial cells but is
-   cleanest in E2. Diagnostic analysis on secondary indicators
-   (process CPU, request rate, voluntary ctx-switches, Python GC
-   activity) shows no correlation with the step events: i.e. no
-   obvious cause among the usual suspects. If confirmed and
-   mechanism-localized, this would imply UNBOUNDED resident memory
-   growth on multi-day timescales (each step adds bytes that never
-   return). The classical SAR toolkit cannot diagnose this without
-   complementary heap-profiling instrumentation; it is the most
-   actionable finding for the vLLM community.
+   (or sbrk-extended heap) and never releasing them. The paper text
+   leaves the two mechanism hypotheses (mmap vs sbrk) unresolved.
+   The same pattern shows up qualitatively in three of the four
+   factorial cells but is cleanest in E2. Diagnostic analysis on
+   secondary indicators (process CPU, request rate, voluntary
+   ctx-switches, Python GC activity) shows no correlation with the
+   step events: i.e. no obvious cause among the usual suspects. If
+   confirmed and mechanism-localized, this would imply UNBOUNDED
+   resident memory growth on multi-day timescales (each step adds
+   bytes that never return). The classical SAR toolkit cannot
+   diagnose this without complementary heap-profiling instrumentation;
+   it is the most actionable finding for the vLLM community.
+
+   **Refinement obtained during n=3 preparation (NEW vs paper):**
+   the (rss_vms_corr, K_trim) metric panel introduced for n=3
+   analysis separates two distinct step-wise mechanisms that the
+   paper had conflated. E2 is mmap-style (RSS and VMS lock-step,
+   corr ~0.93). A1 is sbrk-style (RSS steps without paired VMS
+   steps, corr ~0.20), i.e. heap-arena extension rather than
+   kernel-mapped blocks. See Open Question #4 below for the
+   classification rule.
 
 Other key observations:
 - **Client-side aging is essentially undetectable over 24h** in all
@@ -391,20 +401,21 @@ In order of priority for the next session:
    diff the bash-history docker run env from `launch_cell.py` invocation:
    ulimits, --cpus, --memory-reservation, namespaces, security-opt,
    user/uid. Any difference could be the cause.
-6. **Implement stepness analysis (kurtosis-based, K).** Write
-   `analysis/stepness.py` to compute excess kurtosis of ΔRSS per
-   run, with bootstrap 95% CI and RSS-VMS lag-0 cross-correlation
-   as companion. Required sequencing:
-   - First, run on n=1 pilot CSVs in `logs/aging_pilot_24h_*/` to
-     establish per-cell baseline K_n1 values.
-   - Then, run on n=3 r01 CSVs on server (no need to wait for r02
-     or r03 to start). Report K_n3 alongside K_n1 per cell.
-   - Final report once r02 and r03 are done: K with between-run
-     CI from 3 replicates per cell.
-   This is independent of the slope/topology investigation and
-   produces a self-contained finding for the paper (the qualitative
-   step-wise signature, quantified). High priority because it can
-   start now on n=1 data already available locally.
+6. **Stepness analysis (corr / K_trim / steps_per_hour).**
+   `analysis/stepness.py` has been written and partially validated
+   on pilot n=1 (2026-05-19). Metric panel: corr (primary, mechanism
+   signature), K_trim (intensity), steps_per_hour (operational).
+   See Open Question #4 for definition and classification rule.
+   Remaining work:
+   - Complete the K_trim CI table on n=1 (A2, E3, E3b values still
+     TBD as of 2026-05-19).
+   - Run on n=3 r01 (server). Compare per-cell mechanism-class
+     assignment n=1 vs n=3.
+   - Re-run on r02, r03 once available, compute between-run CI for
+     each metric (3 replicates per cell).
+   - The headline paper outcome is whether mechanism class
+     (mmap / sbrk / drift) is preserved across n=1 and n=3 despite
+     the slope collapse.
 7. **Long-tail TODO (post-campaign).**
    - Run validation_check.py on a1_r02 / a2_r02 / e3b_r02 if/when they
      complete.
@@ -535,35 +546,84 @@ echo "$(date -Iseconds) | <category> | <free-text note>" \
    plot. Run on all completed r01 immediately. Do not wait for r02 or
    r03 to start this analysis.
 
-   **Headline metric for the paper: excess kurtosis K of ΔRSS.** A
-   single scalar to quantify whether memory growth is punctuated
-   (step-wise) or continuous (drift). Definition: K = E[(ΔRSS - μ)⁴ /
-   σ⁴] - 3, computed on the first differences of rss_bytes
-   post-warmup. Implementation: `scipy.stats.kurtosis(diff_rss,
-   fisher=True, bias=False)`. Interpretation:
-   - K ≈ 0: gaussian-like → continuous drift (case of E1 in paper)
-   - K > 10: tail-heavy → moderate punctuation
-   - K > 50: very tail-heavy → strong step-wise pattern (expected
-     for E2, V0 cells)
+   **Metrics policy for the paper (calibrated on pilot n=1, 2026-05-19).**
+   A single scalar (K alone) proved fragile: raw kurtosis is dominated
+   by single extreme outliers (E1 pilot showed K=16412 with bootstrap
+   CI [2, 16893] driven by one anomalous sample). We adopt a
+   three-metric panel per cell.
 
-   Operational classification rule for the paper: K > 10 → cell is
-   classified as showing "punctuated memory dynamics"; K ≤ 10 →
-   "continuous drift". Bootstrap 95% CI on K via 1000 percentile
-   resamples to support the claim.
+   1. **Primary — rss_vms_corr**: lag-0 cross-correlation of dRSS and
+      dVMS post-warmup. Identifies the MECHANISM:
+      - corr > 0.8 → lock-step → mmap-style allocation (RSS and VMS
+        grow together: kernel-mapped blocks, never released)
+      - corr < 0.5 → not lock-step → either continuous drift or
+        sbrk-style heap-internal accumulation
+   2. **Secondary — K_trim**: excess kurtosis of ΔRSS after
+      winsorization at the 99.9 percentile. Quantifies the INTENSITY
+      of the step-wise pattern, robust to single outliers:
+      - K_trim > 10 → tail-heavy → punctuated dynamics
+      - K_trim < 5 → gaussian-like → continuous drift
+   3. **Operational — steps_per_hour**: count of ΔRSS > 1 MB per
+      hour of runtime. Reader-friendly descriptor: "this cell shows
+      N step events of at least 1 MB per hour."
 
-   Chosen over Gini / top-k concentration / σ-over-median because:
-   (a) kurtosis is a standard statistical moment, no bibliography
-   needed beyond a footnote citing Fisher; (b) one-line formula fits
-   the 7-page limit; (c) signed scalar, robust to choice of
-   thresholds; (d) trivially comparable across cells, replicas, and
-   between n=1 and n=3.
+   Raw K is reported alongside K_trim for transparency but does not
+   enter the classification rule.
 
-   Companion qualitative descriptor (no extra metric needed,
-   reported in text only): the RSS-VMS lag-0 cross-correlation
-   during the run, since the paper claim is that resident AND
-   virtual memory step together. If this correlation is preserved
-   in n=3 even with smaller slopes, the mmap-style mechanism
-   interpretation survives.
+   **Three-category classification rule.** Apply jointly:
+
+   | pattern              | corr   | K_trim | mechanism interpretation                                                                  |
+   |----------------------|--------|--------|-------------------------------------------------------------------------------------------|
+   | mmap-style step-wise | > 0.8  | > 10   | RSS and VMS step together at discrete events → kernel-mapped blocks never returned        |
+   | sbrk-style step-wise | < 0.5  | > 10   | RSS steps without paired VMS steps → glibc heap-arena extension, no kernel mmap involved  |
+   | continuous drift     | < 0.5  | < 5    | smooth small-grain accumulation, no big steps                                             |
+   | (border)             | mixed  | mixed  | needs n=3 confirmation                                                                    |
+
+   **Why this is a new finding versus the n=1 paper.** The paper text
+   (Section IV.E) mentions both mmap and sbrk-extended heap as
+   alternative hypotheses but does NOT distinguish them. The
+   (corr, K_trim) pair separates them for the first time. In
+   particular, A1 in the paper was lumped with the other
+   "three-of-four step-wise cells"; the metric panel reveals A1
+   belongs to a DIFFERENT mechanism class than E2 (sbrk-style vs
+   mmap-style). This is a paper-worthy refinement obtainable without
+   any new instrumentation, just from the existing proc CSVs.
+
+   **Baseline K_n1 values (pilot CSVs, 2026-05-19).**
+
+   | cell | corr  | K_trim | classification             |
+   |------|-------|--------|----------------------------|
+   | E1   | 0.32  | 0.0    | continuous drift           |
+   | E2   | 0.93  | +356   | mmap-style step-wise       |
+   | A1   | 0.20  | +402   | sbrk-style step-wise       |
+   | A2   | 0.58  | TBD    | border (intermediate)      |
+   | E3   | 0.40  | TBD    | border                     |
+   | E3b  | 0.45  | TBD    | border                     |
+
+   K_trim values for A2, E3, E3b to be filled in after re-running the
+   updated stepness.py on n=1.
+
+   **Replication plan against n=3.**
+   1. Re-run stepness.py on all pilot n=1 CSVs to complete the
+      baseline table above.
+   2. Run on n=3 r01 (server). Compare per-cell:
+      corr_n3 vs corr_n1, K_trim_n3 vs K_trim_n1.
+   3. The paper claim survives if MECHANISM CLASS is preserved
+      between n=1 and n=3 even when slope magnitudes have collapsed:
+      - E2: corr_n3 stays > 0.8 → mmap-style intact
+      - A1: corr_n3 stays < 0.5 AND K_trim_n3 > 10 → sbrk-style intact
+      - E1: corr_n3 stays low AND K_trim_n3 low → drift class confirmed
+   4. If class assignments hold across n=1 and n=3 despite 3-260x
+      slope drop, this is the strongest paper claim available:
+      "the aging MECHANISM is invariant under the operational regime;
+      only the RATE is workload-modulated."
+
+   Why this metric set was chosen: (a) all three quantities are
+   one-line definitions, no bibliography needed beyond a Fisher
+   footnote for K_trim; (b) robust to single outliers (Winsor on
+   K, correlation is bounded in [-1,1]); (c) the metric panel
+   discriminates mechanism, not just magnitude; (d) trivially
+   comparable across cells, replicas, n=1 and n=3.
 
    **Analysis sequencing (important).** Compute K on the n=1 pilot
    CSVs FIRST, before looking at any n=3 numbers. The n=1 K values

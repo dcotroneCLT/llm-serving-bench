@@ -1,8 +1,11 @@
 """
 Quantify the step-wise RSS growth pattern (paper Section IV.E, Figure 2(b)).
-Headline metric: excess kurtosis K of ΔRSS post-warmup, with bootstrap 95% CI
-and RSS-VMS lag-0 correlation as a companion. See EXPERIMENT_STATE.md
-"Open questions #4" for motivation. CLI/parsing pattern follows replicate_n1.py.
+Primary metric: RSS-VMS lag-0 correlation (mmap-style allocator signature).
+Secondary metric: trimmed excess kurtosis K_trim of ΔRSS post-warmup (winsorized
+at 99.9 percentile, bootstrap 95% CI), with raw K kept as a companion.
+Operational metric: count of ΔRSS > 1 MB events per hour.
+See EXPERIMENT_STATE.md "Open questions #4" for motivation.
+CLI/parsing pattern follows replicate_n1.py.
 """
 import argparse
 import glob
@@ -13,6 +16,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 from scipy.stats import kurtosis
+from scipy.stats.mstats import winsorize
 
 
 # Engine labels that proc_monitor writes as <label>_<seq>.csv.
@@ -127,16 +131,28 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
     arr = diff_rss.values
     if float(np.var(arr)) == 0.0:
         warn(f"{basename}: ΔRSS has zero variance; K undefined")
-        K = float("nan")
-        ci_lo = ci_hi = float("nan")
+        K_raw = float("nan")
+        K_raw_ci_lo = K_raw_ci_hi = float("nan")
+        K_trim = float("nan")
+        K_trim_ci_lo = K_trim_ci_hi = float("nan")
     else:
-        K = float(kurtosis(arr, fisher=True, bias=False))
+        K_raw = float(kurtosis(arr, fisher=True, bias=False))
+        arr_trim = np.asarray(winsorize(arr, limits=(0, 0.001)))
+        K_trim = float(kurtosis(arr_trim, fisher=True, bias=False))
         if n < 100:
             warn(f"{basename}: n={n} < 100, skipping bootstrap CI")
-            ci_lo = ci_hi = float("nan")
+            K_raw_ci_lo = K_raw_ci_hi = float("nan")
+            K_trim_ci_lo = K_trim_ci_hi = float("nan")
         else:
             rng = np.random.default_rng(seed)
-            ci_lo, ci_hi = bootstrap_ci(arr, n_bootstrap, rng)
+            K_raw_ci_lo, K_raw_ci_hi = bootstrap_ci(arr, n_bootstrap, rng)
+            K_trim_ci_lo, K_trim_ci_hi = bootstrap_ci(arr_trim, n_bootstrap, rng)
+
+    one_mb = 1024**2
+    step_count_1mb = int(np.sum(arr > one_mb))
+    duration_s = float(df["ts_unix"].max() - df["ts_unix"].min())
+    duration_h = duration_s / 3600.0
+    steps_per_h_1mb = step_count_1mb / duration_h if duration_h > 0 else float("nan")
 
     p99 = float(np.percentile(arr, 99))
     top_mask = arr >= p99
@@ -148,10 +164,14 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
         "run_id": basename,
         "cell_id": cell_id_for(basename),
         "n_samples": n,
-        "K": K,
-        "K_ci_lo": ci_lo,
-        "K_ci_hi": ci_hi,
         "rss_vms_corr": rss_vms_corr,
+        "K_raw": K_raw,
+        "K_raw_ci_lo": K_raw_ci_lo,
+        "K_raw_ci_hi": K_raw_ci_hi,
+        "K_trim": K_trim,
+        "K_trim_ci_lo": K_trim_ci_lo,
+        "K_trim_ci_hi": K_trim_ci_hi,
+        "steps_per_h_1mb": steps_per_h_1mb,
         "mean_top1_step_mb": mean_top1_step_mb,
         "_diff_rss": arr,
         "_diff_ts": ts_values,
@@ -165,29 +185,51 @@ def fmt_num(x, fmt):
 
 
 def print_pretty(rows):
-    header = f"{'run_id':<44} {'cell':<7} {'n':<7} {'K':>9} {'CI95':<22} {'corr':>6} {'top1%_step':>12}"
+    header = (
+        f"{'run_id':<44} {'cell':<5} {'n':>6} "
+        f"{'corr':>6} "
+        f"{'K_raw':>8} {'CI95':<22} "
+        f"{'K_trim':>8} {'CI95':<18} "
+        f"{'steps>1MB/h':>11} "
+        f"{'top1%_step':>12}"
+    )
     print(header)
     print("-" * len(header))
     for r in rows:
-        ci = f"[{fmt_num(r['K_ci_lo'], '+.2f')}, {fmt_num(r['K_ci_hi'], '+.2f')}]"
+        ci_raw = (
+            f"[{fmt_num(r['K_raw_ci_lo'], '+.0f')}, "
+            f"{fmt_num(r['K_raw_ci_hi'], '+.0f')}]"
+        )
+        ci_trim = (
+            f"[{fmt_num(r['K_trim_ci_lo'], '+.1f')}, "
+            f"{fmt_num(r['K_trim_ci_hi'], '+.1f')}]"
+        )
         print(
             f"{r['run_id']:<44} "
-            f"{r['cell_id']:<7} "
-            f"{r['n_samples']:<7} "
-            f"{fmt_num(r['K'], '+9.2f')} "
-            f"{ci:<22} "
-            f"{fmt_num(r['rss_vms_corr'], '6.3f')} "
+            f"{r['cell_id']:<5} "
+            f"{r['n_samples']:>6} "
+            f"{fmt_num(r['rss_vms_corr'], '6.2f')} "
+            f"{fmt_num(r['K_raw'], '+8.0f')} {ci_raw:<22} "
+            f"{fmt_num(r['K_trim'], '+8.1f')} {ci_trim:<18} "
+            f"{fmt_num(r['steps_per_h_1mb'], '11.2f')} "
             f"{fmt_num(r['mean_top1_step_mb'], '8.4f')} MB"
         )
 
 
 def print_csv(rows):
-    print("run_id,cell_id,n_samples,K,K_ci_lo,K_ci_hi,rss_vms_corr,mean_top1_step_mb")
+    print(
+        "run_id,cell_id,n_samples,rss_vms_corr,"
+        "K_raw,K_raw_ci_lo,K_raw_ci_hi,"
+        "K_trim,K_trim_ci_lo,K_trim_ci_hi,"
+        "steps_per_h_1mb,mean_top1_step_mb"
+    )
     for r in rows:
         print(
             f"{r['run_id']},{r['cell_id']},{r['n_samples']},"
-            f"{r['K']:.6f},{r['K_ci_lo']:.6f},{r['K_ci_hi']:.6f},"
-            f"{r['rss_vms_corr']:.6f},{r['mean_top1_step_mb']:.6f}"
+            f"{r['rss_vms_corr']:.6f},"
+            f"{r['K_raw']:.6f},{r['K_raw_ci_lo']:.6f},{r['K_raw_ci_hi']:.6f},"
+            f"{r['K_trim']:.6f},{r['K_trim_ci_lo']:.6f},{r['K_trim_ci_hi']:.6f},"
+            f"{r['steps_per_h_1mb']:.6f},{r['mean_top1_step_mb']:.6f}"
         )
 
 
