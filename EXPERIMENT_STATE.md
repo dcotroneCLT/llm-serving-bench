@@ -67,11 +67,16 @@ every wasted run is a wasted day.
 
 ---
 
-## Background: what the n=1 paper found
+## Background: what the n=1 preprint found
 
-The submitted version of the paper (single-run 24h per cell, no replicas)
-established three findings that the n=3 campaign was designed to replicate
-and strengthen.
+(Context only. The camera-ready paper does NOT compare against these
+numbers; it reports the n=3 results standalone. This section is here
+to remind the reader of the prior state of the art on which the n=3
+study design rests, and to provide a reference for the internal
+sanity check discussed in "Internal sanity check" section below.)
+
+The submitted preprint (single-run 24h per cell, no replicas)
+established three findings that motivated the n=3 design.
 
 1. **Software aging exists in modern LLM serving on the GPU.** All three
    primary deployments (vLLM standalone V1, Triton + vLLM V0, naive
@@ -170,17 +175,28 @@ This design choice is now under scrutiny (see "Open questions").
 ## TL;DR
 
 The n=3 campaign is on day 3.5 of 9.5. Round 1 (r01 of all 6 cells) is
-complete. The RSS slope numbers from r01 are 3 to 260 times smaller than
-the n=1 paper Table IV. Image drift has been ruled out as the dominant
-cause because a1 (vLLM V0 v0.7.3, immutable 15-month-old binary, identical
-args) also drops by 8x. The leading hypothesis is a topology effect:
-the paper ran one cell at a time on the host; the n=3 campaign runs three
-cells in parallel on three GPUs. E3b (sub-saturated) replicates the paper
-exactly while E3 (saturated) does not, which is consistent with a CPU-host
-contention mechanism. Plan: let the r02 batch finish (~30h), then stop
-the campaign and run a1 in isolation for 24h. If isolated a1 returns
-to ~+530 KB/h, topology effect is confirmed and the paper narrative needs
-revision.
+complete. The camera-ready paper will be a **standalone study on n=3
+data**, not a replication of the preprint (see Paper section above for
+the framing decision taken on 2026-05-19).
+
+On the n=3 data, the central findings to verify (independent of any
+preprint comparison) are: (a) does aging exist across the 6 cells?
+(b) is it localized in the framework orchestration layers rather than
+the inference path? (c) which cells exhibit mmap-style step-wise growth
+vs sbrk-style vs continuous drift, per the (corr, K_trim) classification?
+(d) does the qualitative pattern hold across r01, r02, r03 with low
+between-run variance?
+
+Internally (not in the paper), we observed that r01 slopes are 3 to
+260 times smaller than the preprint Table IV. We are investigating
+this as a sanity check, since the preprint was the basis for hardware
+booking and rate calibration. Image drift has been ruled out as the
+dominant cause (a1 binary is immutable v0.7.3 and still drops 8x).
+Leading internal hypothesis: parallel-topology effect (preprint was
+sequential single-GPU, n=3 is parallel three-GPU). E3b sub-saturated
+matches the preprint magnitude; E3 saturated does not. Plan: let the
+r02 batch finish (~30h), then run a1 in isolation for 24h as a
+diagnostic. Regardless of outcome, the paper proceeds on n=3 numbers.
 
 ---
 
@@ -190,10 +206,19 @@ revision.
 - Deadline: 30 June 2026
 - Authors: Domenico Cotroneo (UniNa Federico II / UNCC), Bojan Cukic (UNCC)
 - Working title: "The Aging Surface of LLM Serving Engines: An Empirical Study"
-- Submitted (n=1) version: 6 cells, 24h each, single-GPU sequential.
-  Available at docs/WOSAR_2026.pdf (uploaded version).
-- Target (n=3) version: 6 cells, 3 replicas each, 36h each, 3-GPU parallel.
-  Currently in execution.
+- **Preprint (n=1) version**: `docs/WOSAR_2026.pdf`. Single-run 24h per
+  cell, single-GPU sequential. Preliminary findings.
+- **Camera-ready (final) version**: standalone paper based entirely on
+  the n=3 campaign data. Currently in execution. **NOT framed as a
+  replication study of the preprint**: the final paper presents the
+  n=3 numbers directly, with its own slopes, its own metric panel
+  (corr, K_trim, steps/h), and its own mechanism interpretation
+  (mmap-style vs sbrk-style step-wise). The preprint serves as
+  background context (what was previously hypothesized) but its
+  numerical results are not the reference against which the n=3
+  campaign is validated. Differences in slope magnitude between
+  preprint and n=3 are an internal sanity check, not a paper-level
+  claim.
 
 ---
 
@@ -303,24 +328,54 @@ Pending (not yet started):
 
 ---
 
-## Results r01 vs paper Table IV
+## Internal sanity check: r01 slopes vs preprint Table IV
 
-| cell | paper | n=3 r01 | factor | image identical to paper? |
+**Scope.** This table is INTERNAL: it does not appear in the
+camera-ready paper. The paper presents the n=3 numbers standalone.
+This sanity check exists because the preprint informed the hardware
+booking and the rate calibrations; a large unexplained divergence is
+worth understanding before we trust the rest of the n=3 numbers.
+
+| cell | preprint | n=3 r01 | factor | image identical to preprint? |
 |---|---|---|---|---|
 | E1 V1 standalone | +9.15 MB/h | +0.035 MB/h | 260x smaller | NO (drift) |
 | E2 Triton+V0     | +2.04 MB/h | +0.109 MB/h | 18x smaller  | yes |
 | E3 PyT+HF sat    | +170 KB/h  | +58 KB/h    | 3x smaller   | yes |
-| E3b PyT+HF low   | +179 KB/h  | +201 KB/h   | **~1.1x (REPLICATES)** | yes |
+| E3b PyT+HF low   | +179 KB/h  | +201 KB/h   | **~1.1x (matches)** | yes |
 | A1 V0 standalone | +530 KB/h  | +64 KB/h    | **8.3x smaller** | **YES** (identical immutable binary) |
 | A2 Triton+V1     | +20 KB/h   | +217 KB/h   | 10x larger | yes (but rate differs, see note) |
 
 Notes:
-- A2 had its target rate recalibrated from 0.90 (paper) to 1.753 (n=3)
-  after smoke tests confirmed V1 is actually initialized in Triton with
-  VLLM_USE_V1=1. So A2 is not directly comparable to paper A2.
-- Pipeline correctness validated: `replicate_n1.py` (committed at repo root)
-  reads the local n=1 CSVs and reproduces the paper numbers within 5-20%.
-  So the n=3 numbers above are correct, not a pipeline artefact.
+- A2 had its target rate recalibrated from 0.90 (preprint) to 1.753
+  (n=3) after smoke tests confirmed V1 is actually initialized in
+  Triton with VLLM_USE_V1=1. So A2 is not directly comparable to
+  preprint A2.
+- Pipeline correctness validated: `replicate_n1.py` (committed at repo
+  root) reads the local n=1 CSVs and reproduces the preprint numbers
+  within 5-20%. So the n=3 numbers above are correct, not a pipeline
+  artefact.
+- For the camera-ready paper, only the n=3 column matters; the
+  preprint column is here for our internal record.
+
+**Why this verification still matters (even if not in the paper).**
+We deliberately want to check whether the qualitative findings of the
+preprint are recovered in the n=3 data, independent of the absolute
+magnitudes. Specifically:
+
+1. Does the **framework-layer localization** hold? (E1 + E2 leak more
+   than E3, regardless of slope magnitude.)
+2. Does the **engine × hosting interaction** hold? (V0 standalone
+   leaks less than V1 standalone, but more than V1 in Triton — i.e.
+   the qualitative ordering of the 2x2 factorial.)
+3. Does the **step-wise lock-step pattern** hold for E2? (corr > 0.8,
+   K_trim > 10 on n=3.) And does the new mmap-vs-sbrk distinction
+   carry over?
+4. Is **client-side aging still effectively absent** at the 36h scale?
+
+If yes on all four, the preprint findings are essentially confirmed at
+the level that matters scientifically (mechanism and ordering), and
+the n=3 paper presents updated numbers on top of confirmed phenomena.
+If any fails, that is itself a finding the n=3 paper can report.
 
 ---
 
@@ -364,6 +419,16 @@ Notes:
 - 2026-05-19 afternoon ET: Decision to let the r02 batch complete
   (~30h) before any intervention. Stop campaign only after r02 batch
   finishes, then run a1 in isolation as a topology-effect test.
+- 2026-05-19 evening ET: **Paper framing decision.** The camera-ready
+  is a standalone paper on n=3 data, NOT a replication study of the
+  preprint. The internal sanity check comparing r01 slopes to
+  preprint Table IV remains useful (the preprint informed booking
+  and rate calibration, large unexplained divergence is worth
+  investigating) and the qualitative findings of the preprint will
+  be verified against n=3 internally. But the camera-ready presents
+  n=3 numbers directly, with its own metric panel and mechanism
+  interpretation. This reframing removes the burden of explaining a
+  "replication failure" in the paper itself.
 
 ---
 
@@ -388,15 +453,22 @@ In order of priority for the next session:
    identical args to current `cells/a1.yaml`. Expected: ~+530 KB/h if
    topology is the confound; ~+64 KB/h if topology is not the cause
    (in which case we need a deeper investigation).
-4. **Paper narrative decision.** Conditional on a1 isolated result:
-   - If +530 KB/h, narrative becomes "we replicate the pilot in a
-     controlled single-cell setting; parallel-topology deployment in
-     real production reduces apparent aging rates by 5-10x, which is
-     itself an operationally relevant observation."
-   - If +64 KB/h, narrative becomes "the pilot numbers in Table IV did
-     not survive replication. Possible cause: something in the launch
-     framework not captured by the bash-history args (env vars, ulimits,
-     CPU pinning). Investigation continues."
+4. **Paper narrative finalization (under the standalone-n=3 framing).**
+   The camera-ready will present n=3 numbers directly. The narrative
+   does NOT depend on the a1 isolated outcome; the isolated diagnostic
+   only informs our internal understanding. The four content elements
+   to write up regardless of a1 isolated outcome:
+   (a) campaign description and stress regime (Section IV.A) on n=3.
+   (b) client-side stationarity check (Section IV.B) on n=3.
+   (c) process-side memory aging (Section IV.C) on n=3, with the new
+       (corr, K_trim, steps/h) metric panel and the
+       mmap-vs-sbrk-vs-drift classification.
+   (d) low-load ablation (E3b) and 2x2 factorial (Section IV.D-E)
+       on n=3.
+   Threats-to-Validity section explicitly discusses the parallel
+   topology choice as a feature of the design (matches realistic
+   multi-tenant deployment), with the a1-isolated outcome cited in
+   support if available.
 5. **Backup hypothesis to test if a1 isolated does not replicate.**
    diff the bash-history docker run env from `launch_cell.py` invocation:
    ulimits, --cpus, --memory-reservation, namespaces, security-opt,
@@ -423,6 +495,21 @@ In order of priority for the next session:
      executed protocol (n=3, 36h, parallel topology, Qwen2.5-7B).
    - Fix run_monitors.py manifest collision (currently a workaround).
    - Restore Docker data-root on /home per ADR-002.
+   - Refactor `analysis/aging_trends.py` to use `analysis/aging_io.py`
+     (currently duplicates `load_csvs` and `proc_prefix` discovery).
+     Deferred from 2026-05-19 audit: not a correctness issue since
+     `aging_trends.py` is always called with explicit `<run_dir>`,
+     just code-quality debt.
+   - Standardize `process_alive` parsing on `aging_io.truthy_series`
+     across `validation_check.py` and `aging_trends.py`. Currently
+     they use `astype(bool)` / `== True` which works because pandas
+     infers bool, but is fragile if a sentinel row ever introduces
+     a non-bool value. Deferred from 2026-05-19 audit, low risk.
+   - `replicate_n1.py` has a hardcoded `BASE` path tied to the
+     original Cowork sandbox. The script is frozen (one-shot
+     pipeline validation against paper Table IV, ran on 2026-05-19,
+     numbers in this doc). If rerun elsewhere, parametrize via
+     `--base PATH` CLI flag. Not a blocker.
 
 ---
 

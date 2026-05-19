@@ -215,6 +215,48 @@ def warmup_from_manifest(manifest: dict, default_s: float = DEFAULT_WARMUP_S) ->
     return default_s
 
 
+def resolve_warmup(run_dir: Path, default_s: float = DEFAULT_WARMUP_S) -> float:
+    """Resolve warmup_discard_s for a run directory by project convention.
+
+    - wosar2026_<cell>_r<NN>: read from campaigns/wosar2026/cells/<cell>.yaml
+      (the single source of truth for n=3 campaign runs).
+    - aging_pilot_*: paper convention 1800s (default_s).
+    - Anything else: fall back to manifest, then default_s.
+
+    Callers that already have an explicit warmup (CLI flag) should bypass
+    this helper.
+    """
+    run_dir = Path(run_dir)
+    name = run_dir.name
+    if name.startswith("wosar2026_"):
+        rest = name[len("wosar2026_"):]
+        cell_id = rest.split("_r", 1)[0].lower() if "_r" in rest else rest.lower()
+        cell_yaml = REPO_ROOT / "campaigns" / "wosar2026" / "cells" / f"{cell_id}.yaml"
+        if cell_yaml.is_file():
+            try:
+                cell = load_yaml_minimal(cell_yaml, kind="cell")
+                if cell.get("warmup_discard_s") is not None:
+                    return float(cell["warmup_discard_s"])
+            except Exception as exc:
+                print(f"  [warn] could not read warmup from {cell_yaml}: {exc}", file=sys.stderr)
+        return float(default_s)
+    if name.startswith("aging_pilot_"):
+        return float(default_s)
+    return warmup_from_manifest(load_manifest(run_dir), default_s=default_s)
+
+
+def discover_runs(logs_root: Path) -> list[Path]:
+    """Return run directories under logs_root matching project naming conventions."""
+    logs_root = Path(logs_root)
+    out: list[Path] = []
+    if not logs_root.is_dir():
+        return out
+    for entry in sorted(logs_root.iterdir()):
+        if entry.is_dir() and (entry.name.startswith("aging_pilot_") or entry.name.startswith("wosar2026_")):
+            out.append(entry)
+    return out
+
+
 def label_for_run(cell_id: Optional[str], replica: Optional[str], run_dir: Path) -> str:
     if cell_id and cell_id in CELL_META:
         base = CELL_META[cell_id]["label"]

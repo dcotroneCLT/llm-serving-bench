@@ -3,6 +3,9 @@ Replicate paper n=1 RSS slope from local CSVs.
 Compare to paper Table IV.
 Downsamples to ~2000 samples per run to keep Theil-Sen O(n^2) tractable.
 """
+# Frozen replication script: BASE is hardcoded to the original sandbox path used
+# at submission time; do not refactor to use aging_io.py.
+
 import glob
 import os
 import pandas as pd

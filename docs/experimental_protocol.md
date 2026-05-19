@@ -182,6 +182,22 @@ Figure generation:
 - `analysis/diagnose_step_patterns.py` for RSS vs VMS, CPU, request
   rate, and voluntary context-switch diagnostics.
 
+Step-wise pattern quantification (paper Section IV.E, Figure 2):
+
+- `analysis/stepness.py` emits a three-metric panel per run:
+  `rss_vms_corr` (lag-0 RSS-VMS correlation, primary signature of the
+  allocation mechanism), `K_trim` (excess kurtosis of ΔRSS after
+  winsorize at the 99.9 percentile, secondary intensity metric), and
+  `steps_per_h_1mb` (operational rate of ΔRSS events larger than
+  1 MiB).
+- Raw `K` is reported alongside `K_trim` but is dominated by single
+  outliers and not used for cross-cell comparison.
+- Classification rule for the paper:
+  - mmap-style step-wise: `corr > 0.8` AND `K_trim > 10` (canonical: E2).
+  - RSS-only step-wise (sbrk-style): `corr < 0.5` AND `K_trim > 10`
+    (A1 candidate).
+  - continuous drift: `corr < 0.5` AND `K_trim < 5` (canonical: E1).
+
 ## 9. Integrity Checks
 
 Before long runs:

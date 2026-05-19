@@ -81,6 +81,7 @@ Plus 1 sanity run: e2 on gpu0 (override) for 6h, to argue GPU index does not mat
 - `scripts/smoke_test_run.sh`: 5-min GO/NO-GO gate before each cell
 - `scripts/campaign_health.sh`: periodic read-only health monitor (run every 6-12h during campaign)
 - `analysis/validation_check.py`: post-run verdict (Mann-Kendall + Theil-Sen, p<0.01 + slope>0)
+- `analysis/stepness.py`: step-wise pattern panel (corr, K_trim, steps>1MB/h) with bootstrap CIs and a three-category classification rule for the paper
 
 ## Critical fixes applied (chronological)
 
@@ -131,11 +132,12 @@ Interpret FAILs:
 ## What to do at end of campaign
 
 1. Run `python analysis/validation_check.py --run-dir ~/wosar/runs/wosar2026_<cell>_r<NN>` for each of the 19 runs. Each emits PASS / SOFT FAIL / HARD FAIL verdict on the RSS slope.
-2. Aggregate r01/r02/r03 slopes per cell (median + union/intersection of 95% CIs).
-3. Apply Benjamini-Hochberg FDR control at q=0.10 across cells.
-4. Re-write paper sections IV.C (results per RQ), IV.E (ablations), V (Threats to Validity).
-5. Update docs/experimental_protocol.md to reflect the actual campaign (Qwen2.5-7B, n=3, 36h windows, 3-slot parallel).
-6. Submit by 30 June 2026.
+2. Run `python analysis/stepness.py --logs-root ~/wosar/runs --warmup-s 3600` to compute the three-metric panel (corr, K_trim, steps>1MB/h) for all replicas. Apply the paper classification rule per cell (n=3 majority).
+3. Aggregate r01/r02/r03 slopes per cell (median + union/intersection of 95% CIs).
+4. Apply Benjamini-Hochberg FDR control at q=0.10 across cells.
+5. Re-write paper sections IV.C (results per RQ), IV.E (ablations), V (Threats to Validity).
+6. Update docs/experimental_protocol.md to reflect the actual campaign (Qwen2.5-7B, n=3, 36h windows, 3-slot parallel).
+7. Submit by 30 June 2026.
 
 ## Pending technical debt (post-campaign)
 

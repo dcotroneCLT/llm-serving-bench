@@ -178,6 +178,13 @@ python3 analysis/validation_check.py --run-dir <run_dir>
 python3 analysis/aging_trends.py <run_dir> --alpha 0.10 --downsample-seconds 60
 ```
 
+For the step-wise pattern panel (corr, K_trim, steps>1MB/h) across all
+runs under a runs root:
+
+```
+python3 analysis/stepness.py --logs-root <runs_root> --warmup-s 3600
+```
+
 For campaign figures:
 
 ```

@@ -8,83 +8,40 @@ See EXPERIMENT_STATE.md "Open questions #4" for motivation.
 CLI/parsing pattern follows replicate_n1.py.
 """
 import argparse
-import glob
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.stats import kurtosis
 from scipy.stats.mstats import winsorize
 
-
-# Engine labels that proc_monitor writes as <label>_<seq>.csv.
-KNOWN_LABELS = [
-    "vllm_v0_standalone",
-    "vllm_v1_standalone",
-    "vllm_standalone",
-    "triton_vllm_v0",
-    "triton_vllm_v1",
-    "triton_vllm",
-    "pytorch_naive",
-]
-
-# Fixed mapping from pilot run dir basename to paper cell_id.
-PILOT_CELL_MAP = {
-    "aging_pilot_24h_vllm_v1":                   "E1",
-    "aging_pilot_24h_triton_v1":                 "E2",
-    "aging_pilot_24h_pytorch_naive_v1":          "E3",
-    "aging_pilot_24h_pytorch_naive_low_rate_v1": "E3b",
-    "aging_pilot_24h_vllm_v0_ablation_v2":       "A1",
-    "aging_pilot_24h_triton_v1_ablation_v2":     "A2",
-}
+from aging_io import (
+    discover_proc_prefix,
+    discover_runs,
+    infer_cell_id,
+    load_manifest,
+    load_proc,
+    resolve_warmup,
+)
 
 
 def warn(msg):
     print(f"warning: {msg}", file=sys.stderr)
 
 
-def detect_label(run_dir):
-    """Return the first KNOWN_LABELS entry that has matching CSVs in run_dir."""
-    for lab in KNOWN_LABELS:
-        if glob.glob(os.path.join(run_dir, f"{lab}_*.csv")):
-            return lab
-    return None
-
-
-def cell_id_for(run_basename):
-    if run_basename in PILOT_CELL_MAP:
-        return PILOT_CELL_MAP[run_basename]
-    if run_basename.startswith("wosar2026_"):
-        return run_basename[len("wosar2026_"):]
-    return run_basename
-
-
-def load_proc(run_dir, label):
-    files = sorted(glob.glob(os.path.join(run_dir, f"{label}_*.csv")))
-    if not files:
-        return None
-    dfs = []
-    for f in files:
-        try:
-            cols = ["ts_unix", "process_alive", "rss_bytes", "vms_bytes"]
-            d = pd.read_csv(f, usecols=lambda c: c in cols)
-            dfs.append(d)
-        except Exception as e:
-            warn(f"failed to read {f}: {e}")
-    if not dfs:
-        return None
-    df = pd.concat(dfs, ignore_index=True)
-    df = df.sort_values("ts_unix").drop_duplicates("ts_unix").reset_index(drop=True)
-    return df
+def display_cell_id(cell_id, fallback):
+    if not cell_id:
+        return fallback
+    # "e1" -> "E1", "e3b" -> "E3b", "a1" -> "A1"
+    return cell_id[:1].upper() + cell_id[1:]
 
 
 def filter_run(df, warmup_s):
     t0 = df["ts_unix"].min()
     df = df[df["ts_unix"] >= t0 + warmup_s].copy()
-    if "process_alive" in df.columns:
-        df = df[df["process_alive"].astype(str).str.lower().isin(["true", "1"])]
     df = df[df["rss_bytes"].notna()]
     return df.reset_index(drop=True)
 
@@ -99,15 +56,20 @@ def bootstrap_ci(values, n_resamples, rng):
 
 
 def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
-    basename = os.path.basename(os.path.normpath(run_dir))
-    label = detect_label(run_dir)
+    run_path = Path(run_dir)
+    basename = run_path.name
+    manifest = load_manifest(run_path)
+    label = discover_proc_prefix(run_path, manifest)
     if label is None:
         warn(f"{basename}: no proc_monitor CSV matching known engine labels; skipping")
         return None
-    df = load_proc(run_dir, label)
+    df = load_proc(run_path, label, columns=["rss_bytes", "vms_bytes"])
     if df is None or df.empty:
         warn(f"{basename}: empty or unreadable proc CSVs; skipping")
         return None
+    df = df.drop_duplicates("ts_unix").reset_index(drop=True)
+    if warmup_s is None:
+        warmup_s = resolve_warmup(run_path)
     df = filter_run(df, warmup_s)
     if df.empty:
         warn(f"{basename}: empty after warmup/alive filter; skipping")
@@ -162,7 +124,7 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
     ts_values = df["ts_unix"].astype(float).values[1:]
     return {
         "run_id": basename,
-        "cell_id": cell_id_for(basename),
+        "cell_id": display_cell_id(infer_cell_id(basename, manifest), basename),
         "n_samples": n,
         "rss_vms_corr": rss_vms_corr,
         "K_raw": K_raw,
@@ -246,22 +208,18 @@ def print_top_k(rows, k):
             print(f"  {when}  +{arr[i] / 1024**2:8.3f} MB")
 
 
-def discover_runs(logs_root):
-    out = []
-    for entry in sorted(os.listdir(logs_root)):
-        if entry.startswith("aging_pilot_") or entry.startswith("wosar2026_"):
-            path = os.path.join(logs_root, entry)
-            if os.path.isdir(path):
-                out.append(path)
-    return out
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--run-dir", help="single run directory")
     g.add_argument("--logs-root", help="parent containing multiple run dirs")
-    p.add_argument("--warmup-s", type=int, default=1800, help="warmup discard in seconds")
+    p.add_argument(
+        "--warmup-s",
+        type=int,
+        default=None,
+        help="warmup discard in seconds; if omitted, resolved per-run "
+             "(wosar2026_*: campaign cell yaml; aging_pilot_*: 1800s)",
+    )
     p.add_argument("--bootstrap", type=int, default=1000, help="bootstrap resamples for K CI")
     p.add_argument("--seed", type=int, default=42, help="RNG seed for bootstrap")
     p.add_argument("--csv", action="store_true", help="machine-readable CSV output")
@@ -269,7 +227,7 @@ def main():
     args = p.parse_args()
 
     if args.run_dir:
-        targets = [args.run_dir]
+        targets = [Path(args.run_dir)]
     else:
         targets = discover_runs(args.logs_root)
         if not targets:
