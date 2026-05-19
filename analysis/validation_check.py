@@ -38,6 +38,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pymannkendall as mk
+from scipy.stats import theilslopes
+
+from aging_io import truthy_series
 
 
 HARD_FAIL = 2
@@ -116,9 +119,13 @@ def rss_slope_mb_per_h(rss_bytes: np.ndarray, ts_unix: np.ndarray, discard_warmu
     except Exception as e:
         return {"error": f"mann-kendall failed: {e}"}
 
-    # Theil-Sen slope: bytes per second (because x = ts_unix in seconds).
-    # Convert to MB/h: bytes/s * 3600 / 1e6
-    slope_bytes_per_s = mk_result.slope
+    # Theil-Sen slope on the REAL ts_unix axis (seconds). pymannkendall's
+    # mk_result.slope is computed on integer sample indices [0,1,...] and
+    # would need to be divided by the proc_monitor sample period before
+    # converting to MB/h. Using scipy.stats.theilslopes(y, x) sidesteps
+    # that confusion and matches replicate_n1.py and aging_trends.py.
+    sen_slope, sen_intercept, _, _ = theilslopes(rss_post, ts_post)
+    slope_bytes_per_s = float(sen_slope)
     slope_mb_per_h = slope_bytes_per_s * 3600.0 / 1e6
 
     return {
@@ -129,7 +136,7 @@ def rss_slope_mb_per_h(rss_bytes: np.ndarray, ts_unix: np.ndarray, discard_warmu
         "z_statistic": float(mk_result.z),
         "trend": mk_result.trend,        # 'increasing', 'decreasing', 'no trend'
         "slope_mb_per_h": float(slope_mb_per_h),
-        "intercept_bytes": float(mk_result.intercept),
+        "intercept_bytes": float(sen_intercept),
     }
 
 
@@ -197,7 +204,7 @@ def check(run_dir: Path) -> int:
         return HARD_FAIL
 
     if "process_alive" in proc_df.columns:
-        alive_frac = float(proc_df["process_alive"].astype(bool).mean())
+        alive_frac = float(truthy_series(proc_df["process_alive"]).mean())
         log(f"proc alive frac : {alive_frac:.3f}")
         if alive_frac < 0.95:
             log(f"[HARD] proc_monitor reports < 95% samples with process_alive=True")
@@ -224,7 +231,7 @@ def check(run_dir: Path) -> int:
 
     # Filter to live samples only
     if "process_alive" in proc_df.columns:
-        df = proc_df[proc_df["process_alive"].astype(bool)].copy()
+        df = proc_df[truthy_series(proc_df["process_alive"])].copy()
     else:
         df = proc_df.copy()
     df = df.dropna(subset=[rss_col, ts_col])

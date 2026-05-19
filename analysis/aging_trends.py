@@ -46,6 +46,7 @@ Dependencies: pandas, numpy, scipy, pymannkendall.
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import sys
 import warnings
@@ -61,6 +62,8 @@ try:
 except ImportError:
     print("pymannkendall not installed. Run: pip install pymannkendall", file=sys.stderr)
     sys.exit(2)
+
+from aging_io import infer_cell_id, load_manifest, resolve_warmup, truthy_series
 
 
 # ---------- data loading ----------
@@ -92,6 +95,24 @@ def load_client(run_dir: Path) -> Optional[pd.DataFrame]:
         return None
     parts = [pd.read_csv(f) for f in files]
     return pd.concat(parts, ignore_index=True)
+
+
+def filter_warmup(df: Optional[pd.DataFrame], ts_col: str, warmup_s: float) -> Optional[pd.DataFrame]:
+    if df is None or df.empty or ts_col not in df.columns:
+        return df
+    t0 = float(df[ts_col].min())
+    return df[df[ts_col] >= t0 + warmup_s].reset_index(drop=True)
+
+
+def warmup_source_tag(run_dir: Path, cli_override: Optional[float]) -> str:
+    if cli_override is not None:
+        return "cli"
+    name = run_dir.name
+    if name.startswith("aging_pilot_"):
+        return "pilot"
+    if name.startswith("wosar2026_"):
+        return "campaign"
+    return "default"
 
 
 # ---------- core stats ----------
@@ -231,53 +252,78 @@ def bh_fdr(pvalues: list[float], alpha: float = 0.10) -> list[float]:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("run_dir", type=Path)
+    p.add_argument("run_dir", type=Path, nargs="?", default=None,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--run-dir", type=Path, default=None, dest="run_dir_flag",
+                   help="run directory (alternative to positional)")
     p.add_argument("--alpha", type=float, default=0.10)
     p.add_argument("--downsample-seconds", type=int, default=60)
+    p.add_argument("--warmup-s", type=float, default=None,
+                   help="warmup discard in seconds; if omitted, resolved per-run "
+                        "(aging_pilot_*: 1800s; wosar2026_*: from cell yaml).")
+    p.add_argument("--csv", action="store_true",
+                   help="emit one CSV row per (run_id, indicator) to stdout "
+                        "instead of the human-readable table.")
     args = p.parse_args()
 
-    if not args.run_dir.is_dir():
-        print(f"Not a directory: {args.run_dir}", file=sys.stderr); sys.exit(1)
+    run_dir = args.run_dir_flag if args.run_dir_flag is not None else args.run_dir
+    if run_dir is None:
+        p.error("provide run dir as positional argument or --run-dir flag")
+    if not run_dir.is_dir():
+        print(f"Not a directory: {run_dir}", file=sys.stderr); sys.exit(1)
 
-    print(f"Loading run from {args.run_dir} ...")
+    warmup_s = float(args.warmup_s) if args.warmup_s is not None else float(resolve_warmup(run_dir))
+    print(f"warmup_s = {int(warmup_s)} ({warmup_source_tag(run_dir, args.warmup_s)})",
+          file=sys.stderr)
 
-    gpu = load_csvs(args.run_dir, "gpu0")
+    manifest = load_manifest(run_dir)
+    cell_id = infer_cell_id(run_dir.name, manifest) or ""
+
+    progress = sys.stderr if args.csv else sys.stdout
+    print(f"Loading run from {run_dir} ...", file=progress)
+
+    gpu = load_csvs(run_dir, "gpu0")
     if gpu is None:
         print("  [warn] no gpu0 CSVs found", file=sys.stderr); gpu_ds = None
     else:
+        gpu = filter_warmup(gpu, "ts_unix", warmup_s)
         gpu_ds = downsample_to_minutes(gpu, "ts_unix", args.downsample_seconds)
-        print(f"  gpu: {len(gpu)} raw -> {len(gpu_ds)} per-window samples")
+        print(f"  gpu: {len(gpu)} post-warmup -> {len(gpu_ds)} per-window samples", file=progress)
 
     proc_prefix = None
-    for f in args.run_dir.glob("*_000000.csv"):
+    for f in run_dir.glob("*_000000.csv"):
         name = f.stem.rsplit("_", 1)[0]
         if name not in ("gpu0", "system"):
             proc_prefix = name; break
     if proc_prefix:
-        proc = load_csvs(args.run_dir, proc_prefix)
+        proc = load_csvs(run_dir, proc_prefix)
         if proc is not None:
             if "process_alive" in proc.columns:
-                proc = proc[proc["process_alive"] == True]
+                proc = proc[truthy_series(proc["process_alive"])]
+            proc = filter_warmup(proc, "ts_unix", warmup_s)
             proc_ds = downsample_to_minutes(proc, "ts_unix", args.downsample_seconds)
-            print(f"  proc ({proc_prefix}): {len(proc)} raw -> {len(proc_ds)} per-window samples")
+            print(f"  proc ({proc_prefix}): {len(proc)} post-warmup -> {len(proc_ds)} per-window samples",
+                  file=progress)
         else:
             proc_ds = None
     else:
-        print("  [warn] no proc monitor CSV found"); proc_ds = None
+        print("  [warn] no proc monitor CSV found", file=progress); proc_ds = None
 
-    system = load_csvs(args.run_dir, "system")
+    system = load_csvs(run_dir, "system")
     if system is None:
         print("  [warn] no system CSVs found", file=sys.stderr); system_ds = None
     else:
+        system = filter_warmup(system, "ts_unix", warmup_s)
         system_ds = downsample_to_minutes(system, "ts_unix", args.downsample_seconds)
-        print(f"  system: {len(system)} raw -> {len(system_ds)} per-window samples")
+        print(f"  system: {len(system)} post-warmup -> {len(system_ds)} per-window samples", file=progress)
 
-    client = load_client(args.run_dir)
+    client = load_client(run_dir)
     if client is None:
         print("  [warn] no client requests CSVs found", file=sys.stderr); client_ds = None
     else:
+        client = filter_warmup(client, "submitted_at_unix", warmup_s)
         client_ds = downsample_client(client, args.downsample_seconds)
-        print(f"  client: {len(client)} raw -> {len(client_ds)} per-window samples")
+        print(f"  client: {len(client)} post-warmup -> {len(client_ds)} per-window samples", file=progress)
 
     catalog = []
     if gpu_ds is not None:
@@ -308,16 +354,18 @@ def main() -> None:
     if not catalog:
         print("No indicators to analyze. Aborting.", file=sys.stderr); sys.exit(1)
 
-    print(f"\nAnalyzing {len(catalog)} indicators ...")
+    print(f"\nAnalyzing {len(catalog)} indicators ...", file=progress)
     dt_hours = args.downsample_seconds / 3600.0
 
     rows = []
     for source, name, series in catalog:
-        print(f"  {source}.{name} (n={series.notna().sum()}) ...", end=" ", flush=True)
+        print(f"  {source}.{name} (n={series.notna().sum()}) ...", end=" ",
+              flush=True, file=progress)
         s = trend_one_indicator(series, dt_hours)
         s["source"] = source; s["indicator"] = name
         rows.append(s)
-        print(f"slope={s['sen_slope_per_hour']:.4g}/h, rho={s['rho']:.2f}, p={s['mk_p']:.4f}")
+        print(f"slope={s['sen_slope_per_hour']:.4g}/h, rho={s['rho']:.2f}, p={s['mk_p']:.4f}",
+              file=progress)
 
     pvals = [r["mk_p"] for r in rows]
     qvals = bh_fdr(pvals, alpha=args.alpha)
@@ -329,6 +377,28 @@ def main() -> None:
         )
         mk_significant = (not np.isnan(q)) and (q < args.alpha)
         r["significant"] = bool(mk_significant and ci_excludes_zero)
+
+    if args.csv:
+        writer = csv.writer(sys.stdout)
+        writer.writerow([
+            "run_id", "cell_id", "indicator", "n_samples",
+            "slope", "slope_ci_lo", "slope_ci_hi",
+            "mk_z", "mk_p_value", "lag1_rho",
+        ])
+        for r in sorted(rows, key=lambda x: (x["source"], x["indicator"])):
+            writer.writerow([
+                run_dir.name,
+                cell_id,
+                f"{r['source']}.{r['indicator']}",
+                r["n"],
+                format(r["sen_slope_per_hour"], ".6g"),
+                format(r["ci_low"], ".6g"),
+                format(r["ci_high"], ".6g"),
+                format(r["mk_z"], ".6g"),
+                format(r["mk_p"], ".6g"),
+                format(r["rho"], ".6g"),
+            ])
+        return
 
     print("\n" + "=" * 140)
     print(f"AGING TREND ANALYSIS  (FDR target q={args.alpha:.2f}, "
