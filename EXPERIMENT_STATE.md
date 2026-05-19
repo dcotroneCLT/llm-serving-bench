@@ -4,7 +4,7 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-05-19 (afternoon ET).
+Last updated: 2026-05-19 (evening ET).
 
 ---
 
@@ -429,6 +429,21 @@ If any fails, that is itself a finding the n=3 paper can report.
   n=3 numbers directly, with its own metric panel and mechanism
   interpretation. This reframing removes the burden of explaining a
   "replication failure" in the paper itself.
+- 2026-05-19 evening ET: **Analysis pipeline hardened (5 fixes).**
+  `aging_trends.py` now uses `aging_io.resolve_warmup` for per-run
+  warmup discard (3600s campaign / 1800s pilot, auto-resolved from
+  cell yaml) and emits machine-readable `--csv` output.
+  `validation_check.py` and `aging_trends.py` now parse
+  `process_alive` via `aging_io.truthy_series` (was `astype(bool)`,
+  false-PASS for "False" string rows). `validation_check.py`
+  Theil-Sen slope now computed on real `ts_unix` axis instead of
+  sample indices (was ~5x inflated). New `fdr_aggregate.py`
+  applies BH-FDR at q=0.10 across the joint family of trends.
+  Sanity check on pilot n=1: aging_trends E1 = +9.14 MB/h vs paper
+  +9.15, E2 = +1.99 vs paper +2.04, validation_check A1 = ~+0.5 vs
+  paper +0.53. Paper pipeline now end-to-end in-repo. Decision
+  rule for significance: MK Hamed-Rao p<0.01 AND Theil-Sen CI
+  excludes zero AND bh_reject=True.
 
 ---
 
@@ -495,16 +510,11 @@ In order of priority for the next session:
      executed protocol (n=3, 36h, parallel topology, Qwen2.5-7B).
    - Fix run_monitors.py manifest collision (currently a workaround).
    - Restore Docker data-root on /home per ADR-002.
-   - Refactor `analysis/aging_trends.py` to use `analysis/aging_io.py`
-     (currently duplicates `load_csvs` and `proc_prefix` discovery).
-     Deferred from 2026-05-19 audit: not a correctness issue since
-     `aging_trends.py` is always called with explicit `<run_dir>`,
-     just code-quality debt.
-   - Standardize `process_alive` parsing on `aging_io.truthy_series`
-     across `validation_check.py` and `aging_trends.py`. Currently
-     they use `astype(bool)` / `== True` which works because pandas
-     infers bool, but is fragile if a sentinel row ever introduces
-     a non-bool value. Deferred from 2026-05-19 audit, low risk.
+   - Complete refactor of `analysis/aging_trends.py` onto
+     `analysis/aging_io.py`. Warmup discard, --csv mode, process_alive
+     parsing already done in the 2026-05-19 evening hardening commit;
+     remaining: `load_csvs` and `proc_prefix` discovery still local.
+     Code-quality debt, not correctness.
    - `replicate_n1.py` has a hardcoded `BASE` path tied to the
      original Cowork sandbox. The script is frozen (one-shot
      pipeline validation against paper Table IV, ran on 2026-05-19,
@@ -552,7 +562,7 @@ bash scripts/campaign_health.sh 2>&1 | tee /tmp/health.log
 echo "exit code: ${PIPESTATUS[0]}"
 # Exit 0=OK, 1=WARN (campaign OK, inspect when convenient), 2=FAIL (intervention needed)
 
-# Per-run post-completion verdict
+# Per-run post-completion sanity verdict (NOT paper pipeline)
 python3 analysis/validation_check.py --run-dir ~/wosar/runs/wosar2026_<cell>_r<NN>
 
 # All r01 verdicts in batch
@@ -560,6 +570,23 @@ for cell in e1 e2 e3 a1 a2 e3b; do
   echo "=== ${cell}_r01 ==="
   python3 analysis/validation_check.py --run-dir ~/wosar/runs/wosar2026_${cell}_r01
 done
+
+# Paper pipeline: aging_trends per run (MK Hamed-Rao + Theil-Sen CI)
+python3 analysis/aging_trends.py --run-dir ~/wosar/runs/wosar2026_<cell>_r<NN> --csv \
+  > /tmp/<cell>_<NN>_trends.csv
+# Stderr will show "warmup_s = 3600 (campaign)" for wosar2026_* runs.
+
+# Aggregate across runs with BH-FDR at q=0.10
+python3 analysis/fdr_aggregate.py \
+  --trends-csv /tmp/*_trends.csv \
+  > /tmp/fdr_results.csv
+# Adds q_value and bh_reject columns. Decision rule for paper:
+# significant trend iff mk_p<0.01 AND slope_ci excludes 0 AND bh_reject==True.
+
+# Stepness panel (corr, K_trim, steps/h) per run
+python3 analysis/stepness.py --run-dir ~/wosar/runs/wosar2026_<cell>_r<NN>
+# Or all pilot n=1 in one shot (for baseline)
+python3 analysis/stepness.py --logs-root logs/
 
 # Log a manual mitigation (e.g. after running docker prune by hand)
 echo "$(date -Iseconds) | <category> | <free-text note>" \
@@ -572,22 +599,42 @@ echo "$(date -Iseconds) | <category> | <free-text note>" \
 
 ## Pipeline analytical details (for paper)
 
-- Trend detection: Mann-Kendall with Hamed-Rao correction for
-  autocorrelation. Significance at p < 0.01.
-- Slope estimation: Theil-Sen with exact 95% CI based on order
-  statistics of pairwise slopes, variance inflated by lag-1 AR(1)
-  factor (1+rho)/(1-rho).
-- Multi-test correction: Benjamini-Hochberg FDR at q = 0.10 across all
-  indicators and cells (approx 200 tests).
-- Decision rule: a trend is declared significant only when both the
-  Mann-Kendall test rejects the null and the Theil-Sen 95% CI excludes
-  zero. (analysis/validation_check.py currently checks Mann-Kendall +
-  positive slope only; the full pipeline including CI and BH-FDR is in
-  the analysis notebook used to generate Table IV.)
-- Magnitude criterion: an open question is whether to add an
-  operationally meaningful threshold (e.g. slope > 1 MB/h) on top of
-  the statistical significance, to avoid declaring trends significant
-  on slopes of practical irrelevance. Discussed but not implemented.
+The pipeline is now fully in-repo as of 2026-05-19 evening, split
+across four scripts. All four share warmup resolution and CSV parsing
+via `analysis/aging_io.py`.
+
+- **Trend detection**: Mann-Kendall with Hamed-Rao correction for
+  autocorrelation. Significance at p < 0.01. Implemented in
+  `analysis/aging_trends.py`.
+- **Slope estimation**: Theil-Sen with 95% CI, computed on the real
+  `ts_unix` axis (not sample indices). Variance inflated by lag-1
+  AR(1) factor (1+rho)/(1-rho). Implemented in `aging_trends.py`.
+- **Multi-test correction**: Benjamini-Hochberg FDR at q = 0.10
+  across the joint family of (run_id, indicator) tests.
+  Implemented in `analysis/fdr_aggregate.py`, which consumes
+  `aging_trends.py --csv` output and adds `q_value` and `bh_reject`
+  columns.
+- **Decision rule**: a trend is declared significant when ALL of:
+  (a) MK Hamed-Rao p < 0.01, (b) Theil-Sen 95% CI excludes zero,
+  (c) bh_reject is True. The first two come from `aging_trends.py`,
+  the third from `fdr_aggregate.py`.
+- **Stepness panel**: corr (RSS-VMS lag-0), K_trim (winsorized
+  excess kurtosis), steps_per_hour (count of ΔRSS > 1 MB per hour).
+  Implemented in `analysis/stepness.py`. Used to classify cells as
+  mmap-style / sbrk-style / continuous drift.
+- **Per-run sanity gate**: `analysis/validation_check.py` is the
+  lightweight per-run verdict tool (PASS/SOFT FAIL/HARD FAIL on
+  RSS slope direction). Uses Theil-Sen on real time axis but does
+  NOT compute Hamed-Rao or apply BH-FDR; explicitly NOT the paper
+  pipeline. For paper-quality numbers always use
+  `aging_trends.py` + `fdr_aggregate.py`.
+- **Pipeline validation**: `replicate_n1.py` (repo root, frozen)
+  reproduces preprint Table IV from local pilot CSVs within 5-20%.
+  Run on 2026-05-19 as a sanity check; numbers in
+  "Internal sanity check" section above.
+- **Magnitude criterion**: open question whether to add an
+  operationally meaningful threshold (e.g. slope > 1 MB/h) on top
+  of the statistical significance. Discussed but not implemented.
 
 ---
 
