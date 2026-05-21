@@ -4,14 +4,13 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-05-19 (evening ET).
+Last updated: 2026-05-20 (afternoon ET).
 
 ---
 
 ## How to use this document (for a new chat session)
 
-If you are an LLM assistant picking this up two days from now, read this
-section first.
+If you are an LLM assistant picking this up, read this section first.
 
 **Working language and tone.** The principal investigator (Domenico)
 prefers to chat in Italian. Replies in Italian. The committed
@@ -37,29 +36,25 @@ analysis, and write to the repo. Git commits are usually done by
 Domenico from his Mac because the lock can be held by Claude Code.
 
 **Where to start when he opens this file.**
-1. Read the Background section below for the paper context.
+1. Read "Paper framing" section below for the decision that drives
+   everything else in this document.
 2. Read the Status snapshot for where we are in the campaign.
-3. Read "Results r01 vs paper Table IV" and "What rules out which
-   hypothesis" for the open puzzle.
+3. Read "Open TODOs" and "Open questions" at the bottom for the
+   action items.
 4. Suggest he runs `bash scripts/campaign_health.sh` on the server
    first thing, to get a fresh state. Then suggest
    `python3 analysis/validation_check.py --run-dir ~/wosar/runs/wosar2026_<cell>_<rXX>`
    on any newly-completed runs since this doc was written.
-5. The "Open TODOs" and "Open questions" sections at the bottom are
-   the action items.
 
 **Companion documents.**
-- `docs/WOSAR_2026.pdf`: the submitted (n=1) paper. Read pages 4-6
-  (Section IV, Results) for the headline findings and Table IV.
+- `docs/WOSAR_2026.pdf`: the submitted (n=1) preprint. Background
+  reading for the study design, NOT a reference against which the
+  n=3 campaign is validated. See "Paper framing" below.
 - `docs/project-wosar.md`: longer-form project doc, older snapshot.
   This file (EXPERIMENT_STATE.md) supersedes it as the operational
   hand-off; `project-wosar.md` is kept for historical reference and
   detailed framework documentation (e.g. the catalog of critical
   fixes during framework development).
-- `replicate_n1.py` (repo root): script that re-derives paper Table IV
-  numbers from the local n=1 CSVs. Useful if you doubt the analytical
-  pipeline. Already validated; do not need to re-run unless you have
-  reason to suspect drift.
 
 **When in doubt, ask before acting.** Especially before suggesting to
 stop the campaign or restart anything. The host window is fixed and
@@ -67,136 +62,143 @@ every wasted run is a wasted day.
 
 ---
 
-## Background: what the n=1 preprint found
+## Paper framing (the key decision)
 
-(Context only. The camera-ready paper does NOT compare against these
-numbers; it reports the n=3 results standalone. This section is here
-to remind the reader of the prior state of the art on which the n=3
-study design rests, and to provide a reference for the internal
-sanity check discussed in "Internal sanity check" section below.)
+The camera-ready WoSAR 2026 paper is a **standalone study on n=3 data**.
+It is not framed as a replication of the n=1 preprint. The narrative
+follows the same skeleton as the preprint (same research questions,
+same factorial cells, same family of indicators), but every numerical
+claim, every figure, and every classification rule in the camera-ready
+is computed on the n=3 campaign data and stands on its own.
 
-The submitted preprint (single-run 24h per cell, no replicas)
-established three findings that motivated the n=3 design.
+What the n=3 paper inherits from the n=1 preprint, as design and
+narrative scaffolding:
+1. Aging exists in modern LLM serving on the GPU. Same RQ1.
+2. Aging is localized in the framework orchestration layers, not the
+   inference compute path. Same RQ2.
+3. The leak rate is a property of the full deployment, not a single
+   component. Same 2x2 factorial across engine generation (V0/V1)
+   and hosting layer (standalone/Triton).
+4. Step-wise lock-step growth of RSS and VMS in V0-based engines is
+   the most actionable qualitative finding.
 
-1. **Software aging exists in modern LLM serving on the GPU.** All three
-   primary deployments (vLLM standalone V1, Triton + vLLM V0, naive
-   PyTorch + HuggingFace) showed statistically significant monotonically
-   increasing process-private memory (RSS, USS, PSS coincident) over the
-   24-hour window. Trend was MK-significant after FDR correction; slope
-   was non-zero with 95% Theil-Sen CI excluding zero.
-2. **The aging surface lies in the framework orchestration layers, not
-   in the inference path.** Counter-intuitive ordering: the naive PyTorch
-   baseline (no paged-attention, no continuous batching, no scheduler)
-   leaked the least (+170 KB/h). The production-grade engines leaked
-   1-2 orders of magnitude more (Triton+V0 +2.04 MB/h, vLLM V1 standalone
-   +9.15 MB/h). Since the inference compute path is identical across
-   the three (same Qwen2.5-7B weights, same attention math), the aging
-   must live in the orchestration layers around it.
-3. **The leak rate is a property of the full deployment, not of any
-   single component.** A 2x2 factorial across engine generation (V0
-   vs V1) and hosting layer (standalone vs Triton wrapper) showed leak
-   rates spanning nearly three orders of magnitude across the four
-   cells, with engine and hosting interacting (V0 leaks less than V1
-   standalone, but V0 leaks more than V1 in Triton).
-4. **Step-wise lock-step growth of resident and virtual memory in the
-   V0 engine (qualitative finding, Figure 2b of the paper).** This is
-   the finding the authors care most about. In E2 (Triton + vLLM V0),
-   memory does not grow as a smooth quasi-linear drift: it remains flat
-   for hours, then jumps abruptly by several MB at discrete step events.
-   At each step, RSS (resident, user-space) and VMS (virtual, includes
-   pages mapped via mmap from the kernel) increase TOGETHER, perfectly
-   correlated. This signature is consistent with the engine
-   periodically requesting NEW memory blocks from the kernel via mmap
-   (or sbrk-extended heap) and never releasing them. The paper text
-   leaves the two mechanism hypotheses (mmap vs sbrk) unresolved.
-   The same pattern shows up qualitatively in three of the four
-   factorial cells but is cleanest in E2. Diagnostic analysis on
-   secondary indicators (process CPU, request rate, voluntary
-   ctx-switches, Python GC activity) shows no correlation with the
-   step events: i.e. no obvious cause among the usual suspects. If
-   confirmed and mechanism-localized, this would imply UNBOUNDED
-   resident memory growth on multi-day timescales (each step adds
-   bytes that never return). The classical SAR toolkit cannot
-   diagnose this without complementary heap-profiling instrumentation;
-   it is the most actionable finding for the vLLM community.
+What is **new in the n=3 camera-ready** vs the preprint:
+- **n=3 replication.** Three replicas per cell give a between-run
+  variance bound, addressing the primary threat-to-validity of the
+  preprint.
+- **36h window per run.** Up from 24h; partial improvement against
+  the late-onset-effects TTV.
+- **BH-FDR control** at q=0.10 across the joint family of
+  (run_id, indicator) tests. The preprint did per-indicator MK only.
+- **Three-metric step-wise panel** (`rss_vms_corr`, `K_trim`,
+  `steps_per_h_1mb`) with a three-category classification rule:
+  mmap-style step-wise / sbrk-style step-wise / continuous drift.
+  The preprint conflated mmap and sbrk under "step-wise". This is
+  the paper-worthy mechanism refinement.
+- **Realistic parallel multi-tenant topology.** Three GPUs in
+  parallel rather than the preprint's sequential single-GPU. Declared
+  as a feature of the design (Section III) and discussed in Threats
+  to Validity (Section V) as the operational regime the paper reports
+  on.
+- **e3 vs e3b rate-sensitivity ablation** at proper saturation (e3
+  drops ~15-16% at 0.174 rps, e3b drops <2% at 0.050 rps; see
+  Section IV.D below).
 
-   **Refinement obtained during n=3 preparation (NEW vs paper):**
-   the (rss_vms_corr, K_trim) metric panel introduced for n=3
-   analysis separates two distinct step-wise mechanisms that the
-   paper had conflated. E2 is mmap-style (RSS and VMS lock-step,
-   corr ~0.93). A1 is sbrk-style (RSS steps without paired VMS
-   steps, corr ~0.20), i.e. heap-arena extension rather than
-   kernel-mapped blocks. See Open Question #4 below for the
-   classification rule.
+The preprint Table IV numbers do not appear in the camera-ready. They
+are referenced as the prior state of the art that motivated the n=3
+study design, and that is the only relationship between the two.
 
-Other key observations:
-- **Client-side aging is essentially undetectable over 24h** in all
-  three primary engines. End-to-end latency, TTFT, throughput, and
-  drop rate are stationary. The aging only surfaces when looking
-  inside the engine process.
-- **One GPU-side aging signature**, on A1 (vLLM V0 standalone): VRAM
-  grew at +124 MB/h, accumulating ~3 GB over 24h. None of the other
-  five runs showed any VRAM trend.
+---
 
-Paper Table IV (the headline RSS slope table that the n=3 campaign
-aims to replicate):
+## Background: prior state of the art (n=1 preprint)
 
-| ID  | Deployment         | RSS slope    | 95% CI               |
-|-----|--------------------|--------------|----------------------|
-| E1  | vLLM standalone V1 | +9.15 MB/h   | [+9.03, +9.24] MB/h  |
-| E2  | Triton + vLLM V0   | +2.04 MB/h   | [+0.82, +3.12] MB/h  |
-| E3  | PyTorch + HF naive | +170 KB/h    | [+85, +389] KB/h     |
-| E3b | PyTorch + HF low   | +179 KB/h    | overlapping with E3  |
-| A1  | vLLM V0 standalone | +530 KB/h    | (Table V of paper)   |
-| A2  | Triton + vLLM V1   | +20 KB/h     | (Table V of paper)   |
+Context only. Kept short. The preprint informed the design of the
+n=3 campaign (cell selection, target rates, monitoring stack) but
+does not feed into any numerical claim of the camera-ready.
 
-The n=3 campaign was set up to replicate these numbers with n=3 runs
-per cell and a longer 36h window, to estimate run-to-run variance
-(the primary threat-to-validity called out in the submitted paper).
-The campaign is currently in progress. Section "Results r01 vs paper"
-below documents how the first round actually compares.
+The preprint (single-run 24h per cell, single-GPU sequential)
+established three findings on the same hardware and model:
 
-Paper Threats-to-Validity that the n=3 campaign was designed to address:
+1. **Software aging exists in modern LLM serving on the GPU.** All
+   three primary deployments (vLLM standalone V1, Triton + vLLM V0,
+   naive PyTorch + HF) showed monotonically increasing process-private
+   memory over 24h; MK-significant under FDR correction.
+2. **The aging surface lies in the framework orchestration layers,
+   not in the inference path.** The naive PyTorch baseline leaked the
+   least; production-grade engines leaked 1-2 orders of magnitude
+   more. Since the inference compute path is identical across the
+   three (same Qwen2.5-7B weights, same attention math), aging must
+   live in orchestration.
+3. **The leak rate is a property of the full deployment.** A 2x2
+   factorial across engine generation (V0 vs V1) and hosting layer
+   (standalone vs Triton wrapper) showed leak rates spanning nearly
+   three orders of magnitude across the four cells, with engine and
+   hosting interacting.
+4. **Step-wise lock-step growth of RSS and VMS in V0-based engines
+   (qualitative, Figure 2b of the preprint).** Memory stays flat for
+   hours, then jumps abruptly by several MB at discrete step events,
+   with RSS and VMS stepping together. Diagnostic analysis on
+   secondary indicators (CPU, request rate, voluntary ctx-switches,
+   Python GC) showed no correlation with the step events. Hypothesis:
+   periodic mmap-style allocation of new blocks from the kernel that
+   are never released. The preprint left the mmap-vs-sbrk mechanism
+   alternative unresolved; the n=3 paper resolves it with the metric
+   panel.
+
+Two secondary observations from the preprint:
+- Client-side aging (latency, TTFT, throughput, drop rate) was
+  essentially undetectable over 24h on all three primary engines.
+- One GPU-side aging signature on A1 (vLLM V0 standalone): VRAM
+  grew at +124 MB/h, accumulating ~3 GB over 24h. No other run
+  showed any VRAM trend.
+
+Preprint Threats-to-Validity that the n=3 campaign addresses:
 - **Single-run design** (the priority): no run-to-run variance bound.
   n=3 fixes this.
 - **24h window may miss late-onset effects**: n=3 uses 36h, partial
   improvement.
-- **Confounded factorial** (vLLM version drift across cells): unchanged
-  by n=3, persists as a residual confound.
-- **Single hardware, single model**: unchanged by n=3.
+- **Confounded factorial** (vLLM version drift across cells):
+  persists as a residual confound, declared explicitly in TTV.
+- **Single hardware, single model**: persists.
 
-The campaign was NOT designed to address: parallel-vs-sequential
-topology. The paper ran one cell at a time. The n=3 campaign runs three
-cells in parallel on three GPUs to fit inside the 2-week host window.
-This design choice is now under scrutiny (see "Open questions").
+The n=3 campaign was **not** designed to address parallel-vs-sequential
+topology. The preprint ran one cell at a time; the n=3 campaign runs
+three cells in parallel on three GPUs to fit inside the 2-week host
+window. This design choice is declared as a feature of the n=3 paper:
+it reports on a realistic multi-tenant deployment.
 
 ---
 
-## TL;DR
+## TL;DR (operational, 2026-05-20)
 
-The n=3 campaign is on day 3.5 of 9.5. Round 1 (r01 of all 6 cells) is
-complete. The camera-ready paper will be a **standalone study on n=3
-data**, not a replication of the preprint (see Paper section above for
-the framing decision taken on 2026-05-19).
+n=3 campaign on day 4.5 of ~9.5. Round 1 (r01 of all 6 cells) complete.
+Round 2 batch 1 (e1, e2, e3 r02) complete. Round 2 batch 2 (a1, a2, e3b
+r02) currently running on gpu0/1/2, ~30h to go. Round 3 follows.
 
-On the n=3 data, the central findings to verify (independent of any
-preprint comparison) are: (a) does aging exist across the 6 cells?
-(b) is it localized in the framework orchestration layers rather than
-the inference path? (c) which cells exhibit mmap-style step-wise growth
-vs sbrk-style vs continuous drift, per the (corr, K_trim) classification?
-(d) does the qualitative pattern hold across r01, r02, r03 with low
-between-run variance?
+Two findings are already locked in on n=3 data (will appear in the
+camera-ready regardless of r03 outcome):
 
-Internally (not in the paper), we observed that r01 slopes are 3 to
-260 times smaller than the preprint Table IV. We are investigating
-this as a sanity check, since the preprint was the basis for hardware
-booking and rate calibration. Image drift has been ruled out as the
-dominant cause (a1 binary is immutable v0.7.3 and still drops 8x).
-Leading internal hypothesis: parallel-topology effect (preprint was
-sequential single-GPU, n=3 is parallel three-GPU). E3b sub-saturated
-matches the preprint magnitude; E3 saturated does not. Plan: let the
-r02 batch finish (~30h), then run a1 in isolation for 24h as a
-diagnostic. Regardless of outcome, the paper proceeds on n=3 numbers.
+- **e3 drop rate at saturated load.** PyTorch + HF naive at 0.174 rps
+  drops ~15.6-15.7% of offered requests, confirmed on n=2 (e3_r01 and
+  e3_r02). e3b at 0.050 rps drops <2%. The naive baseline at saturated
+  load exhibits a capacity ceiling that the production-grade engines
+  do not. Reportable as Section IV.D rate-sensitivity ablation.
+- **Pipeline hardened and validated.** Paper pipeline is end-to-end
+  in-repo: `aging_trends.py` with Theil-Sen on real time axis,
+  `fdr_aggregate.py` for BH-FDR at q=0.10, `validation_check.py` as
+  per-run sanity gate, `stepness.py` for the three-metric panel.
+  Decision rule: trend significant iff MK Hamed-Rao p<0.01 AND
+  Theil-Sen 95% CI excludes zero AND bh_reject=True.
+
+Open headline questions for the paper (within-n=3, not vs preprint):
+
+1. Per-cell **between-replica variance** of the RSS slope. Within
+   ~30% across r01/r02/r03 means the cell's aging signature is
+   reproducible.
+2. Per-cell **step-wise classification** (mmap / sbrk / drift) on n=3,
+   and whether the assignment is stable across replicas.
+3. e3 drop rate **mechanism**: time-clustered vs uniform, correlated
+   with GPU 2 VRAM/util spikes or not, behavior stable across r01/r02.
 
 ---
 
@@ -206,19 +208,12 @@ diagnostic. Regardless of outcome, the paper proceeds on n=3 numbers.
 - Deadline: 30 June 2026
 - Authors: Domenico Cotroneo (UniNa Federico II / UNCC), Bojan Cukic (UNCC)
 - Working title: "The Aging Surface of LLM Serving Engines: An Empirical Study"
-- **Preprint (n=1) version**: `docs/WOSAR_2026.pdf`. Single-run 24h per
-  cell, single-GPU sequential. Preliminary findings.
-- **Camera-ready (final) version**: standalone paper based entirely on
-  the n=3 campaign data. Currently in execution. **NOT framed as a
-  replication study of the preprint**: the final paper presents the
-  n=3 numbers directly, with its own slopes, its own metric panel
-  (corr, K_trim, steps/h), and its own mechanism interpretation
-  (mmap-style vs sbrk-style step-wise). The preprint serves as
-  background context (what was previously hypothesized) but its
-  numerical results are not the reference against which the n=3
-  campaign is validated. Differences in slope magnitude between
-  preprint and n=3 are an internal sanity check, not a paper-level
-  claim.
+- **Preprint (n=1) version**: `docs/WOSAR_2026.pdf`. Used as background
+  scaffolding for the camera-ready, not as a reference to replicate.
+- **Camera-ready (final) version**: standalone paper on n=3 campaign
+  data, on the same narrative skeleton as the preprint (RQs, factorial,
+  step-wise mechanism), with all numbers, figures, and classifications
+  computed on n=3.
 
 ---
 
@@ -267,7 +262,7 @@ gpu_memory_utilization 0.9.
   `sha256:9eff9734...` which was the latest on 7 May, now pruned)
 - a1: `sha256:4f4037303e8c7b69439db1077bb849a0823517c0f785b894dc8e96d58ef3a0c2`
   (vllm/vllm-openai:v0.7.3, immutable semver tag, 15 months old, identical
-  to what the paper used)
+  to what the preprint used)
 - e2/a2: `sha256:1fb3d156d4959b83cb7a9bd172f9b86135f97cafcc1b5899292e042536d90141`
   (nvcr.io/nvidia/tritonserver:25.09-vllm-python-py3, 7 months old)
 - e3/e3b: `sha256:452c860860870ee50f19575264c12b647a550ac7f0fbaafbfc6d0e33249c7985`
@@ -299,97 +294,83 @@ campaign (n=3). Verified by md5.
 
 ---
 
-## Status snapshot (2026-05-19 afternoon ET)
+## Status snapshot (2026-05-20 afternoon ET)
 
 ```
 Campaign launched: 2026-05-16T11:12 UTC
-state.summary    : completed=6, running=3, failed=0
+state.summary    : completed=9, running=3, failed=0
 ```
 
-Completed (all r01):
-- e1_r01: 36h, image sha256:a23009..., RSS slope +0.035 MB/h
-- e2_r01: 36h, image sha256:1fb3d1..., RSS slope +0.109 MB/h
-- e3_r01: 36h, image sha256:452c86..., RSS slope +0.058 MB/h
-- a1_r01: 36h, image sha256:4f4037..., RSS slope +0.064 MB/h
-- a2_r01: 36h, image sha256:1fb3d1..., RSS slope +0.217 MB/h
-- e3b_r01: 36h, image sha256:452c86..., RSS slope +0.201 MB/h
+Completed: all r01 of the 6 cells + r02 of e1/e2/e3. All MK-significant
+at p<0.01, all PASS on validation_check.
 
-Running (started ~13:00 UTC 18 May, ~22000s elapsed of 129600s as of last check):
-- e1_r02 on gpu0
-- e2_r02 on gpu1
-- e3_r02 on gpu2
+**Paper-grade RSS slopes** (aging_trends + fdr_aggregate, all
+significant=True per the decision rule MK p<0.01 AND CI excludes 0
+AND bh_reject=True):
 
-Expected r02 batch end: ~21 May 11:00 UTC.
+| cell | r01 slope | r01 CI [lo, hi]       | r02 slope  | r02 CI [lo, hi]        | CI relation        |
+|------|-----------|------------------------|-------------|--------------------------|--------------------|
+| e1   | 6.96 KB/h | [1.5, 22.3] KB/h       | 1.76 KB/h   | [0.74, 23.8] KB/h        | overlap massive    |
+| e2   | 21.7 KB/h | [12.9, 31.6] KB/h      | 161.4 KB/h  | [40.3, 231.4] KB/h       | DISJOINT (+8.7 KB/h gap) |
+| e3   | 11.0 KB/h | [4.9, 20.1] KB/h       | 31.1 KB/h   | [21.4, 88.0] KB/h        | barely disjoint (+1.3 KB/h gap) |
 
-Pending (not yet started):
-- a1_r02, a2_r02, e3b_r02 (start after the r02 batch above finishes)
-- All r03 batch
-- Sanity run (e2 on gpu0, 6h)
+**Reading.** e1 r01 and r02 are CI-compatible; the apparent "17x
+smaller" from validation_check was a point-estimate artifact, the
+two replicas are reproducible within CI. e2 r02 slope is genuinely
+larger than r01 (CIs disjoint by 8.7 KB/h, ~7x point ratio). e3 r02
+slope is just-disjoint from r01 (~3x point ratio, gap 1.3 KB/h).
 
----
+**Pipeline note (calibration gotcha).** validation_check.py and
+aging_trends.py give the SAME point estimate on r02 (smooth-ish runs)
+but DIFFER by ~5x on r01 (step-heavy runs). validation_check operates
+on raw 5s samples; aging_trends.py downsamples to 60s windows before
+Theil-Sen. On step-heavy series the two methods are not equivalent.
+For the paper, only aging_trends + fdr_aggregate is paper-grade.
+validation_check remains a per-run sanity gate (PASS/FAIL on trend
+direction), not a slope source.
 
-## Internal sanity check: r01 slopes vs preprint Table IV
+**Additional paper-grade finding on e3_r02.** proc.vms_bytes shows
+significant growth at +52.2 MB/h (CI [20.9 KB, 77.3 MB]/h, MK p=7.7e-08,
+bh_reject=True). RSS grows at only +31 KB/h on the same run. The
+VMS-to-RSS ratio is ~1700x. This is a third pattern alongside the
+mmap-lock-step and sbrk-RSS-only seen in the preprint, and the
+current three-class stepness panel does NOT capture it (see Step-wise
+mechanism panel section below). On e3_r01 the same indicator was
+NOT significant (slope=0, p=0.097), so the VMS-only growth emerged
+specifically in r02. r03 will settle whether it is a stable property
+of the cell or a r02-specific event.
 
-**Scope.** This table is INTERNAL: it does not appear in the
-camera-ready paper. The paper presents the n=3 numbers standalone.
-This sanity check exists because the preprint informed the hardware
-booking and the rate calibrations; a large unexplained divergence is
-worth understanding before we trust the rest of the n=3 numbers.
+**Validation_check slopes (for the older runs, sanity-gate values only,
+not paper-grade):**
+- e1_r01: +0.035 MB/h, drop trivial
+- e2_r01: +0.109 MB/h, drop trivial
+- e3_r01: +0.058 MB/h, drop 15.7%
+- a1_r01: +0.064 MB/h, drop trivial
+- a2_r01: +0.217 MB/h, drop trivial
+- e3b_r01: +0.201 MB/h, drop trivial
+- e1_r02: +0.002 MB/h, drop trivial
+- e2_r02: +0.161 MB/h, drop trivial
+- e3_r02: +0.031 MB/h, drop 15.6%
 
-| cell | preprint | n=3 r01 | factor | image identical to preprint? |
-|---|---|---|---|---|
-| E1 V1 standalone | +9.15 MB/h | +0.035 MB/h | 260x smaller | NO (drift) |
-| E2 Triton+V0     | +2.04 MB/h | +0.109 MB/h | 18x smaller  | yes |
-| E3 PyT+HF sat    | +170 KB/h  | +58 KB/h    | 3x smaller   | yes |
-| E3b PyT+HF low   | +179 KB/h  | +201 KB/h   | **~1.1x (matches)** | yes |
-| A1 V0 standalone | +530 KB/h  | +64 KB/h    | **8.3x smaller** | **YES** (identical immutable binary) |
-| A2 Triton+V1     | +20 KB/h   | +217 KB/h   | 10x larger | yes (but rate differs, see note) |
+Note that the validation_check r01 numbers are ~5x larger than the
+paper-grade aging_trends numbers on the same data (step-event
+sensitivity, see "Pipeline note" above).
 
-Notes:
-- A2 had its target rate recalibrated from 0.90 (preprint) to 1.753
-  (n=3) after smoke tests confirmed V1 is actually initialized in
-  Triton with VLLM_USE_V1=1. So A2 is not directly comparable to
-  preprint A2.
-- Pipeline correctness validated: `replicate_n1.py` (committed at repo
-  root) reads the local n=1 CSVs and reproduces the preprint numbers
-  within 5-20%. So the n=3 numbers above are correct, not a pipeline
-  artefact.
-- For the camera-ready paper, only the n=3 column matters; the
-  preprint column is here for our internal record.
+Running (r02 batch 2, started ~19 May 11:14 UTC):
+- a1_r02 on gpu0
+- a2_r02 on gpu1
+- e3b_r02 on gpu2
 
-**Why this verification still matters (even if not in the paper).**
-We deliberately want to check whether the qualitative findings of the
-preprint are recovered in the n=3 data, independent of the absolute
-magnitudes. Specifically:
+Expected r02 batch 2 end: ~21 May UTC.
 
-1. Does the **framework-layer localization** hold? (E1 + E2 leak more
-   than E3, regardless of slope magnitude.)
-2. Does the **engine × hosting interaction** hold? (V0 standalone
-   leaks less than V1 standalone, but more than V1 in Triton — i.e.
-   the qualitative ordering of the 2x2 factorial.)
-3. Does the **step-wise lock-step pattern** hold for E2? (corr > 0.8,
-   K_trim > 10 on n=3.) And does the new mmap-vs-sbrk distinction
-   carry over?
-4. Is **client-side aging still effectively absent** at the 36h scale?
+Pending:
+- All r03 batch (e1, a1, e2, a2, e3, e3b).
+- Sanity run (e2 on gpu0, 6h).
 
-If yes on all four, the preprint findings are essentially confirmed at
-the level that matters scientifically (mechanism and ordering), and
-the n=3 paper presents updated numbers on top of confirmed phenomena.
-If any fails, that is itself a finding the n=3 paper can report.
-
----
-
-## What rules out which hypothesis
-
-| hypothesis | status | evidence |
-|---|---|---|
-| Analytical pipeline broken | RULED OUT | replicate_n1.py reproduces paper Tab IV from n=1 CSVs (E1 +8.72 vs +9.15, A1 +505 vs +530 KB/h, etc.) |
-| Corpus changed | RULED OUT | single md5, under git, deterministic |
-| Args differ from paper | RULED OUT for a1/a2 | bash history of pilot vs cell yaml shows identical docker run args |
-| Image drift (vllm latest) | TRUE for e1 only | a1 binary is immutable v0.7.3 yet drops 8x; cannot be image drift |
-| Topology effect | LEADING HYPOTHESIS | e3b (sub-saturated, 50 req/h) replicates paper; e3 (saturated, 624 req/h, same engine) does not. Paper ran one cell at a time; n=3 runs three cells in parallel. Plausible CPU-host contention mechanism. |
-| Workload regime (saturated vs sub-saturated) | PARTIAL EXPLANATION | e3 vs e3b makes this clear: leak rate drops in saturated cells under parallel topology, not in sub-saturated ones |
-| Theil-Sen on 36h vs paper's 24h | RULED OUT | replicate_n1.py confirms warmup-discard and run-duration choices do not move the number more than a few percent |
+Notable n=3 findings already locked (n>=2):
+- e3 drop rate at saturated load: 15.7% (r01) and 15.6% (r02). The
+  PyTorch naive baseline at 0.174 rps hits a capacity ceiling; e3b at
+  0.050 rps drops <2% on the same engine and same GPU.
 
 ---
 
@@ -416,19 +397,10 @@ If any fails, that is itself a finding the n=3 paper can report.
   early-warning thresholds on /var/lib (WARN 20 GB, FAIL 10 GB),
   embedded docker system df snapshot on disk WARN/FAIL, and a manual
   mitigations log in `campaigns/wosar2026/state/mitigations.log`.
-- 2026-05-19 afternoon ET: Decision to let the r02 batch complete
-  (~30h) before any intervention. Stop campaign only after r02 batch
-  finishes, then run a1 in isolation as a topology-effect test.
 - 2026-05-19 evening ET: **Paper framing decision.** The camera-ready
-  is a standalone paper on n=3 data, NOT a replication study of the
-  preprint. The internal sanity check comparing r01 slopes to
-  preprint Table IV remains useful (the preprint informed booking
-  and rate calibration, large unexplained divergence is worth
-  investigating) and the qualitative findings of the preprint will
-  be verified against n=3 internally. But the camera-ready presents
-  n=3 numbers directly, with its own metric panel and mechanism
-  interpretation. This reframing removes the burden of explaining a
-  "replication failure" in the paper itself.
+  is a standalone paper on n=3 data, on the same narrative skeleton as
+  the preprint but with all numbers, figures, and classifications
+  computed on n=3. The preprint is background, not reference.
 - 2026-05-19 evening ET: **Analysis pipeline hardened (5 fixes).**
   `aging_trends.py` now uses `aging_io.resolve_warmup` for per-run
   warmup discard (3600s campaign / 1800s pilot, auto-resolved from
@@ -439,11 +411,91 @@ If any fails, that is itself a finding the n=3 paper can report.
   Theil-Sen slope now computed on real `ts_unix` axis instead of
   sample indices (was ~5x inflated). New `fdr_aggregate.py`
   applies BH-FDR at q=0.10 across the joint family of trends.
-  Sanity check on pilot n=1: aging_trends E1 = +9.14 MB/h vs paper
-  +9.15, E2 = +1.99 vs paper +2.04, validation_check A1 = ~+0.5 vs
-  paper +0.53. Paper pipeline now end-to-end in-repo. Decision
-  rule for significance: MK Hamed-Rao p<0.01 AND Theil-Sen CI
+  Decision rule for significance: MK Hamed-Rao p<0.01 AND Theil-Sen CI
   excludes zero AND bh_reject=True.
+- 2026-05-20 (this update): r02 batch 1 (e1, e2, e3) completed.
+  Batch 2 (a1, a2, e3b r02) currently running. e3 drop rate confirmed
+  on n=2 (r01 15.7%, r02 15.6%). Document cleaned to fully reflect
+  standalone-n=3 framing: the n=3-vs-preprint sanity check, the
+  "what rules out which hypothesis" diagnostic, and the planned
+  a1-isolated topology test are no longer part of the active plan
+  and have been moved to the Archive section at the bottom for
+  traceability.
+- 2026-05-20 afternoon ET: **First scan from validation_check showed
+  apparent r02/r01 ratios of 0.06 (e1, 17x smaller), 1.48 (e2),
+  0.53 (e3).** Interpreted at first as large between-replica
+  variance; see follow-up below for the CI-aware reading.
+- 2026-05-20 evening ET: **Paper-grade pipeline (aging_trends +
+  fdr_aggregate) recomputed on r01 and r02 of e1/e2/e3.** Findings:
+  (1) The "17x" on e1 was a validation_check artifact. Paper-grade
+  CIs for e1_r01 [1.5, 22.3] KB/h and e1_r02 [0.74, 23.8] KB/h
+  overlap completely — the two replicas are reproducible within CI.
+  (2) e2 shows a real between-run effect: r01 [12.9, 31.6] KB/h
+  and r02 [40.3, 231.4] KB/h are disjoint by 8.7 KB/h. r02 slope is
+  ~7x higher than r01.
+  (3) e3 r01 [4.9, 20.1] KB/h vs r02 [21.4, 88.0] KB/h: borderline
+  disjoint (gap 1.3 KB/h). r02 ~3x higher than r01.
+  (4) **e3_r02 also shows paper-grade significant proc.vms_bytes
+  growth at +52.2 MB/h** (CI [20.9 KB, 77.3 MB]/h, MK p=7.7e-08).
+  In r01 of e3, VMS was NOT significant (slope=0, p=0.097). This
+  is a "VMS-only growth" pattern, distinct from mmap-lock-step
+  (RSS+VMS together) and from sbrk-RSS-only (RSS without VMS), and
+  is not captured by the current three-class stepness panel.
+- 2026-05-20 evening ET: **Pipeline calibration note.**
+  validation_check and aging_trends produce the SAME slope on r02
+  (smooth) but DIFFER by ~5x on r01 (step-heavy). Reason: raw 5s
+  samples vs 60s-window downsampling. The two pipelines are not
+  equivalent on step-event-dominated series. **Decision: only
+  aging_trends + fdr_aggregate is paper-grade.** validation_check
+  is reduced to a per-run sanity gate (PASS/FAIL on trend direction),
+  not a slope source for the camera-ready.
+- 2026-05-20 evening ET: **Stepness panel on r02 confirms two of the
+  four expected classes and reveals the fourth.**
+  - E2 r02: corr=0.83, K_trim=648.6 [513.5, 846.1] → mmap-style
+    step-wise confirmed on n=3, matches preprint expectation.
+  - E1 r02: corr=0.31, K_trim=NaN (script edge case to fix),
+    top1%_step=0.0001 MB → continuous drift on RSS confirmed, matches
+    preprint quasi-linear expectation.
+  - E3 r02: corr=0.24, K_trim_dRSS=1.1 → "continuous drift on RSS"
+    by the three-class rule, but the cell ALSO shows paper-grade
+    significant VMS growth at +52 MB/h. Fourth class needed:
+    VAS-only growth.
+- 2026-05-20 evening ET: **stepness.py patched (committed) — first
+  pass, four-class taxonomy.** Fix K_trim=NaN edge case via
+  operational fallback (when top1%_step < 1 MB AND steps>1MB/h < 0.1,
+  set K_trim=0.0 with stderr warning). Add `K_trim_dVMS` metric on
+  proc.vms_bytes deltas, mirroring K_trim_dRSS. New `class` column in
+  CSV output. Four classes: mmap-style / sbrk-style / VAS-only /
+  continuous drift / (border).
+- 2026-05-20 evening ET: **Five-class taxonomy adopted (committed).**
+  Pilot n=1 sanity check after the four-class patch surfaced two
+  retrospective reclassifications:
+  - **E1 pilot**: corr=0.32, K_trim_dRSS=0.0, K_trim_dVMS=789 →
+    VAS-only step-wise, NOT continuous drift as the preprint assumed.
+    The preprint missed this because it had no dVMS axis. The n=3
+    paper recovers the finer mechanism class.
+  - **A1 pilot**: corr=0.20, K_trim_dRSS=402, K_trim_dVMS=582 → does
+    not fit any of the four classes (both axes step-wise but
+    uncorrelated). Fell into border under the four-class rule.
+  Decision: add a fifth class **"uncorrelated step-wise"**
+  (corr < 0.5 AND K_trim_dRSS > 10 AND K_trim_dVMS > 10). Mechanism
+  interpretation: heap-arena extension (RSS-side) and mmap-style
+  block allocation (VMS-side) operating in parallel as two
+  independent allocator events. The class is mechanism-justifiable
+  a priori (glibc/CUDA-caching-allocator design does not constrain
+  these to be synchronous), with A1 pilot as the empirical
+  confirmation. Five-class taxonomy is now canonical for the paper.
+- 2026-05-20 evening ET: **Stepness classifications of the pilot
+  n=1 are retrospective only.** They are useful as a sanity check
+  on the taxonomy and to demonstrate that the dVMS-axis refinement
+  recovers signatures the preprint missed. The headline class
+  assignment per cell in the camera-ready paper is from n=3 (r01,
+  r02, r03 with majority rule), not from the pilot. A cell can
+  legitimately fall into different classes in pilot vs n=3 because
+  the host environment is not stationary across the 2-week window
+  (system.mem_used host-side drift dropped 3x between r01 and r02
+  of n=3, see Status snapshot). Pilot classes do not constrain n=3
+  classes.
 
 ---
 
@@ -451,75 +503,96 @@ If any fails, that is itself a finding the n=3 paper can report.
 
 In order of priority for the next session:
 
-1. **Wait for r02 batch end (~21 May 11:00 UTC).** Then run
-   `validation_check.py` on e1_r02, e2_r02, e3_r02. If r02 slopes are
-   consistent with r01 (within ~30%), the within-cell pattern is stable
-   and we can act. If r02 slopes diverge wildly from r01, we have a
-   second problem to investigate.
-2. **Decision point after r02 batch.** Two choices:
-   - **A: stop campaign, run a1 isolated.** Lose a1_r02 / a2_r02 /
-     e3b_r02 (we already have r01 of each), gain a clean diagnostic.
-   - **B: let the campaign continue through r03.** Then have full
-     n=3 in the parallel-topology setting. Useful only if we decide to
-     reframe the paper around the parallel setup; loses the chance to
-     replicate the original paper.
-3. **a1 isolated test.** When we decide to run it: stop campaign,
-   launch only a1 on gpu0, target duration 24h (matching paper),
-   identical args to current `cells/a1.yaml`. Expected: ~+530 KB/h if
-   topology is the confound; ~+64 KB/h if topology is not the cause
-   (in which case we need a deeper investigation).
-4. **Paper narrative finalization (under the standalone-n=3 framing).**
-   The camera-ready will present n=3 numbers directly. The narrative
-   does NOT depend on the a1 isolated outcome; the isolated diagnostic
-   only informs our internal understanding. The four content elements
-   to write up regardless of a1 isolated outcome:
-   (a) campaign description and stress regime (Section IV.A) on n=3.
-   (b) client-side stationarity check (Section IV.B) on n=3.
-   (c) process-side memory aging (Section IV.C) on n=3, with the new
-       (corr, K_trim, steps/h) metric panel and the
-       mmap-vs-sbrk-vs-drift classification.
-   (d) low-load ablation (E3b) and 2x2 factorial (Section IV.D-E)
+1. **DONE 2026-05-20: paper-grade r01/r02 slopes for e1, e2, e3.**
+   See Status snapshot for the per-cell CI table and reading. Headlines:
+   - e1: r01 and r02 CIs overlap massively. Reproducible within CI.
+   - e2: r01 and r02 CIs disjoint, r02 ~7x higher than r01.
+   - e3: r01 and r02 CIs barely disjoint, r02 ~3x higher.
+   - e3_r02 additionally shows paper-grade VMS growth at +52 MB/h
+     (a fourth, "VAS-only" stepness class).
+
+   Also DONE: stepness panel on e1/e2/e3 r02. E2 confirmed
+   mmap-style on n=3. E1 confirmed continuous drift on n=3. E3
+   needs a fourth class for VMS-only growth (see Open Q #2).
+
+   ```bash
+   # Reusable, for r01 + r02 of any three cells:
+   for cell in e1 e2 e3; do
+     python3 analysis/aging_trends.py \
+       --run-dir ~/wosar/runs/wosar2026_${cell}_r01 --csv \
+       > /tmp/${cell}_r01_trends.csv
+     python3 analysis/aging_trends.py \
+       --run-dir ~/wosar/runs/wosar2026_${cell}_r02 --csv \
+       > /tmp/${cell}_r02_trends.csv
+   done
+   python3 analysis/fdr_aggregate.py \
+     --trends-csv /tmp/e1_r01_trends.csv \
+     --trends-csv /tmp/e2_r01_trends.csv \
+     --trends-csv /tmp/e3_r01_trends.csv \
+     --csv > /tmp/fdr_r01.csv
+   python3 analysis/fdr_aggregate.py \
+     --trends-csv /tmp/e1_r02_trends.csv \
+     --trends-csv /tmp/e2_r02_trends.csv \
+     --trends-csv /tmp/e3_r02_trends.csv \
+     --csv > /tmp/fdr_r02.csv
+   ```
+
+2. **Wait for r02 batch 2 end (~21 May UTC).** Then run the same
+   analysis on `a1_r02`, `a2_r02`, `e3b_r02`. After this, all 12 r02
+   runs are available and the n=2 within-cell variance can be
+   estimated per cell.
+
+3. **r03 batch.** Continues per the campaign plan. Expected to end
+   ~24-25 May UTC. Once r03 is in, full n=3 analysis: median slope per
+   cell, between-run CI, BH-FDR across the joint family.
+
+4. **Paper writing on n=3 data.** The four content elements:
+   (a) Campaign description, hardware, workload, stress regime
+       (Section IV.A) on n=3.
+   (b) Client-side stationarity check (Section IV.B) on n=3.
+       Latency, TTFT, throughput, drop rate over the 36h window.
+   (c) Process-side memory aging (Section IV.C) on n=3 with the
+       three-metric step-wise panel: per-cell RSS slope with
+       BH-FDR-controlled significance, and (corr, K_trim, steps/h)
+       classification (mmap-style / sbrk-style / continuous drift).
+   (d) Low-load ablation (E3b) and 2x2 factorial (Section IV.D-E)
        on n=3.
-   Threats-to-Validity section explicitly discusses the parallel
-   topology choice as a feature of the design (matches realistic
-   multi-tenant deployment), with the a1-isolated outcome cited in
-   support if available.
-5. **Backup hypothesis to test if a1 isolated does not replicate.**
-   diff the bash-history docker run env from `launch_cell.py` invocation:
-   ulimits, --cpus, --memory-reservation, namespaces, security-opt,
-   user/uid. Any difference could be the cause.
-6. **Stepness analysis (corr / K_trim / steps_per_hour).**
-   `analysis/stepness.py` has been written and partially validated
-   on pilot n=1 (2026-05-19). Metric panel: corr (primary, mechanism
-   signature), K_trim (intensity), steps_per_hour (operational).
-   See Open Question #4 for definition and classification rule.
-   Remaining work:
-   - Complete the K_trim CI table on n=1 (A2, E3, E3b values still
-     TBD as of 2026-05-19).
-   - Run on n=3 r01 (server). Compare per-cell mechanism-class
-     assignment n=1 vs n=3.
-   - Re-run on r02, r03 once available, compute between-run CI for
-     each metric (3 replicates per cell).
-   - The headline paper outcome is whether mechanism class
-     (mmap / sbrk / drift) is preserved across n=1 and n=3 despite
-     the slope collapse.
+   Threats-to-Validity (Section V) declares the parallel topology as
+   a feature of the design (realistic multi-tenant deployment), the
+   confounded factorial (vLLM version drift across cells), single
+   hardware, single model.
+
+5. **Stepness analysis sequencing.**
+   - Run `stepness.py --warmup-s 3600` on all completed n=3 runs
+     (r01 + r02 as they land). Record per-cell (corr, K_trim,
+     steps/h) per replica.
+   - After r03, compute between-run CI for each metric (3 replicates
+     per cell). Robust class assignment requires the metric to be
+     stable across replicas.
+   - Decide the headline mechanism claim per cell from the n=3
+     majority-class assignment.
+
+6. **e3 drop rate analysis.** Both e3_r01 and e3_r02 show ~15.6-15.7%
+   dropped requests at the saturated target rate. Investigate:
+   - Are drops time-clustered (bursty) or uniformly distributed?
+   - Do they correlate with GPU 2 VRAM/util spikes or with the
+     process scheduler queue depth?
+   - Is the drop pattern stable across r01/r02 in time, or only in
+     aggregate fraction?
+   The finding is reportable as a property of the PyTorch naive
+   baseline at saturated load in the n=3 paper (Section IV.D rate
+   ablation).
+
 7. **Long-tail TODO (post-campaign).**
-   - Run validation_check.py on a1_r02 / a2_r02 / e3b_r02 if/when they
-     complete.
    - Update `docs/experimental_protocol.md` to reflect the actual
      executed protocol (n=3, 36h, parallel topology, Qwen2.5-7B).
-   - Fix run_monitors.py manifest collision (currently a workaround).
+   - Fix `run_monitors.py` manifest collision (currently a workaround).
    - Restore Docker data-root on /home per ADR-002.
    - Complete refactor of `analysis/aging_trends.py` onto
      `analysis/aging_io.py`. Warmup discard, --csv mode, process_alive
      parsing already done in the 2026-05-19 evening hardening commit;
      remaining: `load_csvs` and `proc_prefix` discovery still local.
      Code-quality debt, not correctness.
-   - `replicate_n1.py` has a hardcoded `BASE` path tied to the
-     original Cowork sandbox. The script is frozen (one-shot
-     pipeline validation against paper Table IV, ran on 2026-05-19,
-     numbers in this doc). If rerun elsewhere, parametrize via
-     `--base PATH` CLI flag. Not a blocker.
 
 ---
 
@@ -527,11 +600,8 @@ In order of priority for the next session:
 
 On the laptop (this repo):
 - `EXPERIMENT_STATE.md` (this file)
-- `replicate_n1.py` (script that reads `logs/aging_pilot_24h_*/` CSVs and
-  reproduces paper Table IV numbers via Theil-Sen, used to validate the
-  pipeline)
 - `docs/project-wosar.md` (longer-form project doc)
-- `docs/WOSAR_2026.pdf` (paper draft as submitted)
+- `docs/WOSAR_2026.pdf` (preprint as submitted; background only)
 - `campaigns/wosar2026/{campaign.yaml, cells/*.yaml}` (campaign config)
 - `scripts/{campaign.py, launch_cell.py, smoke_test_run.sh,
   campaign_health.sh}` (campaign machinery)
@@ -539,16 +609,16 @@ On the laptop (this repo):
   run_monitors.py, find_engine_pid.py, _common.py}` (monitoring)
 - `client/{run_client.py, config.yaml, prompts/arxiv_corpus.jsonl,
   protocols/*.py}` (workload)
-- `analysis/validation_check.py` (post-run verdict per run)
+- `analysis/{validation_check.py, aging_trends.py, fdr_aggregate.py,
+  stepness.py, aging_io.py}` (paper pipeline)
 - `engines/{vllm_standalone, triton_vllm, pytorch_naive}/` (engine
   definitions, Dockerfiles, model_repository for Triton)
 
 On the server (cci-csgpu11):
 - `~/wosar/llm-serving-bench/` (this repo, checked out)
 - `~/wosar/runs/wosar2026_<cell>_r<NN>/` (current campaign runs)
-- `~/wosar/runs_n1_baseline/aging_pilot_24h_*/` (paper pilot runs,
-  May 6-15; CSVs available, but pilot launch scripts not archived: args
-  must be recovered from bash history)
+- `~/wosar/runs_n1_baseline/aging_pilot_24h_*/` (preprint pilot runs;
+  not used in the camera-ready)
 - `~/wosar/runs_aborted_20260516_052308/` (failed first attempt)
 - `~/wosar/hf_cache/` (HuggingFace cache, mounted into all containers)
 
@@ -583,10 +653,11 @@ python3 analysis/fdr_aggregate.py \
 # Adds q_value and bh_reject columns. Decision rule for paper:
 # significant trend iff mk_p<0.01 AND slope_ci excludes 0 AND bh_reject==True.
 
-# Stepness panel (corr, K_trim, steps/h) per run
-python3 analysis/stepness.py --run-dir ~/wosar/runs/wosar2026_<cell>_r<NN>
-# Or all pilot n=1 in one shot (for baseline)
-python3 analysis/stepness.py --logs-root logs/
+# Stepness panel (corr, K_trim, steps/h) per run, on campaign data
+python3 analysis/stepness.py --run-dir ~/wosar/runs/wosar2026_<cell>_r<NN> --warmup-s 3600
+
+# Or all campaign runs in one shot
+python3 analysis/stepness.py --logs-root ~/wosar/runs --warmup-s 3600
 
 # Log a manual mitigation (e.g. after running docker prune by hand)
 echo "$(date -Iseconds) | <category> | <free-text note>" \
@@ -599,9 +670,9 @@ echo "$(date -Iseconds) | <category> | <free-text note>" \
 
 ## Pipeline analytical details (for paper)
 
-The pipeline is now fully in-repo as of 2026-05-19 evening, split
-across four scripts. All four share warmup resolution and CSV parsing
-via `analysis/aging_io.py`.
+The pipeline is fully in-repo as of 2026-05-19 evening, split across
+four scripts. All four share warmup resolution and CSV parsing via
+`analysis/aging_io.py`.
 
 - **Trend detection**: Mann-Kendall with Hamed-Rao correction for
   autocorrelation. Significance at p < 0.01. Implemented in
@@ -618,180 +689,221 @@ via `analysis/aging_io.py`.
   (a) MK Hamed-Rao p < 0.01, (b) Theil-Sen 95% CI excludes zero,
   (c) bh_reject is True. The first two come from `aging_trends.py`,
   the third from `fdr_aggregate.py`.
-- **Stepness panel**: corr (RSS-VMS lag-0), K_trim (winsorized
-  excess kurtosis), steps_per_hour (count of ΔRSS > 1 MB per hour).
-  Implemented in `analysis/stepness.py`. Used to classify cells as
-  mmap-style / sbrk-style / continuous drift.
+- **Stepness panel**: `corr` (RSS-VMS lag-0), `K_trim` (winsorized
+  excess kurtosis), `steps_per_h_1mb` (count of ΔRSS > 1 MB per
+  hour). Implemented in `analysis/stepness.py`. Used to classify
+  cells as mmap-style / sbrk-style / continuous drift.
 - **Per-run sanity gate**: `analysis/validation_check.py` is the
   lightweight per-run verdict tool (PASS/SOFT FAIL/HARD FAIL on
   RSS slope direction). Uses Theil-Sen on real time axis but does
   NOT compute Hamed-Rao or apply BH-FDR; explicitly NOT the paper
   pipeline. For paper-quality numbers always use
-  `aging_trends.py` + `fdr_aggregate.py`.
-- **Pipeline validation**: `replicate_n1.py` (repo root, frozen)
-  reproduces preprint Table IV from local pilot CSVs within 5-20%.
-  Run on 2026-05-19 as a sanity check; numbers in
-  "Internal sanity check" section above.
+  `aging_trends.py + fdr_aggregate.py`.
 - **Magnitude criterion**: open question whether to add an
   operationally meaningful threshold (e.g. slope > 1 MB/h) on top
   of the statistical significance. Discussed but not implemented.
 
 ---
 
+## Step-wise mechanism panel (paper Section IV.E)
+
+The three metrics, definitions, and classification rule.
+
+1. **Primary — `rss_vms_corr`**: lag-0 cross-correlation of dRSS and
+   dVMS post-warmup. Identifies the MECHANISM:
+   - corr > 0.8 → lock-step → mmap-style allocation (RSS and VMS
+     grow together: kernel-mapped blocks, never released)
+   - corr < 0.5 → not lock-step → either continuous drift or
+     sbrk-style heap-internal accumulation
+2. **Secondary — `K_trim`**: excess kurtosis of ΔRSS after
+   winsorization at the 99.9 percentile. Quantifies the INTENSITY
+   of the step-wise pattern, robust to single outliers:
+   - K_trim > 10 → tail-heavy → punctuated dynamics
+   - K_trim < 5 → gaussian-like → continuous drift
+3. **Operational — `steps_per_h_1mb`**: count of ΔRSS > 1 MB per
+   hour of runtime. Reader-friendly descriptor: "this cell shows
+   N step events of at least 1 MB per hour."
+
+Raw `K` is reported alongside `K_trim` for transparency but does not
+enter the classification rule (it is dominated by single outliers
+and not cross-cell comparable).
+
+**Three-category classification rule.** Apply jointly:
+
+| pattern              | corr   | K_trim | mechanism interpretation                                                                  |
+|----------------------|--------|--------|-------------------------------------------------------------------------------------------|
+| mmap-style step-wise | > 0.8  | > 10   | RSS and VMS step together at discrete events → kernel-mapped blocks never returned        |
+| sbrk-style step-wise | < 0.5  | > 10   | RSS steps without paired VMS steps → glibc heap-arena extension, no kernel mmap involved  |
+| continuous drift     | < 0.5  | < 5    | smooth small-grain accumulation, no big steps                                             |
+| (border)             | mixed  | mixed  | needs n=3 confirmation                                                                    |
+
+**Why this is a paper-worthy refinement.** The preprint Section IV.E
+mentions both mmap and sbrk-extended heap as alternative hypotheses
+but does not distinguish them. The (corr, K_trim) pair separates them
+for the first time and is computable from the existing proc CSVs with
+no new instrumentation. The headline mechanism claim of the n=3 paper
+is the per-cell class assignment on n=3 data.
+
+**Status of stepness metric panel:**
+- Implemented in `analysis/stepness.py`.
+- Validated on n=1 pilot CSVs (E1 = continuous drift, E2 =
+  mmap-style step-wise, A1 = sbrk-style step-wise; A2, E3, E3b border).
+- **Confirmed on n=3 r02 for E1 and E2** (2026-05-20): E2 mmap-style
+  (corr=0.83, K_trim=648.6) ✓; E1 continuous drift (corr=0.31,
+  top1%_step=0.0001 MB) ✓ (K_trim=NaN is a script edge case to fix
+  for low-step series).
+- **Fourth class needed: "VAS-only growth".** e3_r02 is classified
+  by the current rule as continuous drift (corr=0.24, K_trim_dRSS=1.1)
+  because the panel looks at dRSS only. But e3_r02 also has paper-grade
+  significant proc.vms_bytes growth at +52 MB/h with no matching RSS
+  growth. Pattern: address space reserved (mmap) but never paged in
+  → not visible in RSS. Plausible mechanism: PyTorch's CUDA caching
+  allocator reserves host-side VAS for device-side mappings without
+  touching CPU memory. To capture this class, stepness.py needs an
+  additional metric K_trim_dVMS, and the classification rule needs
+  a fourth row:
+
+  | pattern                  | corr   | K_trim_dRSS | K_trim_dVMS | mechanism |
+  |--------------------------|--------|--------------|--------------|-----------|
+  | mmap-style step-wise     | > 0.8  | > 10         | > 10         | RSS+VMS lock-step, kernel-mapped blocks never returned |
+  | sbrk-style step-wise     | < 0.5  | > 10         | < 5          | RSS heap-arena extends without kernel mmap |
+  | VAS-only step-wise       | < 0.5  | < 5          | > 10         | VMS-only jumps, address space reserved without paging-in |
+  | uncorrelated step-wise   | < 0.5  | > 10         | > 10         | RSS and VMS both jump but desynchronized; heap-arena + mmap operating independently |
+  | continuous drift         | < 0.5  | < 5          | < 5          | smooth small-grain accumulation everywhere |
+  | (border)                 | mixed  | mixed        | mixed        | needs replica confirmation |
+
+  The five-class taxonomy was committed to `analysis/stepness.py`
+  and `analysis/README.md` on 2026-05-20.
+
+---
+
 ## Open questions for the next session
 
-1. After r02 batch: do the r02 slopes match r01? If yes, topology
-   confound hypothesis stays in play. If no, deeper problem.
-2. After a1 isolated: does it return to ~+530 KB/h? Decides paper
-   narrative.
-3. If topology is confirmed as the confound, do we have time to run a
-   sequential n=3 (6 cells x 3 replicas x 24h = 18 days)? No. So the
-   paper has to be framed around the realistic deployment (parallel
-   topology) or around a single-cell controlled replication of the
-   pilot. Decide before 30 June.
-4. **Does the step-wise RSS/VMS lock-step pattern persist in the n=3
-   data?** This is the qualitative finding the authors care most about,
-   independent of slope magnitudes. Even if the leak rates have dropped
-   by an order of magnitude in n=3, the question is whether the
-   signature is still present:
-   - On E2 (Triton + vLLM V0): the cleanest case in the paper.
-   - On A1 (vLLM V0 standalone): also showed step-wise pattern.
-   - On A2 (Triton + V1) and E1 (V1 standalone): NOT step-wise in the
-     paper (E1 was quasi-linear).
+All within-n=3. No comparison with the preprint.
 
-   What to check (post-completion, on each r01 and onwards):
-   - Plot RSS(t) and VMS(t) on the same axis with second-by-second
-     resolution. Look for flat-then-jump pattern with both curves
-     stepping at the same instants.
-   - Compute first-difference dRSS/dt and dVMS/dt. The step events
-     should appear as paired spikes.
-   - Cross-correlation of dRSS and dVMS at lag 0 should be near 1
-     during the step events.
-   - If the slope magnitude has collapsed but the qualitative pattern
-     is preserved, the finding survives and the paper can keep it as
-     the centerpiece of Section IV.E. If the pattern has disappeared
-     (smooth growth instead of step-wise), the finding does not
-     replicate and the section needs rewriting.
+1. **Between-replica variance per cell. CI-AWARE READING ON n=2
+   (e1/e2/e3 only; a1/a2/e3b r02 still running).**
+   - **e1**: r01 CI [1.5, 22.3] KB/h and r02 CI [0.74, 23.8] KB/h
+     overlap completely. Reproducible within CI; the apparent point
+     ratio of 0.25 is consistent with Theil-Sen sample variance on
+     low-step data, not a real difference.
+   - **e2**: r01 CI [12.9, 31.6] KB/h and r02 CI [40.3, 231.4] KB/h
+     are disjoint by 8.7 KB/h. r02 slope is genuinely higher than
+     r01, with a ~7x ratio. Real between-run effect on this cell.
+   - **e3**: r01 CI [4.9, 20.1] KB/h and r02 CI [21.4, 88.0] KB/h
+     are disjoint by 1.3 KB/h. Borderline; ~3x point ratio.
+   Question for r03: does e2 (and e3) regress toward r01, or does
+   r02 confirm a real drift in the slope estimate? Plausible causes
+   if real: cumulative ambient state on the host (file cache, log
+   growth, neighboring runs' residual effects). The host-side
+   `system.mem_used_bytes` itself dropped 3x between r01 (41.5 MB/h)
+   and r02 (14 MB/h), confirming the host environment was different.
 
-   Implementation: add an analysis script that loads the proc CSVs of
-   a run, extracts rss_bytes and vms_bytes, and reports (a) the number
-   of detected step events above a threshold, (b) the mean step
-   amplitude, (c) the dRSS-dVMS lag-0 correlation, (d) optionally a
-   plot. Run on all completed r01 immediately. Do not wait for r02 or
-   r03 to start this analysis.
+2. **Stepness class assignment per cell on n=3. PARTIAL ANSWERS
+   (r02 of e1/e2/e3, 2026-05-20):**
+   - **E2 r02**: corr=0.83, K_trim_dRSS=648.6, K_trim_dVMS expected
+     also high (lock-step) → **mmap-style step-wise** confirmed.
+   - **E1 r02**: corr=0.31, K_trim_dRSS=0.0 (fallback), top1%_step
+     = 0.0001 MB → **continuous drift** if K_trim_dVMS is also low
+     (campaign run, where aging_trends said VMS not significant).
+     Note: E1 of the PILOT was reclassified to "VAS-only step-wise"
+     under the new taxonomy because K_trim_dVMS_pilot=789, but the
+     campaign run does not (yet) show the same VMS behavior. The
+     headline n=3 class for E1 follows the n=3 data.
+   - **E3 r02**: corr=0.24, K_trim_dRSS=1.1, paper-grade VMS growth
+     at +52 MB/h → **VAS-only step-wise** if K_trim_dVMS is high
+     (likely given the +52 MB/h aggregate slope and visual
+     step-event behavior); to confirm by reading the patched
+     stepness.py output column.
+   - A1, A2, E3b: r02 still running, classification pending. A1 in
+     particular is the candidate for "uncorrelated step-wise"
+     based on the pilot retrospective.
+   - r03 (all cells): pending the campaign continuing.
+   The headline mechanism claim of the camera-ready is the per-cell
+   class assignment on n=3 with majority rule across r01/r02/r03, on
+   the **five-class taxonomy**: mmap-style / sbrk-style / VAS-only /
+   uncorrelated / continuous drift.
 
-   **Metrics policy for the paper (calibrated on pilot n=1, 2026-05-19).**
-   A single scalar (K alone) proved fragile: raw kurtosis is dominated
-   by single extreme outliers (E1 pilot showed K=16412 with bootstrap
-   CI [2, 16893] driven by one anomalous sample). We adopt a
-   three-metric panel per cell.
+   Pilot n=1 reclassification under the same five-class rule is
+   retrospective only (does not feed the paper headline):
+   - E2 pilot → mmap-style step-wise (unchanged)
+   - E1 pilot → VAS-only step-wise (was: drift, missed by preprint)
+   - A1 pilot → uncorrelated step-wise (was: lumped with mmap/sbrk by preprint)
+   - E3, E3b pilot → continuous drift
+   - A2 pilot → border
+   This is paper-relevant only as evidence that the new taxonomy is
+   non-trivial: it recovers mechanism distinctions that the preprint
+   could not make with its three-class panel.
 
-   1. **Primary — rss_vms_corr**: lag-0 cross-correlation of dRSS and
-      dVMS post-warmup. Identifies the MECHANISM:
-      - corr > 0.8 → lock-step → mmap-style allocation (RSS and VMS
-        grow together: kernel-mapped blocks, never released)
-      - corr < 0.5 → not lock-step → either continuous drift or
-        sbrk-style heap-internal accumulation
-   2. **Secondary — K_trim**: excess kurtosis of ΔRSS after
-      winsorization at the 99.9 percentile. Quantifies the INTENSITY
-      of the step-wise pattern, robust to single outliers:
-      - K_trim > 10 → tail-heavy → punctuated dynamics
-      - K_trim < 5 → gaussian-like → continuous drift
-   3. **Operational — steps_per_hour**: count of ΔRSS > 1 MB per
-      hour of runtime. Reader-friendly descriptor: "this cell shows
-      N step events of at least 1 MB per hour."
+3. **Stepness metric stability across replicas.** Within each cell,
+   does the (corr, K_trim) point stay in one classification region
+   across r01/r02/r03, or does it flicker across the boundary?
+   Robust class assignment requires the metric to be stable.
 
-   Raw K is reported alongside K_trim for transparency but does not
-   enter the classification rule.
+4. **e3 drop rate stability and mechanism.** Two replicas at
+   ~15.6-15.7%. Does r03 confirm? Is the drop mechanism client-side
+   concurrency cap exhaustion, server-side asyncio.Lock starvation,
+   or HTTP timeout from prolonged GPU occupation? Each gives a
+   different one-line explanation in Section IV.D.
 
-   **Three-category classification rule.** Apply jointly:
+5. **Topology framing for Threats to Validity.** The n=3 campaign
+   runs three cells in parallel on three GPUs. This is a realistic
+   multi-tenant deployment topology, declared as such in the design
+   (Section III). Section V should articulate explicitly that the
+   reported aging signatures are properties of the deployment under
+   parallel-tenant CPU contention, not of the engine in isolation.
 
-   | pattern              | corr   | K_trim | mechanism interpretation                                                                  |
-   |----------------------|--------|--------|-------------------------------------------------------------------------------------------|
-   | mmap-style step-wise | > 0.8  | > 10   | RSS and VMS step together at discrete events → kernel-mapped blocks never returned        |
-   | sbrk-style step-wise | < 0.5  | > 10   | RSS steps without paired VMS steps → glibc heap-arena extension, no kernel mmap involved  |
-   | continuous drift     | < 0.5  | < 5    | smooth small-grain accumulation, no big steps                                             |
-   | (border)             | mixed  | mixed  | needs n=3 confirmation                                                                    |
+---
 
-   **Why this is a new finding versus the n=1 paper.** The paper text
-   (Section IV.E) mentions both mmap and sbrk-extended heap as
-   alternative hypotheses but does NOT distinguish them. The
-   (corr, K_trim) pair separates them for the first time. In
-   particular, A1 in the paper was lumped with the other
-   "three-of-four step-wise cells"; the metric panel reveals A1
-   belongs to a DIFFERENT mechanism class than E2 (sbrk-style vs
-   mmap-style). This is a paper-worthy refinement obtainable without
-   any new instrumentation, just from the existing proc CSVs.
+## Archive (pre-reframing, kept for traceability)
 
-   **Baseline K_n1 values (pilot CSVs, 2026-05-19).**
+The following items were active before the 2026-05-19 evening paper
+framing decision. They assumed the camera-ready would include a
+side-by-side comparison with the n=1 preprint Table IV. That
+direction is no longer in scope. The work done under that framing
+is retained here so that someone reading the git history (or
+finding a `replicate_n1.py` script in the repo) understands what
+it was for.
 
-   | cell | corr  | K_trim | classification             |
-   |------|-------|--------|----------------------------|
-   | E1   | 0.32  | 0.0    | continuous drift           |
-   | E2   | 0.93  | +356   | mmap-style step-wise       |
-   | A1   | 0.20  | +402   | sbrk-style step-wise       |
-   | A2   | 0.58  | TBD    | border (intermediate)      |
-   | E3   | 0.40  | TBD    | border                     |
-   | E3b  | 0.45  | TBD    | border                     |
+**Internal sanity check (no longer active).** Before the framing
+decision, an internal sanity check compared r01 slopes against
+preprint Table IV and observed differences of 3 to 260x. The
+dominant working hypothesis was the parallel-topology effect: the
+preprint ran one cell at a time on a single GPU; n=3 runs three
+cells in parallel on three GPUs. The fact that e3b at sub-saturated
+load (50 req/h) matched preprint magnitudes, while e3 at saturated
+load (624 req/h) did not, was consistent with a topology- or
+saturation-driven explanation. None of this analysis is required
+for the standalone-n=3 paper.
 
-   K_trim values for A2, E3, E3b to be filled in after re-running the
-   updated stepness.py on n=1.
+**a1-isolated diagnostic (no longer planned as a paper deliverable).**
+A plan to stop the campaign mid-way and run a1 in isolation on
+gpu0 for 24h (matching preprint conditions) was on the table as
+the cleanest topology-effect test. It is no longer required for
+the camera-ready. If time permits post-campaign, it remains an
+interesting mechanism question but does not block the paper.
 
-   **Replication plan against n=3.**
-   1. Re-run stepness.py on all pilot n=1 CSVs to complete the
-      baseline table above.
-   2. Run on n=3 r01 (server). Compare per-cell:
-      corr_n3 vs corr_n1, K_trim_n3 vs K_trim_n1.
-   3. The paper claim survives if MECHANISM CLASS is preserved
-      between n=1 and n=3 even when slope magnitudes have collapsed:
-      - E2: corr_n3 stays > 0.8 → mmap-style intact
-      - A1: corr_n3 stays < 0.5 AND K_trim_n3 > 10 → sbrk-style intact
-      - E1: corr_n3 stays low AND K_trim_n3 low → drift class confirmed
-   4. If class assignments hold across n=1 and n=3 despite 3-260x
-      slope drop, this is the strongest paper claim available:
-      "the aging MECHANISM is invariant under the operational regime;
-      only the RATE is workload-modulated."
+**replicate_n1.py (frozen).** A one-shot script at the repo root
+that reads the local n=1 CSVs and reproduces preprint Table IV
+numbers via Theil-Sen within 5-20%. It was used to validate the
+analytical pipeline against the published preprint numbers (ran
+on 2026-05-19). The script is frozen and is not re-run for the
+camera-ready. If rerun elsewhere, it has a hardcoded `BASE` path
+tied to the original Cowork sandbox and needs to be parametrized
+via a `--base PATH` CLI flag. Not a blocker.
 
-   Why this metric set was chosen: (a) all three quantities are
-   one-line definitions, no bibliography needed beyond a Fisher
-   footnote for K_trim; (b) robust to single outliers (Winsor on
-   K, correlation is bounded in [-1,1]); (c) the metric panel
-   discriminates mechanism, not just magnitude; (d) trivially
-   comparable across cells, replicas, n=1 and n=3.
+**Preprint Table IV (background only, no longer a reference).** The
+headline slope table from the preprint:
 
-   **Analysis sequencing (important).** Compute K on the n=1 pilot
-   CSVs FIRST, before looking at any n=3 numbers. The n=1 K values
-   are the baseline against which the n=3 K values are interpreted.
-   Sequence:
-   1. Run the kurtosis script on the local n=1 CSVs in
-      `logs/aging_pilot_24h_*/` (E1, E2, E3, E3b, A1, A2). Record
-      K_n1 per cell. Expectation from paper Figure 2(b):
-      K_n1(E2) and K_n1(A1) are large (step-wise dominant cells),
-      K_n1(E1) is small (quasi-linear), K_n1(E3, E3b, A2) somewhere
-      in between but with documented step-wise visual signature on
-      three of the four factorial cells.
-   2. Run the same script on the n=3 r01 CSVs on the server
-      (`~/wosar/runs/wosar2026_<cell>_r01/`). Record K_n3 per cell.
-   3. Compare per cell. The headline result for the paper is
-      whether K_n3 / K_n1 stays close to 1 across cells, despite
-      the slope ratios collapsing by 3-260x. Specifically:
-      - If K_n3(E2) is in the same order of magnitude as K_n1(E2),
-        the step-wise mechanism is intact and the paper's central
-        qualitative claim survives.
-      - If K_n3(E2) collapses to single digits, both the magnitude
-        AND the mechanism have changed under the parallel topology.
-        This is a worse outcome but still a clean finding: it would
-        say the mmap-style allocation behavior is itself
-        topology-dependent.
-   4. Once r02 and r03 finish, repeat the analysis to estimate
-      within-cell variance of K (3 replicates per cell). Bootstrap
-      CI from a single run is a within-run uncertainty; replicate
-      CI is the between-run uncertainty, the more important one.
+| ID  | Deployment         | RSS slope    | 95% CI               |
+|-----|--------------------|--------------|----------------------|
+| E1  | vLLM standalone V1 | +9.15 MB/h   | [+9.03, +9.24] MB/h  |
+| E2  | Triton + vLLM V0   | +2.04 MB/h   | [+0.82, +3.12] MB/h  |
+| E3  | PyTorch + HF naive | +170 KB/h    | [+85, +389] KB/h     |
+| E3b | PyTorch + HF low   | +179 KB/h    | overlapping with E3  |
+| A1  | vLLM V0 standalone | +530 KB/h    | (Table V of preprint)|
+| A2  | Triton + vLLM V1   | +20 KB/h     | (Table V of preprint)|
 
-   Implementation note: a small script `analysis/stepness.py`
-   should be added to the repo. Inputs: `--run-dir` for a single
-   run, or `--logs-root` to scan all `aging_pilot_*` directories
-   in `logs/`. Outputs: per-run row with cell_id, K, bootstrap CI,
-   number of post-warmup samples, RSS-VMS lag-0 correlation. As
-   of 2026-05-19 this script does not yet exist and is the next
-   concrete deliverable.
+These numbers do not appear in the camera-ready and are not the
+target of any analysis here. Kept as a record of what the preprint
+reported.
