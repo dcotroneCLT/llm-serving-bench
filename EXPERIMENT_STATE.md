@@ -797,7 +797,7 @@ is the per-cell class assignment on n=3 data.
   | (border)                               | any other combination                                          | mid-corr (0.5-0.8) with significant step events, or mixed K_trim; needs replica confirmation |
 
   The five-class taxonomy with priority short-circuits was committed to
-  `analysis/stepness.py` and `analysis/README.md` across four commits
+  `analysis/stepness.py` and `analysis/README.md` across five commits
   on 2026-05-20 / 2026-05-21:
   - first commit: K_trim_dVMS metric added, K_trim=NaN math fallback,
     five-class rule.
@@ -807,6 +807,18 @@ is the per-cell class assignment on n=3 data.
     "continuous drift" when both axes are in low-step fallback, before
     the corr-based rule. Required because corr in the grey zone 0.5-0.8
     on a low-step run is correlation of micro-noise, not of mechanism.
+  - fix n.4: PID-aware diff segmentation. `analyze_run` now loads
+    `pid` and masks the diff row at every PID transition on both
+    ΔRSS and ΔVMS. Without this, an engine restart (PID bump, RSS/VMS
+    reset to the new process footprint) injects an O(GB) artifact
+    step into the diff series. Synthetic test: a single PID change
+    with no intra-PID jumps > 1 MB produced steps_per_h_1mb=120 and
+    a +899.5 MB false delta under the unsegmented code; under the
+    fix steps_per_h_1mb=0.000 as expected. Local pilot regression
+    test: zero PID transitions detected (single-engine), all 6
+    classes and numeric metrics identical to the pre-fix run.
+    Diagnostic: stderr warning logs the number of PID transitions
+    per run when > 0.
   - fix n.3: (a) `mean_top1_step_mb` recomputed on `arr[arr > 0]` with a
     top-N sort instead of `arr >= np.percentile(arr, 99)`. The old
     formula collapsed to ≈ 0 on zero-heavy sparse series because p99 of

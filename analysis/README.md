@@ -113,7 +113,12 @@ run with bootstrap 95% CIs:
   allocator (e.g. PyTorch CUDA caching allocator on the host) but never
   paged in, so the dynamics are absent from dRSS.
 - `steps_per_h_1mb`: **operational** descriptor. Count of ΔRSS events
-  larger than 1 MiB per hour post-warmup.
+  larger than 1 MiB per hour post-warmup. Diffs are PID-segmented:
+  the row where `pid` changes vs. the previous sample is masked out
+  of both ΔRSS and ΔVMS, so an engine restart does not inject an
+  O(GB) artifact step into the count (synthetic test: a single PID
+  transition with no intra-PID jumps > 1 MB inflated this metric to
+  120 before the segmentation fix, correct value is 0).
 - `mean_top1_step_mb`: **operational** descriptor. Mean of the top 1%
   of POSITIVE ΔRSS jumps, expressed in MB. The positive filter
   (`arr[arr > 0]` before the top-N selection) is required because on

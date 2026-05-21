@@ -20,6 +20,15 @@ dRSS jumps, expressed in MB; the positive filter is required so that
 on zero-heavy sparse series the metric is not pulled to ≈ 0 by the
 mass of zero diffs).
 
+PID-aware segmentation. Diffs are computed within each PID block:
+the row where ``pid`` changes vs. the previous sample is masked out
+of both ΔRSS and ΔVMS. Without this, an engine restart (PID changes,
+RSS/VMS reset to the new process's footprint) injects an O(GB)
+artifact step into the diff series — for example a single PID
+transition with no intra-PID jumps > 1 MB inflated
+``steps_per_h_1mb`` to 120 in a synthetic test, when the correct
+value is 0.
+
 Five-class taxonomy with a border bucket. See
 ``classify_stepness`` and ``analysis/README.md``:
 
@@ -241,7 +250,7 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
     if label is None:
         warn(f"{basename}: no proc_monitor CSV matching known engine labels; skipping")
         return None
-    df = load_proc(run_path, label, columns=["rss_bytes", "vms_bytes"])
+    df = load_proc(run_path, label, columns=["rss_bytes", "vms_bytes", "pid"])
     if df is None or df.empty:
         warn(f"{basename}: empty or unreadable proc CSVs; skipping")
         return None
@@ -253,7 +262,29 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
         warn(f"{basename}: empty after warmup/alive filter; skipping")
         return None
 
-    diff_rss = df["rss_bytes"].astype(float).diff().dropna()
+    # PID-aware segmentation. An engine restart bumps the PID and
+    # resets RSS/VMS, so .diff() across that boundary is a O(GB)
+    # artifact (synthetic test: a single PID change with no intra-PID
+    # jumps > 1 MB produced a false +899.5 MB delta and
+    # steps_per_h_1mb=120). We compute the global diff, then NaN out
+    # the rows where pid changed from the previous sample; dropna()
+    # removes both the initial diff (always NaN) and the inter-PID
+    # boundaries.
+    if "pid" in df.columns:
+        pid_changes = df["pid"].ne(df["pid"].shift())
+        n_pid_transitions = int(pid_changes.sum()) - 1  # subtract the always-true first row
+        if n_pid_transitions > 0:
+            warn(
+                f"{basename}: {n_pid_transitions} PID transition(s) in proc series; "
+                f"masking inter-PID diffs"
+            )
+    else:
+        pid_changes = None
+
+    rss_diff_full = df["rss_bytes"].astype(float).diff()
+    if pid_changes is not None:
+        rss_diff_full = rss_diff_full.mask(pid_changes)
+    diff_rss = rss_diff_full.dropna()
     if len(diff_rss) == 0:
         warn(f"{basename}: insufficient samples for diff_rss; skipping")
         return None
@@ -261,7 +292,10 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
 
     has_vms = "vms_bytes" in df.columns
     if has_vms:
-        diff_vms = df["vms_bytes"].astype(float).diff().dropna()
+        vms_diff_full = df["vms_bytes"].astype(float).diff()
+        if pid_changes is not None:
+            vms_diff_full = vms_diff_full.mask(pid_changes)
+        diff_vms = vms_diff_full.dropna()
         common = diff_rss.index.intersection(diff_vms.index)
         if len(common) >= 2 and diff_rss.loc[common].std() > 0 and diff_vms.loc[common].std() > 0:
             rss_vms_corr = float(np.corrcoef(
