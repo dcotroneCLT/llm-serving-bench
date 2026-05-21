@@ -92,29 +92,58 @@ python3 analysis/validation_check.py \
 
 ## Step-Wise Pattern Analysis
 
-`analysis/stepness.py` quantifies the step-wise RSS growth pattern
-documented in paper Section IV.E (Figure 2). It emits three metrics per
+`analysis/stepness.py` quantifies the step-wise memory growth pattern
+documented in paper Section IV.E (Figure 2). It emits these metrics per
 run with bootstrap 95% CIs:
 
 - `rss_vms_corr` (lag-0): **primary** signature of the allocation
   mechanism. High (> 0.8) means RSS and VMS jump together (mmap-style
   whole-page allocations); low (< 0.5) means RSS jumps without VMS
-  (sbrk-style heap extends).
-- `K_trim`: **secondary** intensity metric. Excess kurtosis of ΔRSS
-  after winsorizing the top 0.1 percent (`scipy.stats.mstats.winsorize(arr,
-  limits=(0, 0.001))`). The raw `K` is reported alongside for
-  reference; it is dominated by single extreme outliers and not
-  comparable across runs.
+  (sbrk-style heap extension) or VMS jumps without RSS (address-space
+  reservation without paging-in).
+- `K_trim_dRSS`: **secondary** intensity metric on RSS. Excess kurtosis
+  of ΔRSS after winsorizing the top 0.1 percent
+  (`scipy.stats.mstats.winsorize(arr, limits=(0, 0.001))`). The raw
+  `K_raw_dRSS` is reported alongside for reference; it is dominated by
+  single extreme outliers and not comparable across runs. The CSV column
+  retains the historical name `K_trim` (same values).
+- `K_trim_dVMS`: **secondary** intensity metric on VMS, computed with
+  the same winsorize-then-kurtosis formula on ΔVMS. Added 2026-05-21 to
+  capture VAS-only growth where address space is reserved by the
+  allocator (e.g. PyTorch CUDA caching allocator on the host) but never
+  paged in, so the dynamics are absent from dRSS.
 - `steps_per_h_1mb`: **operational** descriptor. Count of ΔRSS events
   larger than 1 MiB per hour post-warmup.
 
-Classification rule for the paper:
+### Five-class taxonomy
 
-| corr | K_trim | category |
-|---|---|---|
-| `> 0.8` | `> 10` | mmap-style step-wise (canonical: E2) |
-| `< 0.5` | `> 10` | RSS-only step-wise / sbrk-style (A1 candidate) |
-| `< 0.5` | `< 5`  | continuous drift (canonical: E1) |
+Implemented in `classify_stepness(corr, k_trim_drss, k_trim_dvms)`:
+
+| pattern                | corr   | K_trim_dRSS | K_trim_dVMS | mechanism interpretation |
+|------------------------|--------|-------------|-------------|---------------------------|
+| mmap-style step-wise   | `> 0.8`| `> 10`      | `> 10`      | RSS and VMS step together at discrete events: kernel-mapped pages never returned. Canonical example: E2. |
+| sbrk-style step-wise   | `< 0.5`| `> 10`      | `< 5`       | RSS heap-arena extends without paired VMS step: glibc/jemalloc sbrk path, no kernel mmap involved. |
+| VAS-only step-wise     | `< 0.5`| `< 5`       | `> 10`      | VMS-only jumps with no resident component: address space reserved (anonymous mmap, MAP_NORESERVE-like) and never paged in. Canonical example: `wosar2026_e3_r02` (PyTorch CUDA caching allocator reserves host-side VAS for device-side mappings without touching CPU memory). |
+| uncorrelated step-wise | `< 0.5`| `> 10`      | `> 10`      | RSS and VMS both jump but desynchronized in time: heap-arena extension (RSS-side) and mmap-style allocation of large blocks (VMS-side) operating in parallel as two independent allocator phenomena. Canonical example: `aging_pilot_24h_vllm_v0_ablation_v2` (A1 pilot n=1) with corr=0.20, K_trim_dRSS=402, K_trim_dVMS=582. |
+| continuous drift       | `< 0.5`| `< 5`       | `< 5`       | Smooth small-grain accumulation everywhere, no large step events. Canonical example: E1. |
+| border                 | mixed  | mixed       | mixed       | Out-of-bin or NaN; needs replica confirmation. |
+
+### Low-step fallback
+
+The winsorize-then-kurtosis pipeline can return NaN/inf on a
+quasi-constant diff series (the winsorize step collapses the variance
+to zero). When that happens, the script applies an operational
+fallback per diff axis:
+
+- if `mean_top1_step_mb < 1` AND `steps_per_h_1mb < 0.1` on the same
+  series, the diff has no real step events and `K_trim` is overridden
+  to `0.0` (declared clean drift). A stderr warning is emitted and the
+  output row gains a `notes` entry `RSS_low_step_fallback` or
+  `VMS_low_step_fallback`.
+- otherwise, `K_trim` stays NaN and the row is tagged
+  `RSS_kurtosis_undefined` / `VMS_kurtosis_undefined`. The
+  classification function maps any NaN component to the `border`
+  bucket so the downstream pipeline does not break.
 
 Usage on the local pilot logs (auto-discovery from `aging_pilot_*` and
 `wosar2026_*` subdirs):
