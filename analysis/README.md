@@ -117,33 +117,44 @@ run with bootstrap 95% CIs:
 
 ### Five-class taxonomy
 
-Implemented in `classify_stepness(corr, k_trim_drss, k_trim_dvms)`:
+Implemented in `classify_stepness(corr, k_trim_drss, k_trim_dvms, notes)`:
 
-| pattern                | corr   | K_trim_dRSS | K_trim_dVMS | mechanism interpretation |
-|------------------------|--------|-------------|-------------|---------------------------|
-| mmap-style step-wise   | `> 0.8`| `> 10`      | `> 10`      | RSS and VMS step together at discrete events: kernel-mapped pages never returned. Canonical example: E2. |
-| sbrk-style step-wise   | `< 0.5`| `> 10`      | `< 5`       | RSS heap-arena extends without paired VMS step: glibc/jemalloc sbrk path, no kernel mmap involved. |
-| VAS-only step-wise     | `< 0.5`| `< 5`       | `> 10`      | VMS-only jumps with no resident component: address space reserved (anonymous mmap, MAP_NORESERVE-like) and never paged in. Canonical example: `wosar2026_e3_r02` (PyTorch CUDA caching allocator reserves host-side VAS for device-side mappings without touching CPU memory). |
-| uncorrelated step-wise | `< 0.5`| `> 10`      | `> 10`      | RSS and VMS both jump but desynchronized in time: heap-arena extension (RSS-side) and mmap-style allocation of large blocks (VMS-side) operating in parallel as two independent allocator phenomena. Canonical example: `aging_pilot_24h_vllm_v0_ablation_v2` (A1 pilot n=1) with corr=0.20, K_trim_dRSS=402, K_trim_dVMS=582. |
-| continuous drift       | `< 0.5`| `< 5`       | `< 5`       | Smooth small-grain accumulation everywhere, no large step events. Canonical example: E1. |
-| border                 | mixed  | mixed       | mixed       | Out-of-bin or NaN; needs replica confirmation. |
+| pattern                | condition                                           | K_trim_dRSS | K_trim_dVMS | mechanism interpretation |
+|------------------------|-----------------------------------------------------|-------------|-------------|---------------------------|
+| continuous drift (low-step fallback) | both axes in low-step operational fallback (notes contain `RSS_low_step_operational_drift` AND `VMS_low_step_operational_drift`) | n/a (forced 0) | n/a (forced 0) | No significant step events on either axis; the measured corr is micro-noise correlation, not a mechanism signature. Takes precedence over the (corr, K_trim) rules below. Canonical examples: `wosar2026_e1_r01` (corr=0.64 but both axes flat), A2 pilot (corr=0.58, K_raw_dRSS=3533 winsorize-artifact, K_raw_dVMS=1.08). |
+| mmap-style step-wise   | corr `> 0.8`                                        | `> 10`      | `> 10`      | RSS and VMS step together at discrete events: kernel-mapped pages never returned. Canonical example: E2. |
+| sbrk-style step-wise   | corr `< 0.5`                                        | `> 10`      | `< 5`       | RSS heap-arena extends without paired VMS step: glibc/jemalloc sbrk path, no kernel mmap involved. |
+| VAS-only step-wise     | corr `< 0.5`                                        | `< 5`       | `> 10`      | VMS-only jumps with no resident component: address space reserved (anonymous mmap, MAP_NORESERVE-like) and never paged in. Canonical example: `wosar2026_e3_r02` (PyTorch CUDA caching allocator reserves host-side VAS for device-side mappings without touching CPU memory). |
+| uncorrelated step-wise | corr `< 0.5`                                        | `> 10`      | `> 10`      | RSS and VMS both jump but desynchronized in time: heap-arena extension (RSS-side) and mmap-style allocation of large blocks (VMS-side) operating in parallel as two independent allocator phenomena. Canonical example: `aging_pilot_24h_vllm_v0_ablation_v2` (A1 pilot n=1) with corr=0.20, K_trim_dRSS=402, K_trim_dVMS=582. |
+| continuous drift       | corr `< 0.5`                                        | `< 5`       | `< 5`       | Smooth small-grain accumulation everywhere, no large step events. Canonical example: E1. |
+| border                 | mixed                                               | mixed       | mixed       | Out-of-bin or NaN on (corr, K_trim) with no fallback on either axis; needs replica confirmation. |
 
 ### Low-step fallback
 
-The winsorize-then-kurtosis pipeline can return NaN/inf on a
-quasi-constant diff series (the winsorize step collapses the variance
-to zero). When that happens, the script applies an operational
-fallback per diff axis:
+Operational-driven, NOT math-driven. The rule keys off
+`steps_per_h_1mb` on the same axis, independent of whether the raw
+`K_trim` was computable numerically:
 
-- if `mean_top1_step_mb < 1` AND `steps_per_h_1mb < 0.1` on the same
-  series, the diff has no real step events and `K_trim` is overridden
-  to `0.0` (declared clean drift). A stderr warning is emitted and the
-  output row gains a `notes` entry `RSS_low_step_fallback` or
-  `VMS_low_step_fallback`.
-- otherwise, `K_trim` stays NaN and the row is tagged
+- if `steps_per_h_1mb < 0.01` on a given axis (≈ < 1 MB-scale jump
+  per 100 hours), the series has no real step events on that axis
+  and `K_trim` is overridden to `0.0`, even when the raw computation
+  returned a large finite kurtosis (winsorize on a near-flat series
+  inflates K from a handful of sub-MB outliers). A stderr warning is
+  emitted and the output row gains a `notes` entry
+  `RSS_low_step_operational_drift` or
+  `VMS_low_step_operational_drift`. Threshold calibrated an order of
+  magnitude below the lowest mmap-style cell observed in the n=3
+  campaign (e2_r02 at ≈ 0.09 steps/h) so genuine sparse step-wise
+  runs are not swept up by the fallback.
+- otherwise, if `K_trim` is NaN/inf, the row is tagged
   `RSS_kurtosis_undefined` / `VMS_kurtosis_undefined`. The
-  classification function maps any NaN component to the `border`
-  bucket so the downstream pipeline does not break.
+  classification function maps any NaN component on
+  (corr, K_trim_dRSS, K_trim_dVMS) to the `border` bucket so the
+  downstream pipeline does not break.
+
+When the fallback fires on BOTH axes, the classification function
+short-circuits to `continuous drift` regardless of corr; see the
+priority row at the top of the taxonomy table above.
 
 Usage on the local pilot logs (auto-discovery from `aging_pilot_*` and
 `wosar2026_*` subdirs):

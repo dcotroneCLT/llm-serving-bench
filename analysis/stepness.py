@@ -21,6 +21,11 @@ expressed in MB).
 Five-class taxonomy with a border bucket. See
 ``classify_stepness`` and ``analysis/README.md``:
 
+- continuous drift (low-step fallback): low-step operational fallback
+  fired on BOTH axes (regardless of corr). When neither RSS nor VMS
+  shows real step events, the measured corr is correlation of
+  micro-noise, not a mechanism signature; the class is unambiguously
+  continuous drift.
 - mmap-style step-wise: corr > 0.8 AND K_trim_dRSS > 10 AND K_trim_dVMS > 10
 - sbrk-style step-wise: corr < 0.5 AND K_trim_dRSS > 10 AND K_trim_dVMS < 5
 - VAS-only step-wise: corr < 0.5 AND K_trim_dRSS < 5 AND K_trim_dVMS > 10
@@ -179,13 +184,25 @@ def _apply_low_step_fallback(m, steps_per_h_1mb, basename):
     return ""
 
 
-def classify_stepness(corr, k_trim_drss, k_trim_dvms):
+def classify_stepness(corr, k_trim_drss, k_trim_dvms, notes):
     """Five-class taxonomy plus a border bucket.
 
     See EXPERIMENT_STATE.md "Step-wise mechanism panel" and the
     README of analysis/ for the mechanism interpretation of each
-    class. Any NaN input falls into ``border``.
+    class. Any NaN input on the (corr, K_trim_dRSS, K_trim_dVMS) axes
+    falls into ``border``.
+
+    Priority rule: if the low-step operational fallback fired on BOTH
+    axes (``notes`` contains both ``RSS_low_step_operational_drift``
+    and ``VMS_low_step_operational_drift``), the class is
+    ``continuous drift`` regardless of corr — in the absence of real
+    step events the measured corr is micro-noise, not mechanism.
     """
+    if (
+        "RSS_low_step_operational_drift" in notes
+        and "VMS_low_step_operational_drift" in notes
+    ):
+        return "continuous drift"
     if not (np.isfinite(corr) and np.isfinite(k_trim_drss) and np.isfinite(k_trim_dvms)):
         return "border"
     if corr > 0.8 and k_trim_drss > 10 and k_trim_dvms > 10:
@@ -265,7 +282,7 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
     if not has_vms:
         notes.append("VMS_missing")
 
-    cls = classify_stepness(rss_vms_corr, m_rss["K_trim"], m_vms["K_trim"])
+    cls = classify_stepness(rss_vms_corr, m_rss["K_trim"], m_vms["K_trim"], notes)
 
     ts_values = df["ts_unix"].astype(float).values[1:]
     return {
