@@ -28,14 +28,20 @@ Five-class taxonomy with a border bucket. See
 - continuous drift: corr < 0.5 AND K_trim_dRSS < 5 AND K_trim_dVMS < 5
 - border: everything else (mixed, NaN, or out-of-bin)
 
-Low-step fallback. winsorize-then-kurtosis can return NaN/inf on a
-quasi-constant diff series (variance collapses to zero after
-winsorizing). When that happens, the script checks the operational
-descriptors: if ``mean_top1_step_mb < 1`` AND ``steps_per_h_1mb < 0.1``
-on the same series, the diff has no real step events and ``K_trim``
-is overridden to 0.0 (declared clean drift) with a stderr warning and
-a ``*_low_step_fallback`` entry in ``notes``. If the fallback
-condition does not hold, ``K_trim`` stays NaN and ``notes`` records
+Low-step fallback (operational-driven, NOT math-driven). The rule
+keys off the operational descriptor on the same axis, independent of
+whether ``K_trim`` was computable numerically. If
+``steps_per_h_1mb < 0.01`` on that series (≈ < 1 MB-scale jump per
+100 hours), the run has no real step events on that axis and
+``K_trim`` is overridden to 0.0 with a stderr warning and a
+``*_low_step_operational_drift`` entry in ``notes``. The override
+fires even when the raw ``K_trim`` is large and finite: numerically
+large kurtosis on a near-flat series is a winsorize artifact, not a
+real step-wise signature. Calibration: the threshold is set an order
+of magnitude below the lowest mmap-style cell observed in the n=3
+campaign (e2_r02 at ≈ 0.09 steps/h) to keep genuine sparse step-wise
+runs out of the fallback. If the operational condition does not hold
+but ``K_trim`` is still NaN/inf, ``notes`` records
 ``*_kurtosis_undefined`` so downstream consumers can flag the row.
 
 CLI/parsing pattern follows replicate_n1.py. See EXPERIMENT_STATE.md
@@ -140,31 +146,37 @@ def _compute_kurtosis_metrics(arr, n_bootstrap, rng, basename, label):
 
 
 def _apply_low_step_fallback(m, steps_per_h_1mb, basename):
-    """If K_trim is NaN/inf and the series shows no real steps, set K_trim=0.0.
+    """Operational-driven low-step override for K_trim.
 
-    Mutates the dict in place and returns the note string ("" if no
-    fallback was applied, "<label>_low_step_fallback", or
-    "<label>_kurtosis_undefined" when undefined and the fallback
-    condition is not met).
+    The rule keys off ``steps_per_h_1mb`` only, independent of the
+    numerical K_trim value. If the series has < 0.01 MB-scale jumps
+    per hour, K_trim is forced to 0.0 even when the raw computation
+    returned a large finite kurtosis (winsorize on a near-flat series
+    inflates K). Mutates the dict in place and returns the note
+    string ("" if no fallback was applied,
+    ``"<label>_low_step_operational_drift"`` when the override fired,
+    or ``"<label>_kurtosis_undefined"`` when K_trim is NaN/inf and
+    the fallback did NOT fire).
     """
     label = m["_label"]
     K_trim = m["K_trim"]
-    if np.isfinite(K_trim):
-        return ""
 
-    small_top = np.isfinite(m["mean_top1_step_mb"]) and m["mean_top1_step_mb"] < 1.0
-    small_count = np.isfinite(steps_per_h_1mb) and steps_per_h_1mb < 0.1
-    if small_top and small_count:
+    low_step = np.isfinite(steps_per_h_1mb) and steps_per_h_1mb < 0.01
+    if low_step:
         warn(
-            f"{basename}: Δ{label} K_trim undefined with no real step events "
-            f"(top1%={m['mean_top1_step_mb']:.4f} MB, steps/h={steps_per_h_1mb:.3f}); "
-            f"low-step fallback → K_trim=0.0 (drift)"
+            f"{basename}: Δ{label} no real step events "
+            f"(steps/h={steps_per_h_1mb:.4f} < 0.01, "
+            f"K_trim_raw={K_trim:+.1f}); "
+            f"low-step operational fallback → K_trim=0.0 (drift)"
         )
         m["K_trim"] = 0.0
         m["K_trim_ci_lo"] = float("nan")
         m["K_trim_ci_hi"] = float("nan")
-        return f"{label}_low_step_fallback"
-    return f"{label}_kurtosis_undefined"
+        return f"{label}_low_step_operational_drift"
+
+    if not np.isfinite(K_trim):
+        return f"{label}_kurtosis_undefined"
+    return ""
 
 
 def classify_stepness(corr, k_trim_drss, k_trim_dvms):
