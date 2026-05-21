@@ -3,6 +3,15 @@
 This directory contains the post-processing scripts for pilot runs and
 the WoSAR 2026 long-running software-aging campaign.
 
+## Environment
+
+Run the analysis scripts from an environment with the dependencies in
+`analysis/requirements.txt` installed:
+
+```bash
+python3 -m pip install -r analysis/requirements.txt
+```
+
 ## Inputs
 
 Each run directory is self-contained:
@@ -105,8 +114,10 @@ run with bootstrap 95% CIs:
   of ΔRSS after winsorizing the top 0.1 percent
   (`scipy.stats.mstats.winsorize(arr, limits=(0, 0.001))`). The raw
   `K_raw_dRSS` is reported alongside for reference; it is dominated by
-  single extreme outliers and not comparable across runs. The CSV column
-  retains the historical name `K_trim` (same values).
+  single extreme outliers and not comparable across runs. Bootstrap CIs
+  filter undefined resamples from sparse/constant draws; for `K_trim`
+  the winsorization is recomputed inside each bootstrap resample. The
+  CSV column retains the historical name `K_trim` (same values).
 - `K_trim_dVMS`: **secondary** intensity metric on VMS, computed with
   the same winsorize-then-kurtosis formula on ΔVMS. Added 2026-05-21 to
   capture VAS-only growth where address space is reserved by the
@@ -134,8 +145,8 @@ Implemented in `classify_stepness(corr, k_trim_drss, k_trim_dvms, notes)`:
 
 | pattern                | condition                                           | K_trim_dRSS | K_trim_dVMS | mechanism interpretation |
 |------------------------|-----------------------------------------------------|-------------|-------------|---------------------------|
-| **border (VMS_missing)** | `VMS_missing` in notes (cell breakage, monitor crash, vms_bytes column absent) | n/a | n/a | Highest priority: a run with no VMS axis cannot be classified on the (corr, K_trim_dRSS, K_trim_dVMS) panel; returning `continuous drift` would silently swallow missing data, so the row is flagged `border` for replica review. |
-| continuous drift (low-step fallback) | both axes in low-step operational fallback (notes contain `RSS_low_step_operational_drift` AND `VMS_low_step_operational_drift`) | n/a (forced 0) | n/a (forced 0) | No significant step events on either axis; the measured corr is micro-noise correlation, not a mechanism signature. Takes precedence over the (corr, K_trim) rules below (but yields to `VMS_missing` above). Canonical examples: `wosar2026_e1_r01` (corr=0.64 but both axes flat), A2 pilot (corr=0.58, K_raw_dRSS=3533 winsorize-artifact, K_raw_dVMS=1.08). |
+| **border (VMS missing/unusable)** | `VMS_missing` or `VMS_unusable` in notes (cell breakage, monitor crash, `vms_bytes` column absent, or no finite ΔVMS samples post-warmup) | n/a | n/a | Highest priority: a run with no usable VMS axis cannot be classified on the (corr, K_trim_dRSS, K_trim_dVMS) panel; returning `continuous drift` would silently swallow missing data, so the row is flagged `border` for replica review. |
+| continuous drift (low-step fallback) | both axes in low-step operational fallback (notes contain `RSS_low_step_operational_drift` AND `VMS_low_step_operational_drift`) | n/a (forced 0) | n/a (forced 0) | No significant step events on either axis; the measured corr is micro-noise correlation, not a mechanism signature. Takes precedence over the (corr, K_trim) rules below (but yields to missing/unusable VMS above). Canonical examples: `wosar2026_e1_r01` (corr=0.64 but both axes flat), A2 pilot (corr=0.58, K_raw_dRSS=3533 winsorize-artifact, K_raw_dVMS=1.08). |
 | mmap-style step-wise   | corr `> 0.8`                                        | `> 10`      | `> 10`      | RSS and VMS step together at discrete events: kernel-mapped pages never returned. Canonical example: E2. |
 | sbrk-style step-wise   | corr `< 0.5`                                        | `> 10`      | `< 5`       | RSS heap-arena extends without paired VMS step: glibc/jemalloc sbrk path, no kernel mmap involved. |
 | VAS-only step-wise     | corr `< 0.5`                                        | `< 5`       | `> 10`      | VMS-only jumps with no resident component: address space reserved (anonymous mmap, MAP_NORESERVE-like) and never paged in. Canonical example: `wosar2026_e3_r02` (PyTorch CUDA caching allocator reserves host-side VAS for device-side mappings without touching CPU memory). |
@@ -165,10 +176,14 @@ Operational-driven, NOT math-driven. The rule keys off
   classification function maps any NaN component on
   (corr, K_trim_dRSS, K_trim_dVMS) to the `border` bucket so the
   downstream pipeline does not break.
+- if `vms_bytes` is absent, all-NaN, or has no finite adjacent
+  post-warmup deltas after PID segmentation, the row is tagged
+  `VMS_missing` or `VMS_unusable` and classified as `border` before the
+  low-step fallback can fire.
 
-When the fallback fires on BOTH axes, the classification function
+When the fallback fires on BOTH usable axes, the classification function
 short-circuits to `continuous drift` regardless of corr; see the
-priority row at the top of the taxonomy table above.
+priority rows at the top of the taxonomy table above.
 
 Usage on the local pilot logs (auto-discovery from `aging_pilot_*` and
 `wosar2026_*` subdirs):
@@ -177,15 +192,15 @@ Usage on the local pilot logs (auto-discovery from `aging_pilot_*` and
 python3 analysis/stepness.py --logs-root logs
 ```
 
-On the production campaign, **pass `--warmup-s 3600` explicitly** —
-unlike the other analysis scripts the current implementation does not
-load the per-cell `warmup_discard_s` from the campaign yaml and uses
-its own 1800 s default.
+On the production campaign, `stepness.py` auto-resolves warmup via
+`aging_io.resolve_warmup`: `wosar2026_*` runs read
+`campaigns/wosar2026/cells/<cell>.yaml` (`warmup_discard_s=3600`), and
+pilot runs use the 1800 s convention. Pass `--warmup-s` only for an
+explicit sensitivity check.
 
 ```bash
 python3 analysis/stepness.py \
-  --logs-root /home/dcotrone/wosar/runs \
-  --warmup-s 3600
+  --logs-root /home/dcotrone/wosar/runs
 ```
 
 Add `--csv` for machine-readable output or `--top-k N` to also dump the
@@ -219,10 +234,11 @@ requests. It is the per-level counterpart of `sweep_curve.py`.
   `diagnose_step_patterns.py` (all of which go through `aging_io.py`).
 - `--warmup-hours` overrides manifest/campaign warmup for sensitivity
   checks.
-- `analysis/stepness.py` and `analysis/aging_trends.py` do **not**
-  currently read the cell yaml: their warmup defaults to 1800 s. On
-  production campaign data pass `--warmup-s 3600` (stepness) or rely
-  on the per-run timestamp window (aging_trends).
+- `analysis/stepness.py` and `analysis/aging_trends.py` use run-root
+  paths rather than the plotting scripts' `--campaign-yaml` interface,
+  but both now resolve campaign warmup from project conventions. On
+  production campaign data, omit `--warmup-s` for the cell-yaml value or
+  pass it explicitly for sensitivity checks.
 - Plot downsampling is time-based (`--plot-every-seconds`) rather than
   sample-count-based, so the figures remain valid if monitor sampling
   periods change.

@@ -90,11 +90,13 @@ What is **new in the n=3 camera-ready** vs the preprint:
   the late-onset-effects TTV.
 - **BH-FDR control** at q=0.10 across the joint family of
   (run_id, indicator) tests. The preprint did per-indicator MK only.
-- **Three-metric step-wise panel** (`rss_vms_corr`, `K_trim`,
-  `steps_per_h_1mb`) with a three-category classification rule:
-  mmap-style step-wise / sbrk-style step-wise / continuous drift.
-  The preprint conflated mmap and sbrk under "step-wise". This is
-  the paper-worthy mechanism refinement.
+- **Stepness mechanism panel** (`rss_vms_corr`, `K_trim_dRSS`,
+  `K_trim_dVMS`, `steps_per_h_1mb`, `mean_top1_step_mb`) with the
+  five-class taxonomy: mmap-style / sbrk-style / VAS-only /
+  uncorrelated / continuous drift, plus border for unusable VMS or
+  out-of-bin rows. The preprint conflated mmap and sbrk under
+  "step-wise"; the RSS/VMS split is the paper-worthy mechanism
+  refinement.
 - **Realistic parallel multi-tenant topology.** Three GPUs in
   parallel rather than the preprint's sequential single-GPU. Declared
   as a feature of the design (Section III) and discussed in Threats
@@ -195,10 +197,12 @@ camera-ready regardless of r03 outcome):
   in-repo: `aging_trends.py` + `fdr_aggregate.py` for slope+CI+FDR,
   `stepness.py` for the (corr, K_trim_dRSS, K_trim_dVMS, steps>1MB/h,
   top1%_step) panel with five-class taxonomy + priority short-circuits
-  (low-step → drift, VMS_missing → border). Four bug fixes committed
-  2026-05-20/21 (math fallback → operational fallback; classification
-  short-circuit on both-axes-fallback; top1%_step zero-heavy bug;
-  VMS-missing handling; PID-aware diff segmentation).
+  (low-step → drift, VMS missing/unusable → border). Five hardening
+  fixes landed 2026-05-20/21: math fallback → operational fallback,
+  classification short-circuit on both-axes-fallback, top1%_step
+  zero-heavy bug, VMS missing/unusable handling, PID-aware diff
+  segmentation plus aligned top-k timestamps and sparse-bootstrap
+  handling.
 
 Open headline questions for the paper (within-n=3, not vs preprint):
 
@@ -608,9 +612,10 @@ In order of priority for the next session:
    (b) Client-side stationarity check (Section IV.B) on n=3.
        Latency, TTFT, throughput, drop rate over the 36h window.
    (c) Process-side memory aging (Section IV.C) on n=3 with the
-       three-metric step-wise panel: per-cell RSS slope with
-       BH-FDR-controlled significance, and (corr, K_trim, steps/h)
-       classification (mmap-style / sbrk-style / continuous drift).
+      stepness mechanism panel: per-cell RSS slope with
+      BH-FDR-controlled significance, and (corr, K_trim_dRSS,
+      K_trim_dVMS, steps/h) classification under the five-class
+      taxonomy.
    (d) Low-load ablation (E3b) and 2x2 factorial (Section IV.D-E)
        on n=3.
    Threats-to-Validity (Section V) declares the parallel topology as
@@ -619,9 +624,10 @@ In order of priority for the next session:
    hardware, single model.
 
 5. **Stepness analysis sequencing.**
-   - Run `stepness.py --warmup-s 3600` on all completed n=3 runs
-     (r01 + r02 as they land). Record per-cell (corr, K_trim,
-     steps/h) per replica.
+   - Run `stepness.py` on all completed n=3 runs (r01 + r02 as they
+     land). Warmup is auto-resolved from the cell YAML; pass
+     `--warmup-s 3600` only as an explicit override. Record per-cell
+     (corr, K_trim_dRSS, K_trim_dVMS, steps/h) per replica.
    - After r03, compute between-run CI for each metric (3 replicates
      per cell). Robust class assignment requires the metric to be
      stable across replicas.
@@ -709,11 +715,12 @@ python3 analysis/fdr_aggregate.py \
 # Adds q_value and bh_reject columns. Decision rule for paper:
 # significant trend iff mk_p<0.01 AND slope_ci excludes 0 AND bh_reject==True.
 
-# Stepness panel (corr, K_trim, steps/h) per run, on campaign data
-python3 analysis/stepness.py --run-dir ~/wosar/runs/wosar2026_<cell>_r<NN> --warmup-s 3600
+# Stepness panel (corr, K_trim_dRSS, K_trim_dVMS, steps/h) per run.
+# Warmup is auto-resolved from the campaign cell YAML.
+python3 analysis/stepness.py --run-dir ~/wosar/runs/wosar2026_<cell>_r<NN>
 
 # Or all campaign runs in one shot
-python3 analysis/stepness.py --logs-root ~/wosar/runs --warmup-s 3600
+python3 analysis/stepness.py --logs-root ~/wosar/runs
 
 # Log a manual mitigation (e.g. after running docker prune by hand)
 echo "$(date -Iseconds) | <category> | <free-text note>" \
@@ -745,10 +752,11 @@ four scripts. All four share warmup resolution and CSV parsing via
   (a) MK Hamed-Rao p < 0.01, (b) Theil-Sen 95% CI excludes zero,
   (c) bh_reject is True. The first two come from `aging_trends.py`,
   the third from `fdr_aggregate.py`.
-- **Stepness panel**: `corr` (RSS-VMS lag-0), `K_trim` (winsorized
-  excess kurtosis), `steps_per_h_1mb` (count of ΔRSS > 1 MB per
-  hour). Implemented in `analysis/stepness.py`. Used to classify
-  cells as mmap-style / sbrk-style / continuous drift.
+- **Stepness panel**: `corr` (RSS-VMS lag-0), `K_trim_dRSS`,
+  `K_trim_dVMS`, `steps_per_h_1mb`, and `mean_top1_step_mb`
+  (top 1% of positive ΔRSS jumps). Implemented in
+  `analysis/stepness.py` with PID-segmented deltas and sparse-safe
+  bootstrap CIs. Used to classify cells under the five-class taxonomy.
 - **Per-run sanity gate**: `analysis/validation_check.py` is the
   lightweight per-run verdict tool (PASS/SOFT FAIL/HARD FAIL on
   RSS slope direction). Uses Theil-Sen on real time axis but does
@@ -784,14 +792,18 @@ Raw `K` is reported alongside `K_trim` for transparency but does not
 enter the classification rule (it is dominated by single outliers
 and not cross-cell comparable).
 
-**Three-category classification rule.** Apply jointly:
+**Current five-class classification rule.** Apply jointly:
 
-| pattern              | corr   | K_trim | mechanism interpretation                                                                  |
-|----------------------|--------|--------|-------------------------------------------------------------------------------------------|
-| mmap-style step-wise | > 0.8  | > 10   | RSS and VMS step together at discrete events → kernel-mapped blocks never returned        |
-| sbrk-style step-wise | < 0.5  | > 10   | RSS steps without paired VMS steps → glibc heap-arena extension, no kernel mmap involved  |
-| continuous drift     | < 0.5  | < 5    | smooth small-grain accumulation, no big steps                                             |
-| (border)             | mixed  | mixed  | needs n=3 confirmation                                                                    |
+| pattern                | condition                                           | mechanism interpretation |
+|------------------------|-----------------------------------------------------|--------------------------|
+| border (VMS missing/unusable) | `VMS_missing` or `VMS_unusable` in notes | Cannot classify on the three-axis panel without a usable VMS axis; flag for replica review. |
+| continuous drift (low-step fallback) | both usable axes in low-step operational fallback | No significant step events on either axis; corr is micro-noise correlation, not mechanism. |
+| mmap-style step-wise   | corr > 0.8 AND K_trim_dRSS > 10 AND K_trim_dVMS > 10 | RSS and VMS step together at discrete events → kernel-mapped blocks never returned |
+| sbrk-style step-wise   | corr < 0.5 AND K_trim_dRSS > 10 AND K_trim_dVMS < 5 | RSS heap-arena extends without paired VMS step |
+| VAS-only step-wise     | corr < 0.5 AND K_trim_dRSS < 5 AND K_trim_dVMS > 10 | VMS-only jumps, address space reserved without paging-in |
+| uncorrelated step-wise | corr < 0.5 AND K_trim_dRSS > 10 AND K_trim_dVMS > 10 | RSS and VMS both jump but desynchronized |
+| continuous drift       | corr < 0.5 AND K_trim_dRSS < 5 AND K_trim_dVMS < 5 | smooth small-grain accumulation, no big steps |
+| border                 | mixed                                               | needs n=3 confirmation |
 
 **Why this is a paper-worthy refinement.** The preprint Section IV.E
 mentions both mmap and sbrk-extended heap as alternative hypotheses
@@ -802,27 +814,23 @@ is the per-cell class assignment on n=3 data.
 
 **Status of stepness metric panel:**
 - Implemented in `analysis/stepness.py`.
-- Validated on n=1 pilot CSVs (E1 = continuous drift, E2 =
-  mmap-style step-wise, A1 = sbrk-style step-wise; A2, E3, E3b border).
-- **Confirmed on n=3 r02 for E1 and E2** (2026-05-20): E2 mmap-style
-  (corr=0.83, K_trim=648.6) ✓; E1 continuous drift (corr=0.31,
-  top1%_step=0.0001 MB) ✓ (K_trim=NaN is a script edge case to fix
-  for low-step series).
-- **Fourth class needed: "VAS-only growth".** e3_r02 is classified
-  by the current rule as continuous drift (corr=0.24, K_trim_dRSS=1.1)
-  because the panel looks at dRSS only. But e3_r02 also has paper-grade
-  significant proc.vms_bytes growth at +52 MB/h with no matching RSS
-  growth. Pattern: address space reserved (mmap) but never paged in
-  → not visible in RSS. Plausible mechanism: PyTorch's CUDA caching
-  allocator reserves host-side VAS for device-side mappings without
-  touching CPU memory. To capture this class, stepness.py needs an
-  additional metric K_trim_dVMS, and the classification rule needs
-  a fourth row:
+- Current implementation reports dRSS and dVMS kurtosis, PID-segments
+  deltas across engine restarts, treats missing/unusable VMS as
+  `border`, and uses sparse-safe bootstrap CIs.
+- Pilot n=1 retrospective under the five-class rule: E2 =
+  mmap-style step-wise; E1 = VAS-only step-wise; A1 =
+  uncorrelated step-wise; E3/E3b = continuous drift; A2 =
+  continuous drift via both-axis low-step fallback.
+- Campaign r01/r02 status (2026-05-21): E2 is mmap-style in both
+  replicas; E1 and E3 are continuous drift in both replicas. E3 has a
+  significant VMS slope, but `K_trim_dVMS` remains ~1, so it is smooth
+  VMS drift rather than VAS-only step-wise.
+- Current taxonomy:
 
   | pattern                                | condition                                                     | mechanism |
   |----------------------------------------|----------------------------------------------------------------|-----------|
-  | border (VMS_missing)                   | `VMS_missing` in notes (cell breakage, monitor crash)          | highest-priority short-circuit: cannot classify on (corr, K_trim_dRSS, K_trim_dVMS) without a VMS axis; returning drift would silently swallow missing data. |
-  | continuous drift (low-step fallback)   | both axes in low-step operational fallback (steps/h < 0.01)    | no significant step events on either axis; corr is noise correlation, not mechanism. Priority short-circuit before the metric-based rule (but yields to `VMS_missing`). |
+  | border (VMS missing/unusable)          | `VMS_missing` or `VMS_unusable` in notes (cell breakage, monitor crash, no finite ΔVMS samples) | highest-priority short-circuit: cannot classify on (corr, K_trim_dRSS, K_trim_dVMS) without a usable VMS axis; returning drift would silently swallow missing data. |
+  | continuous drift (low-step fallback)   | both usable axes in low-step operational fallback (steps/h < 0.01) | no significant step events on either axis; corr is noise correlation, not mechanism. Priority short-circuit before the metric-based rule (but yields to missing/unusable VMS). |
   | mmap-style step-wise                   | corr > 0.8 AND K_trim_dRSS > 10 AND K_trim_dVMS > 10           | RSS+VMS lock-step, kernel-mapped blocks never returned |
   | sbrk-style step-wise                   | corr < 0.5 AND K_trim_dRSS > 10 AND K_trim_dVMS < 5            | RSS heap-arena extends without kernel mmap |
   | VAS-only step-wise                     | corr < 0.5 AND K_trim_dRSS < 5  AND K_trim_dVMS > 10           | VMS-only jumps, address space reserved without paging-in |
@@ -830,8 +838,8 @@ is the per-cell class assignment on n=3 data.
   | continuous drift                       | corr < 0.5 AND K_trim_dRSS < 5  AND K_trim_dVMS < 5            | smooth small-grain accumulation everywhere |
   | (border)                               | any other combination                                          | mid-corr (0.5-0.8) with significant step events, or mixed K_trim; needs replica confirmation |
 
-  The five-class taxonomy with priority short-circuits was committed to
-  `analysis/stepness.py` and `analysis/README.md` across five commits
+  The five-class taxonomy with priority short-circuits is implemented in
+  `analysis/stepness.py` and documented in `analysis/README.md`. Change log
   on 2026-05-20 / 2026-05-21:
   - first commit: K_trim_dVMS metric added, K_trim=NaN math fallback,
     five-class rule.
@@ -869,6 +877,16 @@ is the per-cell class assignment on n=3 data.
     psutil reports vms_bytes for all alive processes so the path is
     dormant on existing data, but a monitor crash in r03 would have
     been silently misclassified.
+  - fix n.5: VMS present-but-unusable is also guarded. If `vms_bytes`
+    exists but has no finite adjacent post-warmup ΔVMS samples after
+    PID segmentation (for example all-NaN output), the row receives
+    `VMS_unusable` and is classified as `border` instead of falling
+    through to both-axis low-step drift. `--top-k` timestamps now use
+    the same masked diff indices as `_diff_rss`, so PID-transition
+    masking cannot shift event times. Bootstrap CIs now discard
+    undefined constant-resample kurtosis values, reject
+    `--bootstrap 0`, and recompute winsorization inside each K_trim
+    bootstrap resample.
 
 ---
 

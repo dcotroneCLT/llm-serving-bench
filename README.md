@@ -66,12 +66,19 @@ retries failures once, and keeps GPU slots balanced.
 Pilot figures still run with no arguments. Production analysis should
 point at the campaign descriptor and the run root:
 
+Install the analysis dependencies first if your Python environment does
+not already have them:
+
+```bash
+python3 -m pip install -r analysis/requirements.txt
+```
+
 ```bash
 python3 analysis/plot_rss_2x2.py --campaign-yaml campaigns/wosar2026/campaign.yaml --runs-root /home/dcotrone/wosar/runs --replicas all
 python3 analysis/plot_rss_combined.py --campaign-yaml campaigns/wosar2026/campaign.yaml --runs-root /home/dcotrone/wosar/runs --replicas 1
 python3 analysis/diagnose_step_patterns.py --campaign-yaml campaigns/wosar2026/campaign.yaml --runs-root /home/dcotrone/wosar/runs --cells a1,e2 --replicas all
 python3 analysis/aging_trends.py /home/dcotrone/wosar/runs/wosar2026_e1_r01 --alpha 0.10 --downsample-seconds 60
-python3 analysis/stepness.py --logs-root /home/dcotrone/wosar/runs --warmup-s 3600
+python3 analysis/stepness.py --logs-root /home/dcotrone/wosar/runs
 ```
 
 See `analysis/README.md` for the full analysis pipeline.

@@ -178,11 +178,13 @@ python3 analysis/validation_check.py --run-dir <run_dir>
 python3 analysis/aging_trends.py <run_dir> --alpha 0.10 --downsample-seconds 60
 ```
 
-For the step-wise pattern panel (corr, K_trim, steps>1MB/h) across all
-runs under a runs root:
+For the step-wise pattern panel (RSS/VMS corr, K_trim_dRSS,
+K_trim_dVMS, steps>1MB/h, top1% positive step) across all runs under a
+runs root. Warmup is auto-resolved from the campaign cell YAML for
+`wosar2026_*` runs; pass `--warmup-s` only for an explicit override:
 
 ```
-python3 analysis/stepness.py --logs-root <runs_root> --warmup-s 3600
+python3 analysis/stepness.py --logs-root <runs_root>
 ```
 
 For campaign figures:

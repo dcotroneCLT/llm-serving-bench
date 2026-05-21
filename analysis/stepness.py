@@ -8,7 +8,9 @@ Three metrics per run, computed post-warmup:
   (< 0.5) means dRSS moves without paired dVMS.
 - ``K_trim_dRSS`` (secondary): trimmed excess kurtosis of dRSS after
   winsorize at the 99.9 percentile, with bootstrap 95% CI. The raw
-  ``K_raw_dRSS`` is kept as a companion.
+  ``K_raw_dRSS`` is kept as a companion. Bootstrap CIs filter undefined
+  sparse/constant resamples; trimmed CIs recompute winsorization inside
+  each resample.
 - ``K_trim_dVMS`` (secondary, added 2026-05-21): same trimmed-kurtosis
   formula applied to dVMS. Distinguishes VAS-only growth (VMS jumps
   without paged-in RSS) from the other classes. Same fallback rule
@@ -32,9 +34,12 @@ value is 0.
 Five-class taxonomy with a border bucket. See
 ``classify_stepness`` and ``analysis/README.md``:
 
+- border (VMS missing/unusable): VMS axis absent or no finite ΔVMS
+  samples post-warmup after PID segmentation. The run cannot be
+  classified on the three-axis panel.
 - continuous drift (low-step fallback): low-step operational fallback
-  fired on BOTH axes (regardless of corr). When neither RSS nor VMS
-  shows real step events, the measured corr is correlation of
+  fired on BOTH usable axes (regardless of corr). When neither RSS nor
+  VMS shows real step events, the measured corr is correlation of
   micro-noise, not a mechanism signature; the class is unambiguously
   continuous drift.
 - mmap-style step-wise: corr > 0.8 AND K_trim_dRSS > 10 AND K_trim_dVMS > 10
@@ -64,7 +69,6 @@ CLI/parsing pattern follows replicate_n1.py. See EXPERIMENT_STATE.md
 "Step-wise mechanism panel" for the paper-side motivation.
 """
 import argparse
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,13 +105,44 @@ def filter_run(df, warmup_s):
     return df.reset_index(drop=True)
 
 
-def bootstrap_ci(values, n_resamples, rng):
+def _excess_kurtosis(values):
+    return float(kurtosis(values, fisher=True, bias=False))
+
+
+def _trimmed_excess_kurtosis(values):
+    values_trim = np.asarray(winsorize(values, limits=(0, 0.001)))
+    return _excess_kurtosis(values_trim)
+
+
+def bootstrap_ci(values, n_resamples, rng, estimator=_excess_kurtosis):
+    if n_resamples < 1:
+        raise ValueError("n_resamples must be >= 1")
     ks = np.empty(n_resamples)
     n = len(values)
+    if n == 0:
+        return float("nan"), float("nan")
     for i in range(n_resamples):
         idx = rng.integers(0, n, size=n)
-        ks[i] = kurtosis(values[idx], fisher=True, bias=False)
+        ks[i] = estimator(values[idx])
+    ks = ks[np.isfinite(ks)]
+    if ks.size == 0:
+        return float("nan"), float("nan")
     return float(np.percentile(ks, 2.5)), float(np.percentile(ks, 97.5))
+
+
+def _empty_kurtosis_metrics(label):
+    return {
+        "K_raw": float("nan"),
+        "K_raw_ci_lo": float("nan"),
+        "K_raw_ci_hi": float("nan"),
+        "K_trim": float("nan"),
+        "K_trim_ci_lo": float("nan"),
+        "K_trim_ci_hi": float("nan"),
+        "step_count_1mb": 0,
+        "mean_top1_step_mb": float("nan"),
+        "note_seed": "",
+        "_label": label,
+    }
 
 
 def _compute_kurtosis_metrics(arr, n_bootstrap, rng, basename, label):
@@ -141,16 +176,17 @@ def _compute_kurtosis_metrics(arr, n_bootstrap, rng, basename, label):
         K_trim = float("nan")
         K_trim_ci_lo = K_trim_ci_hi = float("nan")
     else:
-        K_raw = float(kurtosis(arr, fisher=True, bias=False))
-        arr_trim = np.asarray(winsorize(arr, limits=(0, 0.001)))
-        K_trim = float(kurtosis(arr_trim, fisher=True, bias=False))
+        K_raw = _excess_kurtosis(arr)
+        K_trim = _trimmed_excess_kurtosis(arr)
         if n < 100:
             warn(f"{basename}: n={n} < 100 for Δ{label}, skipping bootstrap CI")
             K_raw_ci_lo = K_raw_ci_hi = float("nan")
             K_trim_ci_lo = K_trim_ci_hi = float("nan")
         else:
             K_raw_ci_lo, K_raw_ci_hi = bootstrap_ci(arr, n_bootstrap, rng)
-            K_trim_ci_lo, K_trim_ci_hi = bootstrap_ci(arr_trim, n_bootstrap, rng)
+            K_trim_ci_lo, K_trim_ci_hi = bootstrap_ci(
+                arr, n_bootstrap, rng, estimator=_trimmed_excess_kurtosis
+            )
 
     return {
         "K_raw": K_raw,
@@ -210,17 +246,18 @@ def classify_stepness(corr, k_trim_drss, k_trim_dvms, notes):
 
     Priority rules (checked in order, before the (corr, K_trim) bins):
 
-    1. ``VMS_missing`` in notes → ``border``. We cannot classify a
-       cell whose VMS axis is absent (cell breakage, monitor crash);
-       returning ``continuous drift`` would silently swallow missing
-       data. Must take precedence over the both-fallback rule below.
+    1. ``VMS_missing`` or ``VMS_unusable`` in notes → ``border``. We
+       cannot classify a cell whose VMS axis is absent or entirely
+       non-finite post-warmup (cell breakage, monitor crash); returning
+       ``continuous drift`` would silently swallow missing data. Must
+       take precedence over the both-fallback rule below.
     2. Both axes in low-step operational fallback (``notes`` contains
        both ``RSS_low_step_operational_drift`` and
        ``VMS_low_step_operational_drift``) → ``continuous drift``,
        regardless of corr — in the absence of real step events the
        measured corr is micro-noise, not mechanism.
     """
-    if "VMS_missing" in notes:
+    if "VMS_missing" in notes or "VMS_unusable" in notes:
         return "border"
     if (
         "RSS_low_step_operational_drift" in notes
@@ -290,42 +327,55 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
         return None
     arr_rss = diff_rss.values
 
-    has_vms = "vms_bytes" in df.columns
-    if has_vms:
+    vms_note = ""
+    vms_usable = False
+    if "vms_bytes" in df.columns:
         vms_diff_full = df["vms_bytes"].astype(float).diff()
         if pid_changes is not None:
             vms_diff_full = vms_diff_full.mask(pid_changes)
-        diff_vms = vms_diff_full.dropna()
-        common = diff_rss.index.intersection(diff_vms.index)
-        if len(common) >= 2 and diff_rss.loc[common].std() > 0 and diff_vms.loc[common].std() > 0:
-            rss_vms_corr = float(np.corrcoef(
-                diff_rss.loc[common].values, diff_vms.loc[common].values
-            )[0, 1])
-        else:
+        diff_vms = vms_diff_full.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(diff_vms) == 0:
+            warn(f"{basename}: VMS column present but no usable finite ΔVMS samples")
             rss_vms_corr = float("nan")
-        arr_vms = diff_vms.values
+            arr_vms = np.array([], dtype=float)
+            vms_note = "VMS_unusable"
+        else:
+            vms_usable = True
+            common = diff_rss.index.intersection(diff_vms.index)
+            if len(common) >= 2 and diff_rss.loc[common].std() > 0 and diff_vms.loc[common].std() > 0:
+                rss_vms_corr = float(np.corrcoef(
+                    diff_rss.loc[common].values, diff_vms.loc[common].values
+                )[0, 1])
+            else:
+                rss_vms_corr = float("nan")
+            arr_vms = diff_vms.values
     else:
         rss_vms_corr = float("nan")
         arr_vms = np.array([], dtype=float)
+        vms_note = "VMS_missing"
 
     duration_s = float(df["ts_unix"].max() - df["ts_unix"].min())
     duration_h = duration_s / 3600.0
 
     rng = np.random.default_rng(seed)
     m_rss = _compute_kurtosis_metrics(arr_rss, n_bootstrap, rng, basename, "RSS")
-    m_vms = _compute_kurtosis_metrics(arr_vms, n_bootstrap, rng, basename, "VMS")
+    m_vms = (
+        _compute_kurtosis_metrics(arr_vms, n_bootstrap, rng, basename, "VMS")
+        if vms_usable
+        else _empty_kurtosis_metrics("VMS")
+    )
 
     steps_per_h_1mb = m_rss["step_count_1mb"] / duration_h if duration_h > 0 else float("nan")
     steps_per_h_1mb_dvms = (
-        m_vms["step_count_1mb"] / duration_h if duration_h > 0 else float("nan")
+        m_vms["step_count_1mb"] / duration_h if vms_usable and duration_h > 0 else float("nan")
     )
 
     notes = []
     n_rss = _apply_low_step_fallback(m_rss, steps_per_h_1mb, basename)
     if n_rss:
         notes.append(n_rss)
-    if has_vms:
-        # Skip fallback when VMS is absent: arr_vms.size==0 would
+    if vms_usable:
+        # Skip fallback when VMS is absent or unusable: arr_vms.size==0 would
         # otherwise trigger the low-step branch (0 < 0.01) and inject
         # a spurious VMS_low_step_operational_drift note, which the
         # both-axes-fallback short-circuit would then misread as
@@ -334,11 +384,11 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
         if n_vms:
             notes.append(n_vms)
     else:
-        notes.append("VMS_missing")
+        notes.append(vms_note)
 
     cls = classify_stepness(rss_vms_corr, m_rss["K_trim"], m_vms["K_trim"], notes)
 
-    ts_values = df["ts_unix"].astype(float).values[1:]
+    ts_values = df.loc[diff_rss.index, "ts_unix"].astype(float).values
     return {
         "run_id": basename,
         "cell_id": display_cell_id(infer_cell_id(basename, manifest), basename),
@@ -485,6 +535,8 @@ def main():
     p.add_argument("--csv", action="store_true", help="machine-readable CSV output")
     p.add_argument("--top-k", type=int, default=0, help="if >0, also print top-N ΔRSS events per run")
     args = p.parse_args()
+    if args.bootstrap < 1:
+        p.error("--bootstrap must be >= 1")
 
     if args.run_dir:
         targets = [Path(args.run_dir)]

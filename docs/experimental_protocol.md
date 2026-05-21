@@ -184,19 +184,29 @@ Figure generation:
 
 Step-wise pattern quantification (paper Section IV.E, Figure 2):
 
-- `analysis/stepness.py` emits a three-metric panel per run:
+- `analysis/stepness.py` emits a per-run stepness panel:
   `rss_vms_corr` (lag-0 RSS-VMS correlation, primary signature of the
-  allocation mechanism), `K_trim` (excess kurtosis of ΔRSS after
-  winsorize at the 99.9 percentile, secondary intensity metric), and
-  `steps_per_h_1mb` (operational rate of ΔRSS events larger than
-  1 MiB).
+  allocation mechanism), `K_trim_dRSS`/historical `K_trim` (excess
+  kurtosis of ΔRSS after winsorize at the 99.9 percentile),
+  `K_trim_dVMS` (same statistic on ΔVMS), `steps_per_h_1mb`
+  (operational rate of ΔRSS events larger than 1 MiB), and
+  `mean_top1_step_mb` (mean of the top 1% of positive ΔRSS jumps).
+  RSS/VMS deltas are PID-segmented so engine restarts do not inject
+  artificial cross-process jumps.
 - Raw `K` is reported alongside `K_trim` but is dominated by single
   outliers and not used for cross-cell comparison.
 - Classification rule for the paper:
-  - mmap-style step-wise: `corr > 0.8` AND `K_trim > 10` (canonical: E2).
-  - RSS-only step-wise (sbrk-style): `corr < 0.5` AND `K_trim > 10`
-    (A1 candidate).
-  - continuous drift: `corr < 0.5` AND `K_trim < 5` (canonical: E1).
+  - border: VMS axis missing/unusable, or any out-of-bin/NaN combination.
+  - mmap-style step-wise: `corr > 0.8`, `K_trim_dRSS > 10`, and
+    `K_trim_dVMS > 10` (canonical: E2).
+  - sbrk-style step-wise: `corr < 0.5`, `K_trim_dRSS > 10`, and
+    `K_trim_dVMS < 5`.
+  - VAS-only step-wise: `corr < 0.5`, `K_trim_dRSS < 5`, and
+    `K_trim_dVMS > 10`.
+  - uncorrelated step-wise: `corr < 0.5`, `K_trim_dRSS > 10`, and
+    `K_trim_dVMS > 10`.
+  - continuous drift: both usable axes are in low-step operational
+    fallback, or `corr < 0.5`, `K_trim_dRSS < 5`, and `K_trim_dVMS < 5`.
 
 ## 9. Integrity Checks
 
