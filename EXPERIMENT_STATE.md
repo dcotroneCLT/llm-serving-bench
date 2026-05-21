@@ -467,6 +467,28 @@ Notable n=3 findings already locked (n>=2):
   proc.vms_bytes deltas, mirroring K_trim_dRSS. New `class` column in
   CSV output. Four classes: mmap-style / sbrk-style / VAS-only /
   continuous drift / (border).
+- 2026-05-21 morning ET: **Two incremental fixes to stepness.py
+  (committed up to `1c84e9e`).**
+  - Fix n.1: low-step fallback made unconditional on operational
+    metrics (`steps/h_1mb < 0.01`), not subordinated to K_trim=NaN.
+    Discovered after running the four-class patch on e1_r01 of the
+    campaign and getting K_trim_dRSS=928 from kurtosis on micro-noise
+    (top1%_step=100 byte, no real step events). The original fallback
+    required NaN to trigger, missing this case.
+  - Fix n.2: `classify_stepness` short-circuits to "continuous drift"
+    when both axes are in low-step fallback, before evaluating
+    corr-based rules. Discovered after fix n.1: e1_r01 had both
+    K_trim=0 from fallback but corr=0.64 was in the grey zone 0.5-0.8,
+    so the cell fell into "border". Mechanism justification: corr in
+    that zone on a no-step run is correlation of sampling micro-noise,
+    not of allocation mechanism. The branch "border" is for grey-zone
+    runs with real step events, not for runs with no events at all.
+  - Pilot sanity check after fix n.2: A2 pilot moved from border to
+    continuous drift (was border for corr=0.58 with K_raw spuriously
+    high; now correctly drift since both axes scatter the fallback).
+    All five other pilot cells unchanged. The reclassification of A2
+    pilot is consistent with the mechanism (no step events anywhere
+    → drift), accepted as the correct behavior.
 - 2026-05-20 evening ET: **Five-class taxonomy adopted (committed).**
   Pilot n=1 sanity check after the four-class patch surfaced two
   retrospective reclassifications:
@@ -763,17 +785,44 @@ is the per-cell class assignment on n=3 data.
   additional metric K_trim_dVMS, and the classification rule needs
   a fourth row:
 
-  | pattern                  | corr   | K_trim_dRSS | K_trim_dVMS | mechanism |
-  |--------------------------|--------|--------------|--------------|-----------|
-  | mmap-style step-wise     | > 0.8  | > 10         | > 10         | RSS+VMS lock-step, kernel-mapped blocks never returned |
-  | sbrk-style step-wise     | < 0.5  | > 10         | < 5          | RSS heap-arena extends without kernel mmap |
-  | VAS-only step-wise       | < 0.5  | < 5          | > 10         | VMS-only jumps, address space reserved without paging-in |
-  | uncorrelated step-wise   | < 0.5  | > 10         | > 10         | RSS and VMS both jump but desynchronized; heap-arena + mmap operating independently |
-  | continuous drift         | < 0.5  | < 5          | < 5          | smooth small-grain accumulation everywhere |
-  | (border)                 | mixed  | mixed        | mixed        | needs replica confirmation |
+  | pattern                                | condition                                                     | mechanism |
+  |----------------------------------------|----------------------------------------------------------------|-----------|
+  | border (VMS_missing)                   | `VMS_missing` in notes (cell breakage, monitor crash)          | highest-priority short-circuit: cannot classify on (corr, K_trim_dRSS, K_trim_dVMS) without a VMS axis; returning drift would silently swallow missing data. |
+  | continuous drift (low-step fallback)   | both axes in low-step operational fallback (steps/h < 0.01)    | no significant step events on either axis; corr is noise correlation, not mechanism. Priority short-circuit before the metric-based rule (but yields to `VMS_missing`). |
+  | mmap-style step-wise                   | corr > 0.8 AND K_trim_dRSS > 10 AND K_trim_dVMS > 10           | RSS+VMS lock-step, kernel-mapped blocks never returned |
+  | sbrk-style step-wise                   | corr < 0.5 AND K_trim_dRSS > 10 AND K_trim_dVMS < 5            | RSS heap-arena extends without kernel mmap |
+  | VAS-only step-wise                     | corr < 0.5 AND K_trim_dRSS < 5  AND K_trim_dVMS > 10           | VMS-only jumps, address space reserved without paging-in |
+  | uncorrelated step-wise                 | corr < 0.5 AND K_trim_dRSS > 10 AND K_trim_dVMS > 10           | RSS and VMS both jump but desynchronized; heap-arena + mmap operating independently |
+  | continuous drift                       | corr < 0.5 AND K_trim_dRSS < 5  AND K_trim_dVMS < 5            | smooth small-grain accumulation everywhere |
+  | (border)                               | any other combination                                          | mid-corr (0.5-0.8) with significant step events, or mixed K_trim; needs replica confirmation |
 
-  The five-class taxonomy was committed to `analysis/stepness.py`
-  and `analysis/README.md` on 2026-05-20.
+  The five-class taxonomy with priority short-circuits was committed to
+  `analysis/stepness.py` and `analysis/README.md` across four commits
+  on 2026-05-20 / 2026-05-21:
+  - first commit: K_trim_dVMS metric added, K_trim=NaN math fallback,
+    five-class rule.
+  - fix n.1: low-step fallback made operational-driven (`steps/h < 0.01`)
+    regardless of K_trim numeric value.
+  - fix n.2 (commit `1c84e9e`): classify_stepness short-circuits to
+    "continuous drift" when both axes are in low-step fallback, before
+    the corr-based rule. Required because corr in the grey zone 0.5-0.8
+    on a low-step run is correlation of micro-noise, not of mechanism.
+  - fix n.3: (a) `mean_top1_step_mb` recomputed on `arr[arr > 0]` with a
+    top-N sort instead of `arr >= np.percentile(arr, 99)`. The old
+    formula collapsed to ≈ 0 on zero-heavy sparse series because p99 of
+    a mostly-zero series is 0 and the mask then admitted every
+    non-negative sample. Sanity: E2 pilot top1% under the old code was
+    0.005 MB (incompatible with steps>1MB/h=1.23), under the fix it is
+    2.57 MB. The metric is descriptive only — does not enter the
+    classification rule — but is paper-table material for Section IV.E.
+    (b) `VMS_missing` now short-circuits to `border` ahead of the
+    both-fallback rule. Safety net: when vms_bytes is absent the
+    low-step fallback would otherwise fire spuriously on the empty
+    array (0 < 0.01) and inject `VMS_low_step_operational_drift`,
+    which the priority rule would then misread as drift. Currently
+    psutil reports vms_bytes for all alive processes so the path is
+    dormant on existing data, but a monitor crash in r03 would have
+    been silently misclassified.
 
 ---
 
@@ -799,41 +848,47 @@ All within-n=3. No comparison with the preprint.
    `system.mem_used_bytes` itself dropped 3x between r01 (41.5 MB/h)
    and r02 (14 MB/h), confirming the host environment was different.
 
-2. **Stepness class assignment per cell on n=3. PARTIAL ANSWERS
-   (r02 of e1/e2/e3, 2026-05-20):**
-   - **E2 r02**: corr=0.83, K_trim_dRSS=648.6, K_trim_dVMS expected
-     also high (lock-step) → **mmap-style step-wise** confirmed.
-   - **E1 r02**: corr=0.31, K_trim_dRSS=0.0 (fallback), top1%_step
-     = 0.0001 MB → **continuous drift** if K_trim_dVMS is also low
-     (campaign run, where aging_trends said VMS not significant).
-     Note: E1 of the PILOT was reclassified to "VAS-only step-wise"
-     under the new taxonomy because K_trim_dVMS_pilot=789, but the
-     campaign run does not (yet) show the same VMS behavior. The
-     headline n=3 class for E1 follows the n=3 data.
-   - **E3 r02**: corr=0.24, K_trim_dRSS=1.1, paper-grade VMS growth
-     at +52 MB/h → **VAS-only step-wise** if K_trim_dVMS is high
-     (likely given the +52 MB/h aggregate slope and visual
-     step-event behavior); to confirm by reading the patched
-     stepness.py output column.
+2. **Stepness class assignment per cell on n=3. CONFIRMED ON n=2
+   for E1, E2, E3 (2026-05-21, after fix n.1 + n.2):**
+   - **E2** r01 and r02: corr ~0.82/0.83, K_trim_dRSS 284/649,
+     K_trim_dVMS 239/491 → **mmap-style step-wise** in BOTH replicas.
+     Mechanism class stable on n=2. Confirms preprint expectation of
+     E2 as canonical mmap-style.
+   - **E3** r01 and r02: corr ~0.37/0.24, K_trim_dRSS 1.1/1.1,
+     K_trim_dVMS 1.2/1.1 → **continuous drift** in BOTH replicas.
+     Note: e3_r02 has paper-grade VMS slope of +52 MB/h aggregate
+     (from aging_trends), but K_trim_dVMS=1.1 says VMS grows smooth
+     not step-wise. So the +52 MB/h is continuous drift on VMS, not
+     VAS-only step-wise. Class is "continuous drift with VAS slope
+     asymmetry" — drift on both axes but with RSS slope 31 KB/h and
+     VMS slope 52 MB/h (ratio 1700x). The asymmetry itself is
+     paper-relevant (Section IV.C commentary).
+   - **E1** r01 and r02: corr 0.64/0.31, both K_trim under low-step
+     operational fallback → **continuous drift** in BOTH replicas
+     (after fix n.2). Stable on n=2.
    - A1, A2, E3b: r02 still running, classification pending. A1 in
      particular is the candidate for "uncorrelated step-wise"
      based on the pilot retrospective.
    - r03 (all cells): pending the campaign continuing.
    The headline mechanism claim of the camera-ready is the per-cell
    class assignment on n=3 with majority rule across r01/r02/r03, on
-   the **five-class taxonomy**: mmap-style / sbrk-style / VAS-only /
-   uncorrelated / continuous drift.
+   the five-class taxonomy + priority short-circuit: mmap-style /
+   sbrk-style / VAS-only / uncorrelated / continuous drift.
 
-   Pilot n=1 reclassification under the same five-class rule is
-   retrospective only (does not feed the paper headline):
-   - E2 pilot → mmap-style step-wise (unchanged)
-   - E1 pilot → VAS-only step-wise (was: drift, missed by preprint)
-   - A1 pilot → uncorrelated step-wise (was: lumped with mmap/sbrk by preprint)
+   Pilot n=1 reclassification under the five-class rule + fix n.2
+   (retrospective only, does not feed the paper headline):
+   - E2 pilot → mmap-style step-wise
+   - E1 pilot → VAS-only step-wise (was: drift in preprint, refined
+     by the dVMS axis; K_trim_dVMS=789 indicates real step events
+     on VMS, fallback does not fire because steps/h_dRSS=0.085 > 0.01)
+   - A1 pilot → uncorrelated step-wise
    - E3, E3b pilot → continuous drift
-   - A2 pilot → border
-   This is paper-relevant only as evidence that the new taxonomy is
-   non-trivial: it recovers mechanism distinctions that the preprint
-   could not make with its three-class panel.
+   - **A2 pilot** → continuous drift (was border; reclassified after
+     fix n.2 because both axes scatter the low-step fallback. Coherent
+     with the absence of step events anywhere on A2 pilot.)
+   The pilot reclassification is paper-relevant only as evidence that
+   the new taxonomy is non-trivial: it recovers mechanism distinctions
+   the preprint could not make with its three-class panel.
 
 3. **Stepness metric stability across replicas.** Within each cell,
    does the (corr, K_trim) point stay in one classification region

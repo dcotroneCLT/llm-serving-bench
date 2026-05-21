@@ -15,8 +15,10 @@ Three metrics per run, computed post-warmup:
   as ``K_trim_dRSS`` for the low-step edge case.
 
 Operational descriptors: ``steps_per_h_1mb`` (dRSS jumps > 1 MB per
-hour) and ``mean_top1_step_mb`` (mean of the top 1% dRSS jumps,
-expressed in MB).
+hour) and ``mean_top1_step_mb`` (mean of the top 1% of POSITIVE
+dRSS jumps, expressed in MB; the positive filter is required so that
+on zero-heavy sparse series the metric is not pulled to ≈ 0 by the
+mass of zero diffs).
 
 Five-class taxonomy with a border bucket. See
 ``classify_stepness`` and ``analysis/README.md``:
@@ -100,20 +102,25 @@ def bootstrap_ci(values, n_resamples, rng):
 
 
 def _compute_kurtosis_metrics(arr, n_bootstrap, rng, basename, label):
-    """Kurtosis + bootstrap CI + low-step fallback for a single diff series.
-
-    Returns ``(K_raw, K_raw_ci, K_trim, K_trim_ci, steps_per_h_1mb,
-    mean_top1_step_mb, note)`` where ``note`` is one of ``""``,
-    ``"<label>_low_step_fallback"``, or ``"<label>_kurtosis_undefined"``.
+    """Kurtosis (raw + winsorized) + bootstrap CI + operational
+    descriptors (step_count_1mb, mean_top1_step_mb) for a single diff
+    series. Returns a dict; the low-step operational override is
+    applied by ``_apply_low_step_fallback`` on the result.
     """
     n = arr.size
     one_mb = 1024**2
-    duration_marker = None  # caller computes duration; we need only step counts here.
     step_count_1mb = int(np.sum(arr > one_mb)) if n > 0 else 0
-    if n > 0:
-        p99 = float(np.percentile(arr, 99))
-        top_vals = arr[arr >= p99]
-        mean_top1_step_mb = float(top_vals.mean()) / one_mb if top_vals.size else float("nan")
+    # Top 1% of POSITIVE jumps, by sort. Filtering arr > 0 first is
+    # required: on zero-heavy sparse series, np.percentile(arr, 99) can
+    # be 0, and the old ``arr >= p99`` mask then admitted every
+    # non-negative sample, dragging the mean to ≈0. (E2 pilot: 0.005
+    # MB under the old code, 2.57 MB under the fix — incompatible with
+    # steps>1MB/h=1.23 in the old form, coherent in the new form.)
+    positive = arr[arr > 0] if n > 0 else arr
+    if positive.size > 0:
+        n_top = max(1, int(np.ceil(0.01 * positive.size)))
+        top_vals = np.sort(positive)[-n_top:]
+        mean_top1_step_mb = float(top_vals.mean()) / one_mb
     else:
         mean_top1_step_mb = float("nan")
 
@@ -192,12 +199,20 @@ def classify_stepness(corr, k_trim_drss, k_trim_dvms, notes):
     class. Any NaN input on the (corr, K_trim_dRSS, K_trim_dVMS) axes
     falls into ``border``.
 
-    Priority rule: if the low-step operational fallback fired on BOTH
-    axes (``notes`` contains both ``RSS_low_step_operational_drift``
-    and ``VMS_low_step_operational_drift``), the class is
-    ``continuous drift`` regardless of corr — in the absence of real
-    step events the measured corr is micro-noise, not mechanism.
+    Priority rules (checked in order, before the (corr, K_trim) bins):
+
+    1. ``VMS_missing`` in notes → ``border``. We cannot classify a
+       cell whose VMS axis is absent (cell breakage, monitor crash);
+       returning ``continuous drift`` would silently swallow missing
+       data. Must take precedence over the both-fallback rule below.
+    2. Both axes in low-step operational fallback (``notes`` contains
+       both ``RSS_low_step_operational_drift`` and
+       ``VMS_low_step_operational_drift``) → ``continuous drift``,
+       regardless of corr — in the absence of real step events the
+       measured corr is micro-noise, not mechanism.
     """
+    if "VMS_missing" in notes:
+        return "border"
     if (
         "RSS_low_step_operational_drift" in notes
         and "VMS_low_step_operational_drift" in notes
@@ -275,11 +290,16 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
     n_rss = _apply_low_step_fallback(m_rss, steps_per_h_1mb, basename)
     if n_rss:
         notes.append(n_rss)
-    n_vms = _apply_low_step_fallback(m_vms, steps_per_h_1mb_dvms, basename)
-    if n_vms:
-        notes.append(n_vms)
-
-    if not has_vms:
+    if has_vms:
+        # Skip fallback when VMS is absent: arr_vms.size==0 would
+        # otherwise trigger the low-step branch (0 < 0.01) and inject
+        # a spurious VMS_low_step_operational_drift note, which the
+        # both-axes-fallback short-circuit would then misread as
+        # "continuous drift" instead of "missing data".
+        n_vms = _apply_low_step_fallback(m_vms, steps_per_h_1mb_dvms, basename)
+        if n_vms:
+            notes.append(n_vms)
+    else:
         notes.append("VMS_missing")
 
     cls = classify_stepness(rss_vms_corr, m_rss["K_trim"], m_vms["K_trim"], notes)

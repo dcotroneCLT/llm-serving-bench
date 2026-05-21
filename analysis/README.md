@@ -114,6 +114,14 @@ run with bootstrap 95% CIs:
   paged in, so the dynamics are absent from dRSS.
 - `steps_per_h_1mb`: **operational** descriptor. Count of ΔRSS events
   larger than 1 MiB per hour post-warmup.
+- `mean_top1_step_mb`: **operational** descriptor. Mean of the top 1%
+  of POSITIVE ΔRSS jumps, expressed in MB. The positive filter
+  (`arr[arr > 0]` before the top-N selection) is required because on
+  zero-heavy sparse series the 99th percentile of all diffs can be 0,
+  in which case any `arr >= p99` mask admits every non-negative
+  sample and the mean collapses to ≈ 0. Sanity: E2 pilot top1% under
+  the old buggy formula was 0.005 MB, incompatible with its
+  steps>1MB/h = 1.23; under the fix it is 2.57 MB.
 
 ### Five-class taxonomy
 
@@ -121,7 +129,8 @@ Implemented in `classify_stepness(corr, k_trim_drss, k_trim_dvms, notes)`:
 
 | pattern                | condition                                           | K_trim_dRSS | K_trim_dVMS | mechanism interpretation |
 |------------------------|-----------------------------------------------------|-------------|-------------|---------------------------|
-| continuous drift (low-step fallback) | both axes in low-step operational fallback (notes contain `RSS_low_step_operational_drift` AND `VMS_low_step_operational_drift`) | n/a (forced 0) | n/a (forced 0) | No significant step events on either axis; the measured corr is micro-noise correlation, not a mechanism signature. Takes precedence over the (corr, K_trim) rules below. Canonical examples: `wosar2026_e1_r01` (corr=0.64 but both axes flat), A2 pilot (corr=0.58, K_raw_dRSS=3533 winsorize-artifact, K_raw_dVMS=1.08). |
+| **border (VMS_missing)** | `VMS_missing` in notes (cell breakage, monitor crash, vms_bytes column absent) | n/a | n/a | Highest priority: a run with no VMS axis cannot be classified on the (corr, K_trim_dRSS, K_trim_dVMS) panel; returning `continuous drift` would silently swallow missing data, so the row is flagged `border` for replica review. |
+| continuous drift (low-step fallback) | both axes in low-step operational fallback (notes contain `RSS_low_step_operational_drift` AND `VMS_low_step_operational_drift`) | n/a (forced 0) | n/a (forced 0) | No significant step events on either axis; the measured corr is micro-noise correlation, not a mechanism signature. Takes precedence over the (corr, K_trim) rules below (but yields to `VMS_missing` above). Canonical examples: `wosar2026_e1_r01` (corr=0.64 but both axes flat), A2 pilot (corr=0.58, K_raw_dRSS=3533 winsorize-artifact, K_raw_dVMS=1.08). |
 | mmap-style step-wise   | corr `> 0.8`                                        | `> 10`      | `> 10`      | RSS and VMS step together at discrete events: kernel-mapped pages never returned. Canonical example: E2. |
 | sbrk-style step-wise   | corr `< 0.5`                                        | `> 10`      | `< 5`       | RSS heap-arena extends without paired VMS step: glibc/jemalloc sbrk path, no kernel mmap involved. |
 | VAS-only step-wise     | corr `< 0.5`                                        | `< 5`       | `> 10`      | VMS-only jumps with no resident component: address space reserved (anonymous mmap, MAP_NORESERVE-like) and never paged in. Canonical example: `wosar2026_e3_r02` (PyTorch CUDA caching allocator reserves host-side VAS for device-side mappings without touching CPU memory). |
