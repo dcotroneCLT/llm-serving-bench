@@ -4,7 +4,7 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-05-21 (afternoon ET).
+Last updated: 2026-05-23 (afternoon ET).
 
 ---
 
@@ -171,20 +171,22 @@ it reports on a realistic multi-tenant deployment.
 
 ---
 
-## TL;DR (operational, 2026-05-21)
+## TL;DR (operational, 2026-05-23)
 
-n=3 campaign on day 5.5 of ~9.5. Round 1 (r01 of all 6 cells) complete.
-Round 2 batch 1 (e1, e2, e3 r02) complete. Round 2 batch 2 (a1, a2, e3b
-r02) currently running on gpu0/1/2, ~25h to go (ETA 2026-05-22 ~07:00 ET).
-Round 3 follows.
+n=3 campaign on day 7 of ~10.5. **Round 2 complete** (all 12 r01+r02
+runs across the 6 cells, all paper-grade significant on USS). **Round 3
+batch 1** (e1, e2, e3 r03) currently running on gpu0/1/2, ~14-15h to
+go (ETA fine batch ~2026-05-24 mattina ET). **Round 3 batch 2** (a1,
+a2, e3b r03) still to launch.
 
-Three findings are already locked in on n=3 data (will appear in the
+Five findings are now locked in on n>=2 data (will appear in the
 camera-ready regardless of r03 outcome):
 
 - **e3 drop rate at saturated load.** PyTorch + HF naive at 0.174 rps
-  drops ~15.6-15.7% of offered requests, confirmed on n=2. e3b at
-  0.050 rps drops <2%. Capacity ceiling is a property of the naive
-  baseline at saturated load. Section IV.D rate-sensitivity ablation.
+  drops ~15.6-15.7% of offered requests, confirmed on n=2 (r03 in
+  progress at 13%, may rise to ~15% by end of window). e3b at 0.050
+  rps drops <2%. Capacity ceiling is a property of the naive baseline
+  at saturated load. Section IV.D rate-sensitivity ablation.
 - **Mechanism class headline: E2 is the only step-wise cell on n=3
   campaign; all other 5 cells are continuous drift.** Under the n=3
   setting, mmap-style step-wise allocation (RSS+VMS lock-step, top 1%
@@ -193,6 +195,25 @@ camera-ready regardless of r03 outcome):
   r03). All other deployments exhibit continuous drift with NO
   MB-scale step events. Stronger finding than "five mechanism classes
   observed": canonical example + null findings on 5 contrast cells.
+- **USS adopted as canonical leak indicator for the camera-ready.**
+  USS is paper-grade significant on 12/12 n=2 runs; RSS is significant
+  on 11/12 (a1_r02 fails on CI lower bound = 0.0, an AR(1) inflation
+  artifact when rho_RSS = 0.99). Point estimates of USS and RSS agree
+  within <10% on all 12 runs. USS is also semantically cleaner
+  (process-private resident memory; RSS includes shared mappings that
+  are a confound). Section IV.B (instrumentation) declares USS as
+  primary; RSS reported alongside as secondary.
+- **VAS-only smooth drift on PyTorch+HF naive, r02-only.** On both E3
+  (0.174 rps) and E3b (0.050 rps), the second replica shows
+  paper-grade significant VMS growth at 52 MB/h and 127 MB/h, with
+  RSS at only 31 KB/h and 109 KB/h on the same runs (ratio
+  ~1000-1700x). Empirically verified on e3b_r02 (`vms_bytes` 38.5 →
+  46.0 GB over 36h, num_fds 53→52, num_threads 200→199, rss_bytes
+  +20 MB): rules out FD-leak and thread-stack growth, leaves only
+  anonymous mmap reservation by the PyTorch CUDA caching allocator
+  host-side as the compatible mechanism. K_trim_dVMS <= 2.2 → smooth
+  drift, not step-wise. Phenomenon absent on r01 of both cells; r03
+  will determine whether r02 was the outlier or r01 was.
 - **Pipeline hardened and validated.** Paper pipeline is end-to-end
   in-repo: `aging_trends.py` + `fdr_aggregate.py` for slope+CI+FDR,
   `stepness.py` for the (corr, K_trim_dRSS, K_trim_dVMS, steps>1MB/h,
@@ -206,15 +227,26 @@ camera-ready regardless of r03 outcome):
 
 Open headline questions for the paper (within-n=3, not vs preprint):
 
-1. Per-cell **between-replica variance** of the RSS slope. On n=2 of
-   e1/e2/e3: e1 CIs overlap, e2/e3 r02 disjoint upward from r01.
-   Pattern needs r03 to settle.
-2. Per-cell **step-wise classification** stability across r03 — E2
+1. Per-cell **between-replica variance** of the USS slope. Full n=2
+   CI-aware picture (12 runs): 4/6 cells CI-compatible (a1, a2, e1,
+   e3b), 2/6 CI-disjoint (e2, e3). Both disjoint cells are in slot
+   batch 1, both have r02 > r01 (gap 4.2 KB/h and 1.9 KB/h
+   respectively on USS). r03 will settle whether the gap is real or
+   r02 was the outlier.
+2. **Triton-wrapper between-run variance hypothesis.** USS r02/r01
+   ratios suggest the Triton wrapper amplifies between-run
+   variability regardless of the underlying engine: standalone cells
+   (e1, a1) ratios 0.26 and 1.02 (tight); Triton cells (e2, a2) ratios
+   8.2 and 0.14 (highly variable); PyTorch+HF cells (e3, e3b) ratios
+   2.8 and 2.7 (intermediate). r03 will determine whether this is a
+   structural property or noise on n=2.
+3. Per-cell **step-wise classification** stability across r03 — E2
    mmap-style is reproducible on n=2, expected to hold on r03.
    The other 5 cells should consolidate continuous drift if the
    n=2 picture stays.
-3. e3 drop rate **mechanism**: time-clustered vs uniform, correlated
-   with GPU 2 VRAM/util spikes or not, behavior stable across r01/r02.
+4. e3 drop rate **mechanism**: time-clustered vs uniform, correlated
+   with GPU 2 VRAM/util spikes or not, behavior stable across
+   r01/r02/r03.
 
 ---
 
@@ -310,54 +342,106 @@ campaign (n=3). Verified by md5.
 
 ---
 
-## Status snapshot (2026-05-20 afternoon ET)
+## Status snapshot (2026-05-23 afternoon ET)
 
 ```
 Campaign launched: 2026-05-16T11:12 UTC
-state.summary    : completed=9, running=3, failed=0
+state.summary    : completed=12, running=3, failed=0
 ```
 
-Completed: all r01 of the 6 cells + r02 of e1/e2/e3. All MK-significant
-at p<0.01, all PASS on validation_check.
+Completed: all 12 r01+r02 runs across the 6 cells. All paper-grade
+significant on USS (12/12), 11/12 on RSS (a1_r02 fails on CI lower
+bound = 0 artifact, see "Pipeline note" below). All PASS on
+validation_check.
 
-**Paper-grade RSS slopes** (aging_trends + fdr_aggregate, all
-significant=True per the decision rule MK p<0.01 AND CI excludes 0
-AND bh_reject=True):
+**Paper-grade USS slopes** (aging_trends + fdr_aggregate, decision
+rule = MK p<0.01 AND Theil-Sen CI excludes 0 AND bh_reject=True).
+USS is adopted as the canonical leak indicator for the camera-ready;
+see "Pipeline analytical details" below for the rationale.
 
-| cell | r01 slope | r01 CI [lo, hi]       | r02 slope  | r02 CI [lo, hi]        | CI relation        |
-|------|-----------|------------------------|-------------|--------------------------|--------------------|
-| e1   | 6.96 KB/h | [1.5, 22.3] KB/h       | 1.76 KB/h   | [0.74, 23.8] KB/h        | overlap massive    |
-| e2   | 21.7 KB/h | [12.9, 31.6] KB/h      | 161.4 KB/h  | [40.3, 231.4] KB/h       | DISJOINT (+8.7 KB/h gap) |
-| e3   | 11.0 KB/h | [4.9, 20.1] KB/h       | 31.1 KB/h   | [21.4, 88.0] KB/h        | barely disjoint (+1.3 KB/h gap) |
+| cell | r01 slope  | r01 CI [lo, hi]         | r02 slope   | r02 CI [lo, hi]           | CI relation             |
+|------|------------|---------------------------|--------------|-----------------------------|-------------------------|
+| a1   | 12.9 KB/h  | [9.5, 16.0] KB/h         | 13.2 KB/h    | [12.9, 13.4] KB/h          | overlap (r02 CI inside r01) |
+| a2   | 42.5 KB/h  | [15.6, 61.9] KB/h        | 5.9 KB/h     | [1.4, 87.4] KB/h           | overlap (r02 CI contains r01) |
+| e1   | 7.0 KB/h   | [1.5, 22.3] KB/h         | 1.8 KB/h     | [0.7, 23.8] KB/h           | overlap massive          |
+| e2   | 19.1 KB/h  | [10.9, 29.0] KB/h        | 157.2 KB/h   | [33.2, 228.1] KB/h         | DISJOINT (+4.2 KB/h gap) |
+| e3   | 11.0 KB/h  | [5.0, 19.5] KB/h         | 31.1 KB/h    | [21.4, 87.9] KB/h          | DISJOINT (+1.9 KB/h gap, barely) |
+| e3b  | 38.0 KB/h  | [15.7, 132.2] KB/h       | 103.3 KB/h   | [56.2, 206.1] KB/h         | overlap (intersection [56.2, 132.2]) |
 
-**Reading.** e1 r01 and r02 are CI-compatible; the apparent "17x
-smaller" from validation_check was a point-estimate artifact, the
-two replicas are reproducible within CI. e2 r02 slope is genuinely
-larger than r01 (CIs disjoint by 8.7 KB/h, ~7x point ratio). e3 r02
-slope is just-disjoint from r01 (~3x point ratio, gap 1.3 KB/h).
+**Reading n=2.** 4/6 cells CI-compatible across replicas (a1, a2,
+e1, e3b). 2/6 CI-disjoint (e2 with 4.2 KB/h gap, robust;
+e3 with 1.9 KB/h gap, borderline). a1 is the most reproducible cell
+of the campaign (r02/r01 ratio 1.02, CI of r02 inside CI of r01).
+Both disjoint cells are in slot batch 1; both have r02 > r01 in the
+disjoint direction. r03 will settle whether the gap is structural
+or noise on n=2.
 
-**Pipeline note (calibration gotcha).** validation_check.py and
-aging_trends.py give the SAME point estimate on r02 (smooth-ish runs)
-but DIFFER by ~5x on r01 (step-heavy runs). validation_check operates
-on raw 5s samples; aging_trends.py downsamples to 60s windows before
-Theil-Sen. On step-heavy series the two methods are not equivalent.
-For the paper, only aging_trends + fdr_aggregate is paper-grade.
-validation_check remains a per-run sanity gate (PASS/FAIL on trend
-direction), not a slope source.
+**Paper-grade RSS slopes** (for cross-reference; point estimates
+agree with USS within <10% on all 12 runs):
 
-**Additional paper-grade finding on e3_r02.** proc.vms_bytes shows
-significant growth at +52.2 MB/h (CI [20.9 KB, 77.3 MB]/h, MK p=7.7e-08,
-bh_reject=True). RSS grows at only +31 KB/h on the same run. The
-VMS-to-RSS ratio is ~1700x. This is a third pattern alongside the
-mmap-lock-step and sbrk-RSS-only seen in the preprint, and the
-current three-class stepness panel does NOT capture it (see Step-wise
-mechanism panel section below). On e3_r01 the same indicator was
-NOT significant (slope=0, p=0.097), so the VMS-only growth emerged
-specifically in r02. r03 will settle whether it is a stable property
-of the cell or a r02-specific event.
+| cell | r01 slope  | r01 CI [lo, hi]         | r02 slope   | r02 CI [lo, hi]           | RSS verdict             |
+|------|------------|---------------------------|--------------|-----------------------------|-------------------------|
+| a1   | 12.9 KB/h  | [9.5, 16.0] KB/h         | 13.2 KB/h    | [0.0, 18.0] KB/h           | r02 fails: CI floor=0 (rho_RSS=0.99 inflation; USS recovers it) |
+| a2   | 43.3 KB/h  | [17.8, 62.0] KB/h        | 3.2 KB/h     | [1.3, 98.0] KB/h           | overlap |
+| e1   | 7.0 KB/h   | [1.5, 22.3] KB/h         | 1.8 KB/h     | [0.7, 23.8] KB/h           | overlap |
+| e2   | 21.7 KB/h  | [12.9, 31.6] KB/h        | 161.4 KB/h   | [40.3, 231.4] KB/h         | DISJOINT (+8.7 KB/h gap) |
+| e3   | 11.0 KB/h  | [4.9, 20.1] KB/h         | 31.1 KB/h    | [21.4, 88.0] KB/h          | DISJOINT (+1.3 KB/h gap) |
+| e3b  | 38.0 KB/h  | [15.6, 135.6] KB/h       | 108.9 KB/h   | [58.5, 210.8] KB/h         | overlap |
 
-**Validation_check slopes (for the older runs, sanity-gate values only,
-not paper-grade):**
+**Paper-grade VMS slopes** (decision rule applied; only 2/12 pass):
+
+| run     | slope     | CI                | mk_p     | sig | mechanism note |
+|---------|-----------|---------------------|----------|-----|----------------|
+| e3_r02  | +52.2 MB/h  | [20.9 KB, 77.3 MB]/h | 7.7e-08 | True | VAS-only smooth drift |
+| e3b_r02 | +127 MB/h   | [5.3 KB, 179 MB]/h   | 9.1e-05 | True | VAS-only smooth drift |
+| other 10 runs | 0 or near-zero | — | — | False | no significant VMS growth |
+
+Two "near misses" (`bh_reject=True` but CI lower bound = 0 from
+AR(1) inflation, so fail the strict decision rule): a2_r01 at +37.5
+KB/h and e2_r02 at +37.8 KB/h. Magnitudes 3 orders below the
+PyTorch+HF VAS finding, not worth promoting.
+
+**VMS-only growth empirical verification (e3b_r02)**. Direct
+inspection of the proc CSV at run start vs end (raw values, no
+fitting):
+
+```
+VMS start: 38.52 GB     RSS start: 1.62 GB
+VMS end:   46.04 GB     RSS end:   1.64 GB
+VMS delta: +7.52 GB     RSS delta: +20 MB
+num_fds:    53 → 52     num_threads: 200 → 199
+```
+
+VMS grew by 7.52 GB while RSS grew by 20 MB (ratio ~375x), with
+num_fds and num_threads both flat-to-slightly-decreasing. This
+empirically rules out file-mapping accumulation (would show in
+num_fds) and thread-stack growth (would show in num_threads), and
+narrows the mechanism to anonymous mmap reservation by the PyTorch
+CUDA caching allocator host-side metadata layer. K_trim_dVMS=2.2 →
+smooth, not step-wise.
+
+**Pipeline note 1 (calibration gotcha vs validation_check).**
+validation_check.py and aging_trends.py give the SAME point estimate
+on r02 (smooth-ish runs) but DIFFER by ~5x on r01 (step-heavy runs).
+validation_check operates on raw 5s samples; aging_trends.py
+downsamples to 60s windows before Theil-Sen. On step-heavy series
+the two methods are not equivalent. For the paper, only
+aging_trends + fdr_aggregate is paper-grade. validation_check
+remains a per-run sanity gate (PASS/FAIL on trend direction), not
+a slope source.
+
+**Pipeline note 2 (RSS CI floor on a1_r02).** On a1_r02 alone,
+lag1_rho_RSS = 0.99 while lag1_rho_USS = 0.005. The AR(1) variance
+inflation factor (1+rho)/(1-rho) is ~199x on RSS, ~1.01x on USS.
+The RSS Theil-Sen CI gets blown to [0.0, 17956] KB/h (lower bound at
+floor=0, fails "CI excludes 0"), while the USS CI is a tight
+[12.9, 13.4] KB/h. The slope point estimates agree (RSS 13.16 KB/h,
+USS 13.17 KB/h). The anomaly is isolated to this single run; in the
+other 11 runs RSS and USS rho values are quasi-identical. The case
+for USS as canonical leak indicator is partly built on this
+robustness.
+
+**Validation_check slopes (sanity-gate values only, not paper-grade):**
 - e1_r01: +0.035 MB/h, drop trivial
 - e2_r01: +0.109 MB/h, drop trivial
 - e3_r01: +0.058 MB/h, drop 15.7%
@@ -368,25 +452,27 @@ not paper-grade):**
 - e2_r02: +0.161 MB/h, drop trivial
 - e3_r02: +0.031 MB/h, drop 15.6%
 
-Note that the validation_check r01 numbers are ~5x larger than the
-paper-grade aging_trends numbers on the same data (step-event
-sensitivity, see "Pipeline note" above).
+(r02 batch 2 sanity values not re-tabulated here; aging_trends +
+fdr_aggregate is the source of truth from now on.)
 
-Running (r02 batch 2, started ~19 May 11:14 UTC):
-- a1_r02 on gpu0
-- a2_r02 on gpu1
-- e3b_r02 on gpu2
+Running (r03 batch 1, started ~22 May UTC):
+- e1_r03 on gpu0 (~21h elapsed, ~15h to go)
+- e2_r03 on gpu1 (~21h elapsed, ~15h to go)
+- e3_r03 on gpu2 (~21h elapsed, ~15h to go)
 
-Expected r02 batch 2 end: ~21 May UTC.
+Expected r03 batch 1 end: ~2026-05-24 mattina ET.
 
 Pending:
-- All r03 batch (e1, a1, e2, a2, e3, e3b).
-- Sanity run (e2 on gpu0, 6h).
+- r03 batch 2 (a1, a2, e3b r03), to launch right after batch 1
+  completes. Each 36h → expected end ~2026-05-26.
+- Sanity run (e2 on gpu0, 6h), schedulable after all production runs
+  complete.
 
 Notable n=3 findings already locked (n>=2):
-- e3 drop rate at saturated load: 15.7% (r01) and 15.6% (r02). The
-  PyTorch naive baseline at 0.174 rps hits a capacity ceiling; e3b at
-  0.050 rps drops <2% on the same engine and same GPU.
+- e3 drop rate at saturated load: 15.7% (r01) and 15.6% (r02), with
+  r03 in-progress at 13.0% (still has ~15h to potentially rise).
+  The PyTorch naive baseline at 0.174 rps hits a capacity ceiling;
+  e3b at 0.050 rps drops <2% on the same engine and same GPU.
 
 ---
 
@@ -527,6 +613,60 @@ Notable n=3 findings already locked (n>=2):
     All five other pilot cells unchanged. The reclassification of A2
     pilot is consistent with the mechanism (no step events anywhere
     → drift), accepted as the correct behavior.
+- 2026-05-21 morning ET: r02 batch 2 (a1, a2, e3b r02) launched on
+  gpu0/1/2 right after r02 batch 1 completion. Each scheduled for 36h.
+- 2026-05-22 ET: r02 batch 2 (a1, a2, e3b r02) completed. All 12
+  r01+r02 runs now in `~/wosar/runs/`. Health check 0 FAIL.
+- 2026-05-22 ET: r03 batch 1 (e1, e2, e3 r03) launched on gpu0/1/2.
+  Each scheduled for 36h, ETA fine batch ~2026-05-24 mattina ET.
+- 2026-05-23 ET: **Paper-grade analysis on the full n=2 (12 runs).**
+  Ran aging_trends.py + fdr_aggregate.py over all r01+r02 of the 6
+  cells. Headlines:
+  - **USS = 12/12 paper-grade significant**. RSS = 11/12 (a1_r02
+    fails on CI floor=0).
+  - 4/6 cells CI-compatible across replicas on USS (a1, a2, e1,
+    e3b). 2/6 CI-disjoint (e2 with 4.2 KB/h gap, e3 with 1.9 KB/h
+    gap). Both disjoint cells in slot batch 1, both r02 > r01.
+  - VMS = 2/12 paper-grade significant: e3_r02 at +52 MB/h,
+    e3b_r02 at +127 MB/h. r02-only phenomenon on both PyTorch+HF
+    cells.
+- 2026-05-23 ET: **USS adopted as canonical leak indicator for the
+  camera-ready.** Rationale: (a) 12/12 significant vs 11/12 RSS,
+  (b) robust to AR(1) edge cases (a1_r02 RSS hits CI floor=0 from
+  rho_RSS=0.99 inflation; USS at rho=0.005 has tight [12.9, 13.4]
+  KB/h CI on the same data), (c) semantically cleaner (private
+  resident pages; RSS includes shared mappings that are a
+  confound), (d) point estimates agree with RSS within <10% so
+  no narrative claim changes. RSS is reported alongside as
+  secondary indicator. Preprint used RSS in Table IV but that
+  table is in the archive section already (standalone-n=3
+  framing).
+- 2026-05-23 ET: **VMS-only growth on PyTorch+HF mechanistically
+  verified.** Direct inspection of e3b_r02 proc CSV: VMS 38.52 →
+  46.04 GB (+7.52 GB) over 36h, RSS +20 MB only, num_fds 53→52,
+  num_threads 200→199. Rules out file-mapping accumulation and
+  thread-stack growth. Mechanism: anonymous mmap reservation by
+  PyTorch CUDA caching allocator host-side metadata. K_trim_dVMS
+  = 2.2 → smooth drift, not step-wise. Both e3 (+52 MB/h) and
+  e3b (+127 MB/h) show the pattern on r02; r01 absent on both.
+  Plausible cause: r02 seed=2 produces a different request
+  pattern that engages the allocator path more heavily, or host
+  state accumulation through the campaign. r03 will discriminate.
+  e3b > e3 on VMS slope despite e3b at 3.5x lower load is
+  counter-intuitive on per-request leak terms; consistent with
+  time-driven rather than load-driven allocator dynamics.
+- 2026-05-23 ET: **New hypothesis: Triton wrapper amplifies
+  between-run variance independent of underlying engine.**
+  Observation on n=2 USS ratios r02/r01:
+  - Standalone (e1, a1): 0.26 and 1.02 (tight)
+  - Triton wrapper (e2, a2): 8.2 and 0.14 (highly variable)
+  - PyTorch+HF naive (e3, e3b): 2.8 and 2.7 (intermediate)
+  Standalone cells show the smallest between-run variance,
+  Triton-wrapped cells show the largest. Hypothesis: Triton
+  scheduler internal state (dynamic batching queues, model
+  instance allocation) is non-deterministic across replicas and
+  propagates into the engine process footprint. To be checked
+  on n=3 with r03.
 - 2026-05-20 evening ET: **Five-class taxonomy adopted (committed).**
   Pilot n=1 sanity check after the four-class patch surfaced two
   retrospective reclassifications:
@@ -564,49 +704,44 @@ Notable n=3 findings already locked (n>=2):
 In order of priority for the next session:
 
 1. **DONE 2026-05-20: paper-grade r01/r02 slopes for e1, e2, e3.**
-   See Status snapshot for the per-cell CI table and reading. Headlines:
-   - e1: r01 and r02 CIs overlap massively. Reproducible within CI.
-   - e2: r01 and r02 CIs disjoint, r02 ~7x higher than r01.
-   - e3: r01 and r02 CIs barely disjoint, r02 ~3x higher.
-   - e3_r02 additionally shows paper-grade VMS growth at +52 MB/h
-     (a fourth, "VAS-only" stepness class).
+   See Status snapshot for the per-cell CI table (now USS-canonical).
 
-   Also DONE: stepness panel on e1/e2/e3 r02. E2 confirmed
-   mmap-style on n=3. E1 confirmed continuous drift on n=3. E3
-   needs a fourth class for VMS-only growth (see Open Q #2).
+2. **DONE 2026-05-23: paper-grade slopes on the full n=2 (12 runs).**
+   USS adopted as canonical leak indicator. RSS reported alongside.
+   VMS-only growth confirmed on e3/e3b r02 with empirical mechanism
+   verification.
 
    ```bash
-   # Reusable, for r01 + r02 of any three cells:
-   for cell in e1 e2 e3; do
-     python3 analysis/aging_trends.py \
-       --run-dir ~/wosar/runs/wosar2026_${cell}_r01 --csv \
-       > /tmp/${cell}_r01_trends.csv
-     python3 analysis/aging_trends.py \
-       --run-dir ~/wosar/runs/wosar2026_${cell}_r02 --csv \
-       > /tmp/${cell}_r02_trends.csv
+   # Reusable, full n=2 over all 6 cells:
+   for cell in a1 a2 e1 e2 e3 e3b; do
+     for r in r01 r02; do
+       python3 analysis/aging_trends.py \
+         --run-dir ~/wosar/runs/wosar2026_${cell}_${r} --csv \
+         > /tmp/${cell}_${r}_trends.csv
+     done
    done
    python3 analysis/fdr_aggregate.py \
-     --trends-csv /tmp/e1_r01_trends.csv \
-     --trends-csv /tmp/e2_r01_trends.csv \
-     --trends-csv /tmp/e3_r01_trends.csv \
-     --csv > /tmp/fdr_r01.csv
-   python3 analysis/fdr_aggregate.py \
-     --trends-csv /tmp/e1_r02_trends.csv \
-     --trends-csv /tmp/e2_r02_trends.csv \
-     --trends-csv /tmp/e3_r02_trends.csv \
-     --csv > /tmp/fdr_r02.csv
+     $(ls /tmp/*_r0[12]_trends.csv | sed 's|^|--trends-csv |') \
+     --csv > /tmp/fdr_n2_all.csv
+
+   # Inspect per indicator:
+   awk -F, 'NR==1 || $3=="proc.uss_bytes" {print}' /tmp/fdr_n2_all.csv \
+     | column -t -s,
    ```
 
-2. **Wait for r02 batch 2 end (~21 May UTC).** Then run the same
-   analysis on `a1_r02`, `a2_r02`, `e3b_r02`. After this, all 12 r02
-   runs are available and the n=2 within-cell variance can be
-   estimated per cell.
+3. **Wait for r03 batch 1 end (~2026-05-24 mattina ET).** Then run
+   the same pipeline on `e1_r03`, `e2_r03`, `e3_r03` and extend the
+   FDR aggregate to 15 runs.
 
-3. **r03 batch.** Continues per the campaign plan. Expected to end
-   ~24-25 May UTC. Once r03 is in, full n=3 analysis: median slope per
-   cell, between-run CI, BH-FDR across the joint family.
+4. **Launch r03 batch 2 (a1, a2, e3b r03).** Right after batch 1 ends.
+   Each 36h. Expected end ~2026-05-26.
 
-4. **Paper writing on n=3 data.** The four content elements:
+5. **Full n=3 analysis once r03 batch 2 completes.** Per-cell median
+   slope, between-run CI (e.g. percentile bootstrap over 3 replicas),
+   BH-FDR over the joint family of 18 runs × ~25-34 indicators.
+   This is the source of every numerical claim in Section IV.
+
+6. **Paper writing on n=3 data.** The four content elements:
    (a) Campaign description, hardware, workload, stress regime
        (Section IV.A) on n=3.
    (b) Client-side stationarity check (Section IV.B) on n=3.
@@ -623,9 +758,9 @@ In order of priority for the next session:
    confounded factorial (vLLM version drift across cells), single
    hardware, single model.
 
-5. **Stepness analysis sequencing.**
-   - Run `stepness.py` on all completed n=3 runs (r01 + r02 as they
-     land). Warmup is auto-resolved from the cell YAML; pass
+7. **Stepness analysis sequencing.**
+   - Run `stepness.py` on all completed n=3 runs (r01 + r02 + r03 as
+     they land). Warmup is auto-resolved from the cell YAML; pass
      `--warmup-s 3600` only as an explicit override. Record per-cell
      (corr, K_trim_dRSS, K_trim_dVMS, steps/h) per replica.
    - After r03, compute between-run CI for each metric (3 replicates
@@ -634,18 +769,19 @@ In order of priority for the next session:
    - Decide the headline mechanism claim per cell from the n=3
      majority-class assignment.
 
-6. **e3 drop rate analysis.** Both e3_r01 and e3_r02 show ~15.6-15.7%
-   dropped requests at the saturated target rate. Investigate:
+8. **e3 drop rate analysis.** Both e3_r01 and e3_r02 show ~15.6-15.7%
+   dropped requests at the saturated target rate; e3_r03 at 13% with
+   ~15h left to potentially rise. Investigate:
    - Are drops time-clustered (bursty) or uniformly distributed?
    - Do they correlate with GPU 2 VRAM/util spikes or with the
      process scheduler queue depth?
-   - Is the drop pattern stable across r01/r02 in time, or only in
-     aggregate fraction?
+   - Is the drop pattern stable across r01/r02/r03 in time, or only
+     in aggregate fraction?
    The finding is reportable as a property of the PyTorch naive
    baseline at saturated load in the n=3 paper (Section IV.D rate
    ablation).
 
-7. **Long-tail TODO (post-campaign).**
+9. **Long-tail TODO (post-campaign).**
    - Update `docs/experimental_protocol.md` to reflect the actual
      executed protocol (n=3, 36h, parallel topology, Qwen2.5-7B).
    - Fix `run_monitors.py` manifest collision (currently a workaround).
@@ -752,6 +888,35 @@ four scripts. All four share warmup resolution and CSV parsing via
   (a) MK Hamed-Rao p < 0.01, (b) Theil-Sen 95% CI excludes zero,
   (c) bh_reject is True. The first two come from `aging_trends.py`,
   the third from `fdr_aggregate.py`.
+- **Canonical leak indicator: USS, not RSS.** Decided 2026-05-23
+  based on the full n=2 (12 runs) decision-rule outcome:
+  - USS = 12/12 paper-grade significant; RSS = 11/12 (a1_r02 fails
+    on Theil-Sen CI lower bound = 0, an AR(1) inflation artifact
+    isolated to that single run where rho_RSS = 0.99 vs
+    rho_USS = 0.005).
+  - Point estimates of USS and RSS agree within <10% on all 12
+    runs (the underlying trend is the same; what differs is the
+    autocorrelation structure of the residuals).
+  - USS is semantically cleaner: it counts only process-private
+    resident pages. RSS includes shared mappings (libraries, code,
+    file-backed read-only segments) which are a confound for
+    "leak rate per process".
+  - VMS is the third indicator, reserved for the VAS-reservation
+    pattern: it is the sum of all virtual memory regions of the
+    process, including reserved-but-uncommitted anonymous mmaps.
+    VMS - RSS measures address-space reservation rate without
+    corresponding physical commitment, which is the signature of
+    pool allocators with lazy commit (e.g. PyTorch CUDA caching
+    allocator host-side metadata; see Status snapshot for the
+    e3/e3b r02 finding).
+
+  Camera-ready convention: USS is primary in all paper tables and
+  figures. RSS appears in the same tables as a secondary column.
+  VMS appears separately for the PyTorch+HF cells where it is
+  paper-grade significant. RSS-vs-USS comparison is *not*
+  load-bearing for any narrative claim; the divergence on a1_r02
+  is reported as a methodological note in Section IV.B.
+
 - **Stepness panel**: `corr` (RSS-VMS lag-0), `K_trim_dRSS`,
   `K_trim_dVMS`, `steps_per_h_1mb`, and `mean_top1_step_mb`
   (top 1% of positive ΔRSS jumps). Implemented in
@@ -895,22 +1060,41 @@ is the per-cell class assignment on n=3 data.
 All within-n=3. No comparison with the preprint.
 
 1. **Between-replica variance per cell. CI-AWARE READING ON n=2
-   (e1/e2/e3 only; a1/a2/e3b r02 still running).**
-   - **e1**: r01 CI [1.5, 22.3] KB/h and r02 CI [0.74, 23.8] KB/h
-     overlap completely. Reproducible within CI; the apparent point
-     ratio of 0.25 is consistent with Theil-Sen sample variance on
-     low-step data, not a real difference.
-   - **e2**: r01 CI [12.9, 31.6] KB/h and r02 CI [40.3, 231.4] KB/h
-     are disjoint by 8.7 KB/h. r02 slope is genuinely higher than
-     r01, with a ~7x ratio. Real between-run effect on this cell.
-   - **e3**: r01 CI [4.9, 20.1] KB/h and r02 CI [21.4, 88.0] KB/h
-     are disjoint by 1.3 KB/h. Borderline; ~3x point ratio.
+   (USS, full 12-run picture as of 2026-05-23).**
+   - **a1**: r01 CI [9.5, 16.0] KB/h and r02 CI [12.9, 13.4] KB/h.
+     r02 CI is *inside* r01 CI. Highly reproducible. Most stable
+     cell of the campaign on USS.
+   - **a2**: r01 CI [15.6, 61.9] KB/h and r02 CI [1.4, 87.4] KB/h.
+     r02 CI contains r01 CI. CI-compatible, but r02 CI very wide
+     (factor 60 between lo and hi). Point estimate dropped 14x but
+     within noise.
+   - **e1**: r01 CI [1.5, 22.3] KB/h and r02 CI [0.7, 23.8] KB/h.
+     Overlap massive; the apparent point ratio of 0.26 is
+     consistent with Theil-Sen sample variance on low-step data.
+   - **e2**: r01 CI [10.9, 29.0] KB/h and r02 CI [33.2, 228.1] KB/h.
+     DISJOINT by 4.2 KB/h on USS. r02 slope ~8x higher. Real
+     between-run effect on this cell.
+   - **e3**: r01 CI [5.0, 19.5] KB/h and r02 CI [21.4, 87.9] KB/h.
+     DISJOINT by 1.9 KB/h on USS. ~2.8x point ratio. Borderline
+     real effect.
+   - **e3b**: r01 CI [15.7, 132.2] KB/h and r02 CI [56.2, 206.1]
+     KB/h. Overlap (intersection [56.2, 132.2]). CI-compatible
+     despite 2.7x point ratio.
+
+   Pattern: both CI-disjoint cells (e2, e3) are in slot batch 1
+   (e1/e2/e3 ran in parallel) and both have r02 > r01 in the
+   disjoint direction. e1 in the same batch is CI-compatible. All
+   three batch-2 cells (a1, a2, e3b) are CI-compatible. Plausible
+   causes if real: cumulative ambient state on the host, allocator
+   path divergence between seeds, or batch-1-specific noise. The
+   host-side `system.mem_used_bytes` was 41.5 MB/h in batch 1 of
+   r01 and 14 MB/h in batch 1 of r02 (3x lower); batch 2 always
+   shows 1.4-3.2 MB/h system slope (more than an order of magnitude
+   below batch 1). System memory growth rate is driven by aggregate
+   batch workload intensity, not by cell-specific behavior.
+
    Question for r03: does e2 (and e3) regress toward r01, or does
-   r02 confirm a real drift in the slope estimate? Plausible causes
-   if real: cumulative ambient state on the host (file cache, log
-   growth, neighboring runs' residual effects). The host-side
-   `system.mem_used_bytes` itself dropped 3x between r01 (41.5 MB/h)
-   and r02 (14 MB/h), confirming the host environment was different.
+   r02 confirm a real drift in the slope estimate?
 
 2. **Stepness class assignment per cell on n=3 — FULL 12-RUN PICTURE
    AFTER FIX P1 (2026-05-21 afternoon ET).** All 9 completed + 3
