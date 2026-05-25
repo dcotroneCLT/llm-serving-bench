@@ -3,41 +3,53 @@
 
 Two estimators side-by-side, computed per (cell_id, indicator):
 
-  1. DerSimonian-Laird random-effects on the 3 per-replica Theil-Sen slope
-     estimates. SE per replica derived from the TS exact 95% CI via the
-     Gaussian-equivalent formula (ci_hi - ci_lo) / (2 * 1.96). PRIMARY
-     estimator for the camera-ready tables.
+  1. PRIMARY: DerSimonian-Laird random-effects on the k per-replica Theil-Sen
+     slope estimates. SE per replica derived from the TS exact 95% CI via
+     the Gaussian-equivalent formula (ci_hi - ci_lo) / (2 * 1.96). Reported
+     CI is 95% Gaussian on theta_RE.
 
-  2. Pooled Theil-Sen on the concatenated post-warmup series of all 3
-     replicas, with per-replica time origin reset to 0 and per-replica
-     median-centering. ROBUSTNESS CHECK; does not enter the headline
-     numbers.
+  2. ROBUSTNESS: sample median of the k per-replica Theil-Sen slopes, with
+     the [min, max] of the k reported as the exact non-parametric CI for
+     the population median. Coverage as a function of k:
+         P(Y_(1) <= median <= Y_(k)) = 1 - 2 * (1/2)^k
+     For k=3 this is 1 - 1/4 = 75% (NOT 95%). For k=4 -> 87.5%, k=5 -> 93.75%.
+     A percentile bootstrap CI labelled 95% on k=3 would collapse to the
+     same [min, max] interval (the bootstrap median can only take one of
+     the k observed values) and would therefore mis-state its coverage.
+     We report [min, max] honestly with its true coverage.
 
 Per-cell BH-FDR (q = alpha) is applied across the joint family of
 (cell_id, indicator) tests. The per-cell p-value comes from Stouffer's
-z-score combination of the 3 per-replica MK z statistics in the input
+z-score combination of the per-replica MK z statistics in the input
 trend CSVs.
 
-Decision rule for "RE_significant":
+Decision rule for "RE_significant" (headline):
     (cell-level BH-FDR rejects the Stouffer-combined p) AND
     (RE 95% CI excludes 0) AND
     (n_replicas, k_used_RE, and k_used_stouffer meet --expected-replicas).
+
+The pooled-median CI-excludes-zero flag is reported separately as
+`pooled_ci_excludes_zero` but does NOT gate any significance decision: at
+75% coverage for k=3 it is too conservative to serve as a 95% test, and
+it is meant only as an informational robustness cross-check. Headline
+significance is taken from RE-DL.
 
 Usage:
     # Step 1: per-run trend CSVs (already exists, from aging_trends.py)
     python3 analysis/aging_trends.py --csv --run-dir <run> > /tmp/<run>_trends.csv
 
-    # Step 2: per-cell aggregation across replicas
+    # Step 2: per-cell aggregation across replicas (no raw CSV access needed)
     python3 analysis/aggregate_slopes.py \\
         --trends-csv /tmp/wosar2026_e1_r01_trends.csv \\
         --trends-csv /tmp/wosar2026_e1_r02_trends.csv \\
         --trends-csv /tmp/wosar2026_e1_r03_trends.csv \\
         ... (18 total for full campaign) \\
-        --runs-root ~/wosar/runs \\
         [--alpha 0.10] [--expected-replicas 3] [--no-pooled] [--indicator I,J,...] \\
         [--csv] > /tmp/n3_per_cell_slopes.csv
 
-Dependencies: pandas, numpy, scipy. Reuses analysis/aging_io.py.
+Dependencies: pandas, numpy, scipy. No raw CSV access required: both
+estimators operate on the per-replica trend CSVs produced by
+aging_trends.py.
 
 CAVEAT 1 (SE-from-CI). The TS exact CI is order-statistics-based, not
 Gaussian. Using (hi - lo) / (2 * 1.96) as a Gaussian-equivalent SE is the
@@ -52,12 +64,24 @@ report tau^2 and I^2 alongside the RE slope so the heterogeneity is
 transparent. CIs may be wide, especially for indicators where one
 replica differs by orders of magnitude from the other two.
 
-CAVEAT 3 (pooled-TS interpretation). Pooled Theil-Sen on median-centered,
-concatenated series treats the 3 replicas as repeated samplings on a common
-"time since warmup" axis. The CI does not incorporate between-run variance
-into its width (it goes into the residual). RE-DL is the primary estimator.
-If RE and pooled disagree, RE goes in the paper and the disagreement becomes
-a methodological note.
+CAVEAT 3 (pooled-median is not a 95% CI). The [min, max] interval for
+the population median has exact coverage 75% at k=3, 87.5% at k=4, etc.
+Do NOT compare pooled CI to RE CI as if both were 95%; they have
+different formal coverages. The role of the pooled estimator is to
+detect when the RE central tendency is being dragged by one outlier
+replica.
+
+DESIGN HISTORY. An earlier version of this script computed a "pooled
+Theil-Sen on the concatenated post-warmup series" with per-replica
+median-centering. That estimator was systematically biased toward zero
+because Theil-Sen on a median-centered concatenation gives O(N^2/3)
+within-replica pairs (carrying the trend) but O(2 * N^2/3) cross-replica
+pairs whose median-centered (y_b[t] - y_a[t]) is dominated by noise
+around zero. Empirically pooled slope was 7x-30x below the RE estimate
+on e2/e3 USS, and exactly 0 on e1 RSS. We replaced the pooled-series
+estimator with the median-of-slopes estimator documented above, which
+does not suffer the cross-pair pathology because it never inspects raw
+data and operates only on per-replica slope point estimates.
 """
 from __future__ import annotations
 
@@ -70,15 +94,9 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-# Make sibling module importable when run as a script from the repo root.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from aging_io import (
-    discover_proc_prefix,
-    load_client,
-    load_manifest,
-    load_proc,
-    resolve_warmup,
-)
+# Note: this script no longer imports anything from analysis/aging_io.py;
+# the median-of-slopes estimator works entirely off the per-replica trend
+# CSVs and does not touch the raw monitor CSVs.
 
 
 TRENDS_REQUIRED_COLUMNS = [
@@ -88,7 +106,6 @@ TRENDS_REQUIRED_COLUMNS = [
 ]
 
 DEFAULT_ALPHA = 0.10
-DEFAULT_DOWNSAMPLE_S = 60
 DEFAULT_EXPECTED_REPLICAS = 3
 
 
@@ -224,304 +241,53 @@ def bh_fdr(pvals: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarray]:
     return q, reject
 
 
-# ----------------------------- pooled Theil-Sen ------------------------------
+# ----------------------------- pooled-median (robustness) --------------------
 
-def _load_periodic_series(
-    files: list[Path], col: str, warmup_s: float, downsample_s: int,
-) -> Optional[pd.DataFrame]:
-    if not files:
-        return None
-    try:
-        df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-    except Exception:
-        return None
-    if "ts_unix" not in df.columns or col not in df.columns:
-        return None
-    t0 = float(df["ts_unix"].min())
-    df = df[df["ts_unix"] >= t0 + warmup_s].copy()
-    if df.empty:
-        return None
-    df["_bin"] = (df["ts_unix"] // downsample_s).astype(np.int64)
-    agg = df.groupby("_bin")[col].median().reset_index()
-    if agg.empty:
-        return None
-    agg["ts_unix"] = agg["_bin"].astype(float) * downsample_s
-    agg = agg[["ts_unix", col]].rename(columns={col: "value"})
-    agg["ts_unix"] = agg["ts_unix"] - agg["ts_unix"].min()
-    return agg.dropna().reset_index(drop=True)
+def pooled_median(slopes: np.ndarray) -> dict:
+    """Sample median of k per-replica slope estimates with [min, max] CI.
 
+    The [min, max] interval is the exact non-parametric confidence interval
+    for the population median given k i.i.d. observations:
 
-CLIENT_INDICATORS = {
-    "drop_rate", "e2e_p50", "e2e_p95", "e2e_p99",
-    "ttft_p50", "ttft_p99", "tokens_per_sec",
-}
-CLIENT_INDICATOR_REQUIRES = {
-    "drop_rate": (),  # only needs `status`
-    "e2e_p50": ("e2e_latency_s",),
-    "e2e_p95": ("e2e_latency_s",),
-    "e2e_p99": ("e2e_latency_s",),
-    "ttft_p50": ("ttft_s",),
-    "ttft_p99": ("ttft_s",),
-    "tokens_per_sec": ("actual_output_tokens",),
-}
+        Pr(Y_(1) <= median <= Y_(k))
+            = Pr(1 <= B <= k-1)  with B ~ Binomial(k, 0.5)
+            = 1 - 2 * (1/2)^k
 
+    Coverage by k:
+        k=2 -> 50.0 %
+        k=3 -> 75.0 %
+        k=4 -> 87.5 %
+        k=5 -> 93.75 %
+        k=6 -> 96.875 %
 
-def _load_client_indicator(
-    run_dir: Path, sub_indicator: str, warmup_s: float, downsample_s: int,
-) -> Optional[pd.DataFrame]:
-    if sub_indicator not in CLIENT_INDICATORS:
-        print(f"  [warn] unknown client indicator {sub_indicator!r}; supported: "
-              f"{sorted(CLIENT_INDICATORS)}", file=sys.stderr)
-        return None
-    client = load_client(run_dir)
-    if client is None or client.empty:
-        return None
-    if "submitted_at_unix" not in client.columns or "status" not in client.columns:
-        print(f"  [warn] client requests CSV in {run_dir} missing submitted_at_unix or status",
-              file=sys.stderr)
-        return None
-    required = CLIENT_INDICATOR_REQUIRES[sub_indicator]
-    missing = [c for c in required if c not in client.columns]
-    if missing:
-        print(f"  [warn] client requests CSV in {run_dir} missing columns "
-              f"{missing} for indicator {sub_indicator!r}; skipped", file=sys.stderr)
-        return None
-    t0 = float(client["submitted_at_unix"].min())
-    client = client[client["submitted_at_unix"] >= t0 + warmup_s].copy()
-    if client.empty:
-        return None
-    client["_bin"] = (client["submitted_at_unix"] // downsample_s).astype(np.int64)
-    needs_streaming = sub_indicator in {"ttft_p50", "ttft_p99"}
-    has_streaming_col = "streaming" in client.columns
-    rows = []
-    for bin_id, group in client.groupby("_bin"):
-        n = len(group)
-        ok = group[group["status"] == "ok"]
-        if sub_indicator == "drop_rate":
-            dropped = group[group["status"] == "dropped"]
-            value = (len(dropped) / n) if n > 0 else 0.0
-        elif sub_indicator == "e2e_p50":
-            value = ok["e2e_latency_s"].quantile(0.5) if len(ok) > 0 else np.nan
-        elif sub_indicator == "e2e_p95":
-            value = ok["e2e_latency_s"].quantile(0.95) if len(ok) > 0 else np.nan
-        elif sub_indicator == "e2e_p99":
-            value = ok["e2e_latency_s"].quantile(0.99) if len(ok) > 0 else np.nan
-        elif sub_indicator == "tokens_per_sec":
-            value = ok["actual_output_tokens"].sum() / downsample_s if len(ok) > 0 else np.nan
-        elif needs_streaming:
-            if not has_streaming_col:
-                value = np.nan
-            else:
-                streaming = ok[ok["streaming"] == True]  # noqa: E712 (pandas comparison)
-                if len(streaming) == 0:
-                    value = np.nan
-                elif sub_indicator == "ttft_p50":
-                    value = streaming["ttft_s"].quantile(0.5)
-                else:
-                    value = streaming["ttft_s"].quantile(0.99)
-        else:
-            return None  # unreachable; covered by CLIENT_INDICATORS guard above
-        rows.append({"ts_unix": float(bin_id) * downsample_s, "value": value})
-    if not rows:
-        return None
-    out = pd.DataFrame(rows).dropna().reset_index(drop=True)
-    if out.empty:
-        return None
-    out["ts_unix"] = out["ts_unix"] - out["ts_unix"].min()
-    return out
+    For k=3 (the campaign default) [min, max] is therefore a 75% CI, NOT a
+    95% CI. A percentile bootstrap CI labelled 95% on k=3 would collapse to
+    the same [min, max] interval (the bootstrap median can only take one
+    of the k observed values) and would mis-state its true coverage; we
+    avoid that and report the exact 75% coverage directly.
 
-
-def _gpu_files_for_run(run_dir: Path) -> list[Path]:
-    """Return GPU monitor CSVs for this run.
-
-    Campaign runs monitor exactly one GPU, but the file prefix is the physical
-    index (gpu0_*, gpu1_*, gpu2_*), not always gpu0_*.
+    Returns: dict with `slope` (median), `ci_lo` (min), `ci_hi` (max),
+    `coverage_pct`, and `k_used` (count of finite slopes used).
+    Non-finite slopes are dropped from the median and the [min, max].
     """
-    manifest = load_manifest(run_dir)
-    gpu_index = None
-    engine = manifest.get("engine")
-    if isinstance(engine, dict) and engine.get("gpu_device") is not None:
-        gpu_index = engine.get("gpu_device")
-    else:
-        host = manifest.get("host")
-        if isinstance(host, dict):
-            gpu = host.get("gpu")
-            if isinstance(gpu, dict) and gpu.get("index") is not None:
-                gpu_index = gpu.get("index")
-
-    if gpu_index is not None:
-        try:
-            files = sorted(run_dir.glob(f"gpu{int(gpu_index)}_*.csv"))
-            if files:
-                return files
-        except (TypeError, ValueError):
-            print(f"  [warn] manifest has non-integer gpu index {gpu_index!r} in {run_dir}; "
-                  f"falling back to gpu[0-9]*_*.csv",
-                  file=sys.stderr)
-    return sorted(run_dir.glob("gpu[0-9]*_*.csv"))
-
-
-def load_series_for_run(
-    run_dir: Path, indicator: str, warmup_s: float, downsample_s: int = DEFAULT_DOWNSAMPLE_S,
-) -> Optional[pd.DataFrame]:
-    """Load post-warmup, 60s-downsampled series for one (run, indicator).
-
-    Returns a DataFrame with columns [ts_unix, value], ts_unix in seconds
-    starting at 0. Returns None on missing data.
-    """
-    if indicator.startswith("gpu."):
-        col = indicator[len("gpu."):]
-        files = _gpu_files_for_run(run_dir)
-        return _load_periodic_series(files, col, warmup_s, downsample_s)
-    if indicator.startswith("system."):
-        col = indicator[len("system."):]
-        files = sorted(run_dir.glob("system_*.csv"))
-        return _load_periodic_series(files, col, warmup_s, downsample_s)
-    if indicator.startswith("proc."):
-        col = indicator[len("proc."):]
-        manifest = load_manifest(run_dir)
-        prefix = discover_proc_prefix(run_dir, manifest)
-        if prefix is None:
-            return None
-        # aging_io.load_proc auto-adds ts_unix + process_alive to whatever
-        # columns are requested AND applies the process_alive truthy filter
-        # internally. Pass [col] explicitly because columns=None would skip
-        # the target indicator.
-        df = load_proc(run_dir, prefix, columns=[col])
-        if df is None or df.empty:
-            return None
-        if "ts_unix" not in df.columns or col not in df.columns:
-            return None
-        t0 = float(df["ts_unix"].min())
-        df = df[df["ts_unix"] >= t0 + warmup_s].copy()
-        if df.empty:
-            return None
-        df["_bin"] = (df["ts_unix"] // downsample_s).astype(np.int64)
-        agg = df.groupby("_bin")[col].median().reset_index()
-        if agg.empty:
-            return None
-        agg["ts_unix"] = agg["_bin"].astype(float) * downsample_s
-        agg = agg[["ts_unix", col]].rename(columns={col: "value"})
-        agg["ts_unix"] = agg["ts_unix"] - agg["ts_unix"].min()
-        return agg.dropna().reset_index(drop=True)
-    if indicator.startswith("client."):
-        sub = indicator[len("client."):]
-        return _load_client_indicator(run_dir, sub, warmup_s, downsample_s)
-    return None
-
-
-def _estimate_lag1_autocorr(y: np.ndarray) -> float:
-    """Lag-1 autocorrelation clipped to [0, 0.99]; mirror of aging_trends.py."""
-    y = np.asarray(y, dtype=float)
-    n = len(y)
-    if n < 4:
-        return 0.0
-    yc = y - np.mean(y)
-    num = float(np.sum(yc[:-1] * yc[1:]))
-    den = float(np.sum(yc ** 2))
-    if den <= 0:
-        return 0.0
-    rho = num / den
-    return max(0.0, min(0.99, rho))
-
-
-def _ar1_variance_inflation(rho: float) -> float:
-    rho = max(0.0, min(0.99, rho))
-    return (1.0 + rho) / (1.0 - rho)
-
-
-def _sen_slope_and_ci(
-    x: np.ndarray, y: np.ndarray, alpha: float = 0.05, ar_correction: float = 1.0,
-) -> tuple[float, float, float]:
-    """Sen point slope + order-statistics 95% CI with AR(1)-inflated MK variance.
-
-    Same convention as aging_trends.sen_slope_and_ci. Re-implemented locally
-    so aggregate_slopes.py does not depend on aging_trends.py (which has a
-    hard pymannkendall import at module load).
-    """
-    n = len(x)
-    if n < 3:
-        return float("nan"), float("nan"), float("nan")
-    xi = x[:, None]
-    yi = y[:, None]
-    dx = x[None, :] - xi
-    dy = y[None, :] - yi
-    mask = np.triu(np.ones((n, n), dtype=bool), k=1) & (dx != 0)
-    slopes = dy[mask] / dx[mask]
-    if slopes.size == 0:
-        return float("nan"), float("nan"), float("nan")
-    slopes_sorted = np.sort(slopes)
-    M = len(slopes_sorted)
-    median_slope = float(np.median(slopes_sorted))
-
-    var_S = n * (n - 1) * (2 * n + 5) / 18.0 * float(ar_correction)
-    z = stats.norm.ppf(1 - alpha / 2)
-    C_alpha = z * np.sqrt(var_S)
-
-    L = int(np.floor((M - C_alpha) / 2))
-    U = int(np.ceil((M + C_alpha) / 2)) + 1
-    L = max(0, L)
-    U = min(M - 1, U)
-    return median_slope, float(slopes_sorted[L]), float(slopes_sorted[U])
-
-
-def pooled_theil_sen(
-    run_dirs: list[Path], indicator: str, warmup_s_per_run: list[float],
-    downsample_s: int = DEFAULT_DOWNSAMPLE_S,
-) -> dict:
-    """Theil-Sen on the concatenation of k post-warmup series.
-
-    Per-replica processing:
-      - time origin reset to 0, then OFFSET by (i * T_pad) where T_pad is
-        ~2x the longest per-replica duration. Cross-replica pairs then
-        span Δx >= T_pad, which avoids the near-collinear-x pathology
-        of overlapping replicas (a pair (y_b[t], y_a[t]) with t_a≈t_b
-        gives an undefined or huge-magnitude slope estimate).
-      - value centered by subtracting the per-replica MEDIAN to remove
-        the intercept-difference contribution from cross-replica pairs.
-
-    The CI uses the order-statistics Sen formula with the MK null
-    variance multiplied by the AR(1) inflation factor (1+rho)/(1-rho).
-    rho is averaged across per-replica within-replica lag-1
-    autocorrelations. This makes the pooled CI methodologically
-    consistent with the per-replica CIs in aging_trends.py.
-
-    Caveat: this is still a robustness check, not the primary estimator.
-    Between-run heterogeneity goes into the residual rather than into
-    the CI width. Use RE-DL as the primary.
-
-    slope and CI are reported per HOUR (consistent with aging_trends.py).
-    """
-    xs, ys, rhos = [], [], []
-    durations = []
-    for run_dir, warmup_s in zip(run_dirs, warmup_s_per_run):
-        s = load_series_for_run(run_dir, indicator, warmup_s, downsample_s)
-        if s is None or s.empty:
-            continue
-        x_r = s["ts_unix"].values.astype(float)
-        y_r = s["value"].values.astype(float)
-        y_r = y_r - float(np.median(y_r))
-        rhos.append(_estimate_lag1_autocorr(y_r))
-        durations.append(float(x_r.max() - x_r.min()) if len(x_r) else 0.0)
-        xs.append(x_r)
-        ys.append(y_r)
-    k_used = len(xs)
-    if k_used == 0:
-        return dict(slope=np.nan, ci_lo=np.nan, ci_hi=np.nan, n_total=0, k_used=0)
-
-    # Offset each replica's x by 2x the longest replica's duration so
-    # cross-replica pairs span large, non-degenerate Δx.
-    t_pad = 2.0 * max(durations) if durations else 0.0
-    xs_off = [x_r + i * t_pad for i, x_r in enumerate(xs)]
-    x = np.concatenate(xs_off)
-    y = np.concatenate(ys)
-    if len(x) < 10:
-        return dict(slope=np.nan, ci_lo=np.nan, ci_hi=np.nan, n_total=0, k_used=k_used)
-    rho_pooled = float(np.mean(rhos)) if rhos else 0.0
-    ar_mult = _ar1_variance_inflation(rho_pooled)
-    sl, lo, hi = _sen_slope_and_ci(x, y, alpha=0.05, ar_correction=ar_mult)
-    return dict(slope=float(sl) * 3600.0, ci_lo=float(lo) * 3600.0,
-                ci_hi=float(hi) * 3600.0, n_total=int(len(x)), k_used=k_used)
+    slopes = np.asarray(slopes, dtype=float)
+    finite = slopes[np.isfinite(slopes)]
+    k = int(len(finite))
+    if k == 0:
+        return dict(slope=np.nan, ci_lo=np.nan, ci_hi=np.nan,
+                    coverage_pct=np.nan, k_used=0)
+    if k == 1:
+        # Degenerate: a single replica is its own min, max, and median.
+        # Coverage is undefined; we report 0 to flag it.
+        s = float(finite[0])
+        return dict(slope=s, ci_lo=s, ci_hi=s, coverage_pct=0.0, k_used=1)
+    return dict(
+        slope=float(np.median(finite)),
+        ci_lo=float(np.min(finite)),
+        ci_hi=float(np.max(finite)),
+        coverage_pct=float(100.0 * (1.0 - 2.0 ** (1 - k))),
+        k_used=k,
+    )
 
 
 # ----------------------------- main ------------------------------------------
@@ -533,21 +299,13 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--trends-csv", type=Path, action="append", required=True,
                     help="CSV produced by aging_trends.py --csv. Pass once per run.")
-    ap.add_argument("--runs-root", type=Path, default=None,
-                    help="Root directory containing wosar2026_<cell>_r<NN> subdirs. "
-                         "Required if pooled-TS is requested (default). Warmup is "
-                         "auto-resolved per-run via aging_io.resolve_warmup, which "
-                         "reads the manifest and the cell yaml from the repo's "
-                         "campaigns/<campaign_id>/cells/<cell>.yaml convention.")
     ap.add_argument("--alpha", type=float, default=DEFAULT_ALPHA,
                     help=f"BH-FDR target q (default {DEFAULT_ALPHA}).")
     ap.add_argument("--indicator", type=str, default=None,
                     help="Comma-separated indicator filter (e.g. proc.uss_bytes,"
                          "proc.rss_bytes). Default: all indicators present in inputs.")
     ap.add_argument("--no-pooled", action="store_true",
-                    help="Skip the pooled Theil-Sen estimator (RE-DL only).")
-    ap.add_argument("--downsample-seconds", type=int, default=DEFAULT_DOWNSAMPLE_S,
-                    help=f"Window for pooled-TS downsampling (default {DEFAULT_DOWNSAMPLE_S}s).")
+                    help="Skip the pooled-median robustness estimator (RE-DL only).")
     ap.add_argument("--expected-replicas", type=int, default=DEFAULT_EXPECTED_REPLICAS,
                     help=f"Replicas required for a headline significance decision "
                          f"(default {DEFAULT_EXPECTED_REPLICAS}).")
@@ -575,24 +333,7 @@ def load_trend_inputs(paths: list[Path]) -> pd.DataFrame:
     return df
 
 
-def resolve_run_dirs(
-    df: pd.DataFrame, runs_root: Optional[Path]
-) -> dict[str, Path]:
-    if runs_root is None:
-        return {}
-    mapping = {}
-    for run_id in df["run_id"].unique():
-        candidate = runs_root / run_id
-        if candidate.is_dir():
-            mapping[run_id] = candidate
-        else:
-            print(f"  [warn] runs-root: no directory {candidate} for run {run_id}",
-                  file=sys.stderr)
-    return mapping
-
-
-def aggregate(df_trends: pd.DataFrame, run_dirs: dict[str, Path],
-              do_pooled: bool, downsample_s: int) -> pd.DataFrame:
+def aggregate(df_trends: pd.DataFrame, do_pooled: bool) -> pd.DataFrame:
     bad = df_trends["cell_id"].isna() | df_trends["indicator"].isna()
     if bool(bad.any()):
         print(f"  [warn] {int(bad.sum())} trend row(s) with NaN cell_id/indicator dropped",
@@ -641,23 +382,18 @@ def aggregate(df_trends: pd.DataFrame, run_dirs: dict[str, Path],
             "stouffer_p": p_comb,
         }
 
-        if do_pooled and run_dirs:
-            warmup_s_list = []
-            dirs_list = []
-            for rid in g["run_id"].tolist():
-                if rid in run_dirs:
-                    rd = run_dirs[rid]
-                    dirs_list.append(rd)
-                    warmup_s_list.append(float(resolve_warmup(rd)))
-            pooled = pooled_theil_sen(dirs_list, indicator, warmup_s_list, downsample_s)
+        if do_pooled:
+            pooled = pooled_median(slopes)
             row.update({
                 "slope_pooled": pooled["slope"],
                 "ci_lo_pooled": pooled["ci_lo"],
                 "ci_hi_pooled": pooled["ci_hi"],
-                "n_total_pooled": pooled["n_total"],
+                "pooled_coverage_pct": pooled["coverage_pct"],
                 "k_used_pooled": pooled["k_used"],
             })
-            # agreement: relative gap between RE and pooled
+            # agreement: relative gap between RE central estimate and the
+            # pooled median. Useful when the two estimators differ
+            # substantially (RE pulled by outlier on per-replica SE).
             if np.isfinite(dl["theta_RE"]) and np.isfinite(pooled["slope"]) and dl["theta_RE"] != 0:
                 row["agreement_pct"] = float(
                     100.0 * abs(dl["theta_RE"] - pooled["slope"]) / abs(dl["theta_RE"])
@@ -666,7 +402,8 @@ def aggregate(df_trends: pd.DataFrame, run_dirs: dict[str, Path],
                 row["agreement_pct"] = np.nan
         else:
             row.update(dict(slope_pooled=np.nan, ci_lo_pooled=np.nan, ci_hi_pooled=np.nan,
-                            n_total_pooled=0, k_used_pooled=0, agreement_pct=np.nan))
+                            pooled_coverage_pct=np.nan, k_used_pooled=0,
+                            agreement_pct=np.nan))
 
         rows.append(row)
     return pd.DataFrame(rows)
@@ -731,10 +468,9 @@ def main() -> None:
             print("no trend rows left after --indicator filter", file=sys.stderr)
             sys.exit(1)
 
-    do_pooled = not args.no_pooled and args.runs_root is not None
-    run_dirs = resolve_run_dirs(df_trends, args.runs_root) if do_pooled else {}
+    do_pooled = not args.no_pooled
 
-    df = aggregate(df_trends, run_dirs, do_pooled, args.downsample_seconds)
+    df = aggregate(df_trends, do_pooled)
     df = apply_bh_and_decision(df, args.alpha, args.expected_replicas)
 
     if args.csv:
@@ -751,20 +487,26 @@ def main() -> None:
     print(f"\nPer-cell slope aggregation  (n_replicas typically 3)")
     print(f"BH-FDR family size: {n_tests}, alpha={args.alpha}, "
           f"expected_replicas={args.expected_replicas}")
-    print("=" * 180)
+    print(f"Primary estimator: RE-DL (95% Gaussian CI on theta_RE)")
+    print(f"Robustness estimator: median of k per-replica slopes "
+          f"with [min, max] exact non-parametric CI "
+          f"(coverage = 1 - 2 * 0.5^k; 75% at k=3, 87.5% at k=4)")
+    print("=" * 195)
     header = (
         f"{'cell':<5} {'indicator':<32} "
         f"{'n':>2}/{'kRE':<3}/{'kSt':<3} "
         f"{'slope_RE':>14} {'CI_lo_RE':>14} {'CI_hi_RE':>14} "
         f"{'I2_%':>6} {'tau2':>12} {'stouf_p':>10} {'q_BH':>10} {'sig_RE':>7} "
-        f"{'slope_pooled':>14} {'CI_pooled':>30}"
+        f"{'slope_med':>14} {'[min,max]':>30} {'cov%':>5}"
     )
-    print(header); print("-" * 180)
+    print(header); print("-" * 195)
     for _, r in df.sort_values(["cell_id", "indicator"]).iterrows():
         ci_pooled = (
             f"[{r['ci_lo_pooled']:.4g}, {r['ci_hi_pooled']:.4g}]"
             if np.isfinite(r["ci_lo_pooled"]) else "n/a"
         )
+        cov = (f"{r['pooled_coverage_pct']:.1f}"
+               if np.isfinite(r.get("pooled_coverage_pct", np.nan)) else "n/a")
         sig = "YES" if r["RE_significant"] else "no"
         flags = ""
         if r["degraded_replicas"]:
@@ -777,14 +519,17 @@ def main() -> None:
               f"{r['slope_RE']:>14.4g} {r['ci_lo_RE']:>14.4g} {r['ci_hi_RE']:>14.4g} "
               f"{r['I2_RE']:>6.1f} {r['tau2_RE']:>12.4g} "
               f"{r['stouffer_p']:>10.4g} {r['q_value_cell']:>10.4g} {sig:>7} "
-              f"{r['slope_pooled']:>14.4g} {ci_pooled:>30}")
-    print("=" * 180)
+              f"{r['slope_pooled']:>14.4g} {ci_pooled:>30} {cov:>5}")
+    print("=" * 195)
     print(f"\nTotals: {n_bh}/{n_tests} cells reject BH at q={args.alpha}; "
-          f"{n_re_sig}/{n_tests} RE-significant (BH AND RE CI excludes 0).")
+          f"{n_re_sig}/{n_tests} RE-significant (BH AND RE CI excludes 0 AND replicas not degraded).")
     if n_degraded:
-        print(f"WARNING: {n_degraded}/{n_tests} cells with degraded replicas "
+        print(f"NOTE: {n_degraded}/{n_tests} cells with degraded replicas "
               f"(n_replicas, k_used_RE, or k_used_stouffer below expected_replicas); "
               f"excluded from RE_significant and marked with '*' in the sig_RE column.")
+    if n_disagree:
+        print(f"NOTE: {n_disagree}/{n_tests} cells with high between-replica heterogeneity "
+              f"(I^2 > 75%); marked with '!' in the sig_RE column.")
     if n_disagree:
         print(f"NOTE: {n_disagree}/{n_tests} cells with I2 > 75% (replicas_disagree); "
               f"marked with '!' in the sig_RE column. The RE meta-estimate may be "

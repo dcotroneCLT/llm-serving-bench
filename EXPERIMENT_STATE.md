@@ -696,6 +696,70 @@ Notable n=3 findings already locked (n>=2):
   (system.mem_used host-side drift dropped 3x between r01 and r02
   of n=3, see Status snapshot). Pilot classes do not constrain n=3
   classes.
+- 2026-05-25: **Per-cell aggregator `analysis/aggregate_slopes.py`
+  shipped.** Implements TODO #5 (full n=3 analysis once all r03
+  complete). Two estimators per (cell_id, indicator), computed
+  entirely off the per-replica trend CSVs from `aging_trends.py`:
+  - **Primary**: DerSimonian-Laird random-effects on the k Theil-Sen
+    slopes, with per-replica SE derived from the upstream 95% CI via
+    Gaussian-equivalent `(hi - lo) / (2 * 1.96)`. Reports `slope_RE`,
+    `ci_RE`, `tau2`, `I^2`, `Q`, `Q_pvalue`, `k_used_RE`.
+  - **Robustness**: sample median of the k per-replica slopes, with
+    `[min, max]` reported as the exact non-parametric CI for the
+    population median. Coverage by k from order statistics:
+    `1 - 2 * (1/2)^k` → 75% at k=3, 87.5% at k=4, 93.75% at k=5.
+    Note: a percentile bootstrap labelled "95%" on k=3 collapses to
+    the same `[min, max]` interval and would mis-state coverage; we
+    report the exact 75% directly.
+  Per-cell BH-FDR at q=alpha is applied across the (cell_id,
+  indicator) family. The per-cell MK p-value is the Stouffer z-score
+  combination of the k per-replica MK z values (numerically stable
+  via `scipy.stats.norm.sf`). Decision rule for `RE_significant`:
+  (BH rejects cell-level Stouffer p) AND (RE 95% CI excludes 0) AND
+  (n_replicas, k_used_RE, k_used_stouffer meet `--expected-replicas`,
+  default 3). The pooled-median CI-excludes-zero flag is reported but
+  does NOT gate any significance decision (75% CI too conservative).
+- 2026-05-25: **Earlier pooled Theil-Sen on concatenated series was
+  systematically biased toward zero.** First implementation pooled
+  across replicas by per-replica time-reset + median-centering, then
+  computed Theil-Sen on the concatenation. Empirically `slope_pooled`
+  came in 7-30x below `slope_RE` on e2/e3 USS and exactly 0 on e1
+  RSS. Root cause: Theil-Sen computes pairwise slopes across ALL
+  pairs; on a median-centered concatenation, cross-replica pairs at
+  similar relative times have `Δy ≈ 0` (both centered around their
+  per-replica median) and outnumber within-replica pairs ~2:1. The
+  median of pairwise slopes is therefore dragged toward 0. A
+  follow-up patch added per-replica time-offset (i × 2T) to avoid
+  near-zero `Δt` but only reduced the bias magnitude; the structural
+  problem stayed. Replaced with the median-of-slopes estimator
+  documented above, which never inspects raw data and so cannot
+  suffer the cross-pair pathology. Sanity check on e1 USS:
+  RE=4.6 KB/h, median=4.84 KB/h, agreement <6%; on e2 USS:
+  RE=54.4 KB/h, median=58.6 KB/h, agreement <8%.
+- 2026-05-25: **Audit findings on aggregate_slopes.py addressed.**
+  - `load_proc(prefix, columns=None)` only loads `ts_unix +
+    process_alive`. Was being called without `columns=[col]`, so all
+    `proc.*` indicators returned None in the obsolete pooled-TS
+    branch. Fixed before the branch was removed.
+  - `k_used_RE` and `k_used_stouffer` propagated to CSV and human
+    output. Both gate `RE_significant` against `--expected-replicas`
+    (default 3); rows below threshold are excluded from significance
+    AND marked with `*` in the `sig_RE` column.
+  - High between-replica heterogeneity (`I^2 > 75%`) flagged as `!`
+    next to `sig_RE`. Surfaces cells where the RE estimate is
+    averaging substantially disagreeing replicas (e2 USS is the
+    canonical case).
+  - `--campaign-yaml` argument was speculative and unused; removed.
+    `--runs-root` and `--downsample-seconds` removed in the
+    median-of-slopes refactor because the new estimator no longer
+    needs raw CSV access.
+  - Numerical stability: `1 - stats.norm.cdf(abs(z))` and
+    `1 - stats.chi2.cdf(Q, df)` replaced with `stats.norm.sf` and
+    `stats.chi2.sf` so large z and large Q do not cancel to 0.
+  - `se_from_ci_midrange` on degenerate `[c, c]` or inverted
+    `[hi, lo]` CIs now returns NaN with a stderr warning instead of
+    `SE_FLOOR`; the replica is dropped from the DL meta-analysis
+    rather than receiving an effectively infinite weight.
 
 ---
 
@@ -736,10 +800,34 @@ In order of priority for the next session:
 4. **Launch r03 batch 2 (a1, a2, e3b r03).** Right after batch 1 ends.
    Each 36h. Expected end ~2026-05-26.
 
-5. **Full n=3 analysis once r03 batch 2 completes.** Per-cell median
-   slope, between-run CI (e.g. percentile bootstrap over 3 replicas),
-   BH-FDR over the joint family of 18 runs × ~25-34 indicators.
-   This is the source of every numerical claim in Section IV.
+5. **Full n=3 analysis once r03 batch 2 completes.** Pipeline now
+   wired end-to-end:
+   ```bash
+   # (a) per-run trends on all 18 runs
+   for cell in a1 a2 e1 e2 e3 e3b; do
+     for r in r01 r02 r03; do
+       python3 analysis/aging_trends.py \
+         --run-dir ~/wosar/runs/wosar2026_${cell}_${r} --csv \
+         > /tmp/wosar2026_${cell}_${r}_trends.csv
+     done
+   done
+
+   # (b) per-cell aggregation: RE-DL primary + median-of-3 robustness
+   python3 analysis/aggregate_slopes.py \
+     $(ls /tmp/wosar2026_*_r0[123]_trends.csv | sed 's|^|--trends-csv |') \
+     --alpha 0.10 --expected-replicas 3 --csv \
+     > /tmp/per_cell_n3.csv
+   ```
+   Decision rule for paper: per-cell `RE_significant` (BH on Stouffer
+   p, RE CI excludes 0, replicas not degraded). See "Pipeline
+   analytical details" for the formal definition. Median-of-3 with
+   `[min, max]` reported as 75% non-parametric CI alongside for
+   robustness cross-check. **Validated on batch 1 r03 (e1, e2, e3 ×
+   r01/r02/r03) on 2026-05-25**: 9/9 runs USS paper-grade significant
+   per-run, 2/3 cells RE-significant per-cell (e2 and e3; e1 fails RE
+   CI excludes 0 because per-replica CIs are wide, individual MK
+   strongly rejects), pooled-median in agreement with RE-DL within
+   <10% on e1 and e2 (no outlier dragging the RE estimate).
 
 6. **Paper writing on n=3 data.** The four content elements:
    (a) Campaign description, hardware, workload, stress regime
@@ -808,7 +896,7 @@ On the laptop (this repo):
 - `client/{run_client.py, config.yaml, prompts/arxiv_corpus.jsonl,
   protocols/*.py}` (workload)
 - `analysis/{validation_check.py, aging_trends.py, fdr_aggregate.py,
-  stepness.py, aging_io.py}` (paper pipeline)
+  aggregate_slopes.py, stepness.py, aging_io.py}` (paper pipeline)
 - `engines/{vllm_standalone, triton_vllm, pytorch_naive}/` (engine
   definitions, Dockerfiles, model_repository for Triton)
 
@@ -848,8 +936,20 @@ python3 analysis/aging_trends.py --run-dir ~/wosar/runs/wosar2026_<cell>_r<NN> -
 python3 analysis/fdr_aggregate.py \
   --trends-csv /tmp/*_trends.csv \
   > /tmp/fdr_results.csv
-# Adds q_value and bh_reject columns. Decision rule for paper:
+# Adds q_value and bh_reject columns. Decision rule for per-run analysis:
 # significant trend iff mk_p<0.01 AND slope_ci excludes 0 AND bh_reject==True.
+
+# Per-cell aggregation across the n=3 replicas (camera-ready source of truth).
+# Primary: DL random-effects on the 3 per-replica TS slopes. Robustness:
+# median of the 3 slopes with [min, max] = 75% non-parametric CI for the
+# population median. Per-cell BH-FDR on the Stouffer-combined MK p.
+python3 analysis/aggregate_slopes.py \
+  $(ls /tmp/wosar2026_*_r0[123]_trends.csv | sed 's|^|--trends-csv |') \
+  --alpha 0.10 --expected-replicas 3 \
+  > /tmp/per_cell.txt
+# Decision rule for paper: RE_significant iff (BH rejects Stouffer p)
+# AND (RE 95% CI excludes 0) AND (n_replicas/k_used_RE/k_used_stouffer >= 3).
+# Pooled-median CI is reported as a 75% robustness CI, NOT a 95% test.
 
 # Stepness panel (corr, K_trim_dRSS, K_trim_dVMS, steps/h) per run.
 # Warmup is auto-resolved from the campaign cell YAML.
@@ -879,15 +979,43 @@ four scripts. All four share warmup resolution and CSV parsing via
 - **Slope estimation**: Theil-Sen with 95% CI, computed on the real
   `ts_unix` axis (not sample indices). Variance inflated by lag-1
   AR(1) factor (1+rho)/(1-rho). Implemented in `aging_trends.py`.
-- **Multi-test correction**: Benjamini-Hochberg FDR at q = 0.10
-  across the joint family of (run_id, indicator) tests.
-  Implemented in `analysis/fdr_aggregate.py`, which consumes
-  `aging_trends.py --csv` output and adds `q_value` and `bh_reject`
-  columns.
-- **Decision rule**: a trend is declared significant when ALL of:
-  (a) MK Hamed-Rao p < 0.01, (b) Theil-Sen 95% CI excludes zero,
-  (c) bh_reject is True. The first two come from `aging_trends.py`,
-  the third from `fdr_aggregate.py`.
+- **Multi-test correction**: Benjamini-Hochberg FDR at q = 0.10.
+  Two granularities are exposed:
+  - Per-run (run_id, indicator) BH-FDR in `analysis/fdr_aggregate.py`,
+    consuming `aging_trends.py --csv` outputs and adding `q_value`
+    and `bh_reject` columns. Used for per-run diagnostics and for the
+    intermediate "as runs come in" tables in this document.
+  - Per-cell (cell_id, indicator) BH-FDR in
+    `analysis/aggregate_slopes.py`, where the per-cell p is the
+    Stouffer z-score combination of the k per-replica MK z values.
+    Used for the camera-ready Section IV tables: one row per
+    (cell, indicator) over the full n=3 family.
+- **Per-cell aggregation across replicas**: `analysis/aggregate_slopes.py`
+  emits two estimators per (cell_id, indicator) computed entirely on
+  the per-replica trend CSVs:
+  - Primary `slope_RE`: DerSimonian-Laird random-effects on the k
+    Theil-Sen slopes, with per-replica SE derived from the upstream
+    Theil-Sen 95% CI via Gaussian-equivalent `(hi - lo) / (2 * 1.96)`.
+    Reports `slope_RE`, `ci_RE`, `tau2`, `I^2`, `Q`, `Q_pvalue`,
+    `k_used_RE`. Used as the headline n=3 estimator.
+  - Robustness `slope_pooled` (median): sample median of the k
+    per-replica slopes, with `[min, max]` reported as the exact
+    non-parametric CI for the population median. Coverage from order
+    statistics: `1 - 2 * (1/2)^k` → 75% at k=3, 87.5% at k=4. Used
+    only as a cross-check; NOT a 95% test.
+  Headline `RE_significant`: (cell-level BH rejects Stouffer p) AND
+  (RE 95% CI excludes 0) AND (n_replicas/k_used_RE/k_used_stouffer
+  ≥ `--expected-replicas`, default 3). Rows below the replica
+  threshold are excluded from `RE_significant` and marked with `*`
+  in the human-readable table; rows with `I^2 > 75%` are marked with
+  `!` to surface high between-replica heterogeneity.
+- **Decision rule (per-run, pre-aggregation)**: a trend is declared
+  significant when ALL of: (a) MK Hamed-Rao p < 0.01, (b) Theil-Sen
+  95% CI excludes zero, (c) bh_reject is True. The first two come
+  from `aging_trends.py`, the third from `fdr_aggregate.py`.
+- **Decision rule (per-cell, camera-ready)**: `RE_significant` as
+  defined above, from `aggregate_slopes.py`. Source of truth for
+  Section IV tables on the n=3 campaign.
 - **Canonical leak indicator: USS, not RSS.** Decided 2026-05-23
   based on the full n=2 (12 runs) decision-rule outcome:
   - USS = 12/12 paper-grade significant; RSS = 11/12 (a1_r02 fails
