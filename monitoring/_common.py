@@ -116,6 +116,13 @@ class Watchdog:
         self.timeout = timeout_seconds
         self.sentinel = sentinel
 
+    def _fresh_sentinel(self) -> Any:
+        # Return a new object each call: steady_sampler mutates the returned
+        # dict (setdefault ts_unix, _overrun, _wall_clock_unix). A shared
+        # sentinel would carry the first timeout's timestamp into every later
+        # timeout row.
+        return dict(self.sentinel) if isinstance(self.sentinel, dict) else self.sentinel
+
     def call(self, fn: Callable[[], Any]) -> Any:
         result_q: queue.Queue = queue.Queue(maxsize=1)
 
@@ -130,9 +137,9 @@ class Watchdog:
         try:
             kind, payload = result_q.get(timeout=self.timeout)
         except queue.Empty:
-            return self.sentinel
+            return self._fresh_sentinel()
         if kind == "err":
-            return self.sentinel
+            return self._fresh_sentinel()
         return payload
 
 
@@ -163,8 +170,10 @@ def steady_sampler(
     """Drive a sampler at a steady period, robust to slow samples.
 
     Computes the next deadline as start + n*period to avoid drift. If a
-    sample takes longer than period, deadlines are skipped (we do not
-    backfill) and a warning is set in the sample as `_overrun=True`.
+    sample overruns its period, the following deadlines are already in the
+    past, so subsequent samples fire back-to-back until the schedule catches
+    up (no synthetic rows are backfilled for the missed instants). Each
+    overrun sample is flagged with `_overrun=True`.
     """
     start = time.monotonic()
     n = 0

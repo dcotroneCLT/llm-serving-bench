@@ -52,7 +52,12 @@ class CsvRotatingWriter:
         self.rotation_seconds = rotation_seconds
         self.fieldnames = fieldnames
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._seq = 0
+        # Resume past any existing files so a restart into the same output dir
+        # (the documented req_id recovery path) does not overwrite the prior
+        # run's requests_000000.csv in "w" mode.
+        existing = sorted(self.output_dir.glob(f"{base_name}_*.csv"))
+        last_seq = existing[-1].stem.rsplit("_", 1)[-1] if existing else ""
+        self._seq = int(last_seq) + 1 if last_seq.isdigit() else 0
         self._file = None
         self._writer: Optional[csv.DictWriter] = None
         self._opened_at = 0.0
