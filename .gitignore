@@ -104,6 +104,10 @@ docker-compose.override.yml
 # Local backup files from in-place patches
 *.backup_pre_*
 
+# Node / npm (proposal tooling, e.g. proposals/nvidia docx generation)
+node_modules/
+npm-debug.log*
+
 # Claude Code local config
 .claude/
 
