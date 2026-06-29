@@ -912,6 +912,36 @@ Notable n=3 findings already locked (n>=2):
   dynamo.vllm` (senza flag); NIXL in-worker (no PID proprio); infra `etcd` +
   `nats-server` (separati, FUORI dall'aggregato USS engine). Topologia worker
   fissa, autoscaling OFF.
+- 2026-06-29 ET: **STEP 1 CODE-COMPLETE (9 commit), in attesa del GATE su box.**
+  Implementati e testati in locale: WS3 prefix-repeat, WS4 burst arrival
+  (arrival_mode assorbe request_distribution), WS5 calibrazione per-cella
+  (`scripts/calibrate_rate.py` + `--calibration-file` in launch_cell), WS1 pin
+  (3 image_pin*.json), WS2 monitor per-componente (`monitoring/multiproc_monitor.py`
+  + multi-GPU in run_monitors + `proc_prefix` nel manifest + fix dict-manifest in
+  aging_io), bring-up Dynamo (`deploy/dynamo/`), `scripts/attach_run.py`, celle di
+  validazione (`campaigns/extension/cells/val_*.yaml`), gate checker
+  (`analysis/validate_extension_run.py`). Gate checker validato su run sintetica
+  Dynamo-shaped: PASS, incluso `aging_trends` che legge `agg_dynamo` come serie
+  proc. NB locale: `.venv` ha httpx/pyyaml/psutil aggiunti per i test (gitignored).
+  **GATE su cci-csgpu11 (precede il refactor seriale+lifecycle), con due
+  affinamenti:**
+  1. **Step 0 = verifica finale del pin.** `docker run --rm <img> pip show vllm`
+     sui TRE: Dynamo, Triton, standalone. Devono dare TUTTI 0.16.0. **Triton e' il
+     check critico** (da remoto confermato solo via build.py r26.03 + note 26.03;
+     non con pip show). **Se Triton non da' 0.16.0 esatto: STOP**, l'assunzione di
+     intersezione salta, riparliamone prima di proseguire. Registrare i 3 digest
+     nei pin file.
+  2. **Ordine invertito: prima vLLM standalone, poi Dynamo disaggregato.** Lo
+     standalone e' il path single-process noto: se attach_run/pipeline hanno un bug
+     di base lo si trova sul caso facile, non in mezzo alla complessita' multi-proc.
+  3. Congelare i regex dei componenti in `val_dynamo_disagg.yaml` contro `ps`
+     reale al primo bring-up (chiude "WS2 contro il process tree reale").
+  Gate PASS = entrambi i run PASS + regex congelati + 3 pip show a 0.16.0. SOLO
+  allora: refactor seriale (no fan-out per-slot in campaign.py) + lifecycle Dynamo
+  (bring-up/readiness/teardown in launch_cell). Niente bozza lifecycle prima del
+  gate: e' il pezzo che il gate deve validare su hardware reale.
+  Backlog minore: `aging_trends.downsample_client` assume la colonna `ttft_s`
+  (sempre presente nei CSV reali; guardia da una riga, non blocca).
 - 2026-05-20 evening ET: **Five-class taxonomy adopted (committed).**
   Pilot n=1 sanity check after the four-class patch surfaced two
   retrospective reclassifications:
