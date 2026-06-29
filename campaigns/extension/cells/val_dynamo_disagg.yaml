@@ -1,0 +1,89 @@
+# STEP 1 validation cell: NVIDIA Dynamo disaggregated, vLLM 0.16.0, 2 GPU.
+# Confirms on real hardware: per-component PID-group monitoring, the engine USS
+# aggregate (agg_dynamo) vs a separate infra aggregate (agg_infra), multi-GPU
+# sampling, the two client features, and the analysis pipeline reading
+# agg_dynamo as a single proc series.
+#
+# Bring the engine up by hand first:
+#   bash deploy/dynamo/infra_up.sh
+#   bash deploy/dynamo/serve_disaggregated.sh
+# then drive it:
+#   python3 scripts/attach_run.py --cell-yaml campaigns/extension/cells/val_dynamo_disagg.yaml \
+#       --base-url http://localhost:8400 --runs-root ~/wosar/runs \
+#       --repo-root ~/wosar/llm-serving-bench --duration-seconds 1500
+
+cell_id: val_dynamo_disagg
+short_label: dynamo_disagg_016
+description: |
+  NVIDIA Dynamo 1.0.1 disaggregated (prefill + decode + frontend/KV-router),
+  Qwen2.5-7B-Instruct, vLLM 0.16.0, 2 L40S. STEP 1 validation of the
+  multi-process per-component path.
+
+engine:
+  image_repo: nvcr.io/nvidia/ai-dynamo/vllm-runtime
+  image_tag: 1.0.1-cuda13
+  digest_pin_file: engines/dynamo_vllm/image_pin.json
+  # Engine is started by deploy/dynamo/*.sh, NOT by this cell (attach path).
+  # The full unattended lifecycle is the later launch_cell/campaign work.
+  gpu_devices: [0, 1]
+  readyz:
+    url: "http://localhost:8400/health"
+    timeout_s: 900
+  pid_strategy:
+    type: external   # not managed here; monitoring is by component cmdline
+
+monitors:
+  proc:
+    label: dynamo_engine   # not used as the analysis prefix; agg_dynamo is (see proc_prefix)
+    period_s: 5
+  gpu:
+    period_s: 1
+  system:
+    period_s: 5
+  rotation_s: 60
+  # Per-component spec for multiproc_monitor. FREEZE these regexes against the
+  # real `ps -eo pid,cmd | grep dynamo` tree on first bring-up.
+  components:
+    engine_group: dynamo
+    root_pid: null            # host-wide cmdline scan (components run in separate containers)
+    components:
+      - label: dynamo_frontend
+        pattern: "dynamo\\.frontend"
+        group: engine
+        note: "ingress + in-process KV-router (router is NOT a separate PID)"
+      - label: dynamo_prefill
+        pattern: "dynamo\\.vllm"
+        require: "--is-prefill-worker"
+        group: engine
+        expected_count: 1
+      - label: dynamo_decode
+        pattern: "dynamo\\.vllm"
+        exclude: "--is-prefill-worker"
+        group: engine
+        expected_count: 1
+      - label: etcd
+        pattern: "etcd --listen-client-urls"
+        group: infra
+      - label: nats
+        pattern: "nats-server"
+        group: infra
+
+workload:
+  client_config_overrides:
+    protocol: vllm_openai          # Dynamo frontend is OpenAI-compatible
+    base_url: "http://localhost:8400"
+    model: Qwen/Qwen2.5-7B-Instruct
+    target_rate_rps: 1.0
+    concurrency_cap: 64
+    streaming_prob: 0.7
+    request_timeout_s: 600
+    prefix_repeat_fraction: 0.8
+    shared_prefix_len: 512
+    arrival_mode: bursty
+    burst_factor: 4.0
+    burst_on_seconds: 5.0
+    seed_template: "{replica}"
+
+duration_s: 1500
+warmup_discard_s: 120
+post_run_cooldown_s: 120

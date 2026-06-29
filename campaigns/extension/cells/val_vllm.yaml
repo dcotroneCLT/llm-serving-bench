@@ -1,0 +1,75 @@
+# STEP 1 validation cell: vLLM standalone, vLLM 0.16.0, single GPU.
+# Confirms on real hardware that the single-process monitor/client/manifest/
+# analysis path is byte-compatible after the WS2/WS3/WS4/WS5 changes.
+#
+# Run it via scripts/attach_run.py against a hand-started vLLM container
+# (pass --engine-pid = the container's host PID), or via scripts/launch_cell.py
+# which manages the container directly.
+
+cell_id: val_vllm
+short_label: vllm_standalone_016
+description: |
+  vLLM standalone serving Qwen2.5-7B-Instruct, BF16, vLLM 0.16.0, on one L40S.
+  STEP 1 validation of the single-process path.
+
+engine:
+  image_repo: vllm/vllm-openai
+  image_tag: v0.16.0-cu130
+  digest_pin_file: engines/vllm_standalone/image_pin_ext.json
+  container_name_template: "val_vllm_r{replica}"
+  command:
+    - --model
+    - Qwen/Qwen2.5-7B-Instruct
+    - --dtype
+    - bfloat16
+    - --max-model-len
+    - "8192"
+    - --gpu-memory-utilization
+    - "0.9"
+    - --port
+    - "8000"
+  env: {}
+  shm_size: 8g
+  gpu_device: 0
+  port_mapping:
+    - "8500:8000"
+  volumes:
+    - "{hf_cache_host}:/root/.cache/huggingface"
+  readyz:
+    url: "http://localhost:8500/health"
+    timeout_s: 600
+  pid_strategy:
+    type: container_pid1
+
+monitors:
+  gpu_index_inherits_from_engine: true
+  proc:
+    label: vllm_standalone_016
+    period_s: 5
+  gpu:
+    period_s: 1
+  system:
+    period_s: 5
+  rotation_s: 60
+
+workload:
+  client_config_overrides:
+    protocol: vllm_openai
+    base_url: "http://localhost:8500"
+    model: Qwen/Qwen2.5-7B-Instruct
+    target_rate_rps: 1.0          # small fixed rate for the 20-min validation
+    concurrency_cap: 64
+    streaming_prob: 0.7
+    request_timeout_s: 600
+    # Exercise BOTH new client features so validation proves they take effect.
+    prefix_repeat_fraction: 0.8
+    shared_prefix_len: 512
+    arrival_mode: bursty
+    burst_factor: 4.0
+    burst_on_seconds: 5.0
+    seed_template: "{replica}"
+
+# Short validation window (not 48h).
+duration_s: 1200
+warmup_discard_s: 120
+post_run_cooldown_s: 120
