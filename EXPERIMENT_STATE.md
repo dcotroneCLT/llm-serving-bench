@@ -1123,10 +1123,73 @@ MED = real defect, narrow blast radius; LOW = defensive / cosmetic.
 "Verified" = read in source this session; "reported" = from the review
 sub-agents, not re-confirmed line-by-line.
 
-Code left AS-IS for now (per Domenico's standing instruction); this is
-the actionable backlog. Apply BEFORE analyzing the next campaign
-(Dynamo / multi-GPU / 7-14d runs), which is exactly where the latent
-defects start to bite.
+This is the actionable backlog. The HIGH/MED data-integrity items were
+applied on 2026-06-29 (see "Applied" below); the remaining
+supervision/timestamp items are deferred because they need server-side
+testing.
+
+### Applied 2026-06-29 (verified with a before/after pipeline run on the 18 local runs)
+
+- **CR-A1 DONE.** `aging_trends` now computes slopes on a real
+  elapsed-hours axis (per-bin `_t_hours` carried through
+  `downsample_to_minutes`/`downsample_client`), not `np.arange(n)`.
+  **Verified:** proc/gpu/system per-run indicators are byte-identical
+  before/after on all 18 runs (the monitor bins have no gaps, as
+  Domenico independently confirmed), so the USS/RSS/VMS headline slopes
+  and the per-cell DL-RE table are unchanged. Only `client.*` indicators
+  on cells with real client gaps (e3/e3b low-rate windows with zero
+  requests) shift, and they were non-significant either way. On a
+  gap-free run the new axis equals `arange(n)*window/3600` by
+  construction, so the fix is exact, not approximate.
+- **CR-A2 DONE.** BH rejection unified to `q <= alpha` (BH 1995) in
+  `aging_trends` and `fdr_aggregate` (manual + statsmodels paths now
+  derive reject from `q <= alpha`), matching `aggregate_slopes`. No
+  shared helper was added: `aggregate_slopes` is intentionally
+  standalone (it states so), so only the rule was unified.
+- **CR-A8 DONE.** `downsample_client` uses `truthy_series(ok["streaming"])`
+  instead of `== True`.
+- **Triton throughput DONE (the MED tokens_per_sec finding).**
+  `tokens_per_sec` is NaN ("unavailable") when no request reports a token
+  count, instead of summing all-NaN to a fake 0. **Verified:** e2_r02
+  went from `slope=0,n=2101` to `n=0,slope=nan`; same for a2. This keeps
+  Triton's non-existent throughput out of the catalog rather than a false
+  zero trend.
+- **CR-O3 DONE.** `Watchdog` returns a fresh sentinel per call, so
+  multiple watchdog timeouts no longer share/reuse the first timeout's
+  timestamp.
+- **CR-O4 DONE.** `steady_sampler` docstring corrected to describe the
+  actual catch-up behavior (no false "deadlines are skipped" claim).
+- **CR-C1 DONE** (committed 2026-06-29 in a prior commit): arrival
+  accumulator.
+- **Client restart DONE.** The client `CsvRotatingWriter` resumes past
+  existing `requests_*.csv` instead of restarting at `_seq=0` in "w"
+  mode, so a restart into the same output dir no longer overwrites prior
+  data.
+
+Net effect on the paper: **no number or conclusion changes.** The
+per-cell `proc.uss_bytes` DL-RE slopes and every significance boolean are
+identical before/after; only sub-threshold BH q-values shift by ~1%
+because the corrected client family changed the BH set. The committed
+`paper/n3_analysis/` outputs are now slightly stale on the `client.*`
+rows and the BH q column; regenerate them with the fixed pipeline when
+convenient (proc/USS rows will be unchanged).
+
+### Still deferred (need server-side testing, not applied)
+
+- **CR-O1 (HIGH). Orphan reaper.** Not applied: a correct reaper has to
+  interact with `start_new_session`, the sudo/setuid proc_monitor (which
+  clears PR_SET_PDEATHSIG on exec), and PID recycling, and it cannot be
+  validated off the real host. Proposed design: have launch_cell write
+  child PIDs/PGIDs to `run_dir/child_pids.json` on spawn, and reap any
+  stale same-run group at launch/retry; optionally PR_SET_PDEATHSIG for
+  the non-sudo children. Implement and verify on cci-csgpu11.
+- **CR-C "NTP/monotonic" (MED).** Not applied: measuring durations with
+  `time.monotonic()` instead of `time.time()` (with the silent
+  `max(0.0, ...)` clamp) is a cross-adapter refactor of RequestResult and
+  the three protocol clients; it does not help already-collected data and
+  deserves its own pass with a re-run smoke test.
+
+### Original backlog (for reference)
 
 ### Analysis / statistics (touches paper numbers)
 
@@ -1266,13 +1329,14 @@ defects start to bite.
 ### Priority order before the next campaign
 
 1. ~~**CR-C1** (arrival accumulator)~~ — DONE 2026-06-29.
-2. **CR-A1** (real time axis in slopes) — recheck E2; may touch
-   published numbers on runs with gaps.
-3. **CR-C2** (monotonic vs NTP) — silent TTFT bias.
-4. **CR-O1 / CR-O2** (orphan reaper + shutdown race) — supervision
-   robustness for the longer 7-14d runs.
-5. **CR-A2 / CR-A4 / CR-A5** — reviewer-proofing (BH `<=`, AR(1)
-   docstring, CI unit test).
+2. ~~**CR-A1** (real time axis in slopes)~~ — DONE 2026-06-29, verified
+   no change to USS/RSS/VMS headline numbers.
+3. **CR-C2** (monotonic vs NTP) — silent TTFT bias. DEFERRED (cross-adapter
+   refactor, server re-test needed).
+4. **CR-O1** (orphan reaper) — DEFERRED (server-side test needed);
+   ~~**CR-O2**~~ (shutdown race) still open, cheap, apply next.
+5. ~~**CR-A2**~~ DONE (BH `<=` unified). **CR-A4 / CR-A5** still open —
+   reviewer-proofing (AR(1) docstring, CI off-by-one unit test).
 6. **CR-O5 / CR-C2 (read timeout)** — durability + no slot leak.
 
 ---

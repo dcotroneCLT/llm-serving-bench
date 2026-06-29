@@ -149,10 +149,12 @@ Interpret FAILs:
 
 Full long-running-systems + scientific-integrity review of the operational core (campaign / launch_cell / monitors / client) and the analysis pipeline. The complete, prioritized backlog with severities, `file:line`, verification status, and fixes lives in `EXPERIMENT_STATE.md` under "Code review (2026-06-29)". Headlines (apply before analyzing the next campaign):
 
-- **CR-A1 (HIGH):** `aging_trends` computes slope-per-hour on a synthetic integer axis (`np.arange(n)` / `dt_hours`) while `downsample_to_minutes` drops empty bins, so slopes inflate proportional to the missing-bin fraction on runs with engine restarts. Recheck E2. Fix: use real per-bin `ts_unix` as the time axis.
-- **CR-C1 (HIGH):** client arrival process drifts (`next_arrival = monotonic() + inter` instead of `+= inter`); realized rate sits below target and the deficit grows as the server ages, coupling offered load to the aging signal. One-line fix.
-- **CR-O1 (HIGH):** no orphan reaper if `launch_cell` dies uncleanly; monitors (one under sudo) and the container survive, and renamed run_dirs get recreated by orphaned monitors.
-- Resolved in this pass: monitor discovery in `aging_trends.py` now uses `aging_io.discover_proc_prefix` + dynamic GPU-prefix discovery (closes the non-deterministic 405-vs-520-rows defect, TODO #9).
+- **CR-A1 (HIGH) — DONE 2026-06-29.** `aging_trends` now computes slopes on a real elapsed-hours axis (per-bin `_t_hours`) instead of `np.arange(n)`/`dt_hours`, so missing bins no longer compress the time axis and inflate the slope. Verified with a before/after run on the 18 local runs: USS/RSS/VMS headline slopes and the per-cell DL-RE table are unchanged (monitor bins are gap-free); only `client.*` indicators on low-rate cells with real gaps shift, and they were non-significant either way.
+- **CR-C1 (HIGH) — DONE 2026-06-29.** Client arrival accumulator (`next_arrival += inter`).
+- **CR-A2 (MED) — DONE 2026-06-29.** BH rejection unified to `q <= alpha` across `aging_trends`/`fdr_aggregate`/`aggregate_slopes`.
+- **Triton throughput (MED) — DONE 2026-06-29.** `tokens_per_sec` is NaN ("unavailable") when no token counts exist, instead of a fake 0 from summing all-NaN.
+- **CR-O1 (HIGH) — DEFERRED:** orphan reaper needs server-side testing (sudo/setuid + start_new_session interaction). Design recorded in EXPERIMENT_STATE.
+- Earlier: monitor discovery in `aging_trends.py` now uses `aging_io.discover_proc_prefix` + dynamic GPU-prefix discovery (closes the non-deterministic 405-vs-520-rows defect, TODO #9).
 
 ## Archive of aborted attempts
 
