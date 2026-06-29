@@ -165,8 +165,14 @@ def sen_slope_and_ci(
     return median_slope, float(slopes_sorted[L]), float(slopes_sorted[U])
 
 
-def trend_one_indicator(series: pd.Series, dt_hours: float) -> dict:
-    y = series.dropna().to_numpy()
+def trend_one_indicator(series: pd.Series, t_hours: pd.Series) -> dict:
+    # t_hours is the real elapsed-hours axis aligned with `series`. We mask
+    # both by the value being present so a per-indicator NaN window (e.g. a
+    # TTFT bin with no streaming requests) leaves a real gap on the time
+    # axis instead of being silently collapsed into a uniform index.
+    mask = series.notna().to_numpy()
+    y = series.to_numpy(dtype=float)[mask]
+    x = np.asarray(t_hours, dtype=float)[mask]
     n = len(y)
     if n < 10:
         return {
@@ -184,16 +190,18 @@ def trend_one_indicator(series: pd.Series, dt_hours: float) -> dict:
 
     rho = estimate_lag1_autocorr(y)
     ar_mult = ar1_variance_inflation(rho)
-    x = np.arange(n, dtype=float)
-    sen_per_sample, ci_lo_per_sample, ci_hi_per_sample = sen_slope_and_ci(
+    # sen_slope_and_ci returns the slope already per hour because x is in
+    # hours; no dt rescale. On a gap-free run x == arange(n)*window/3600, so
+    # this reproduces the prior (synthetic-index / dt_hours) result exactly.
+    sen_per_hour, ci_low, ci_high = sen_slope_and_ci(
         x, y, alpha=0.05, ar_correction=ar_mult
     )
 
     return {
         "n": n, "mean": float(np.mean(y)), "std": float(np.std(y)), "rho": rho,
-        "sen_slope_per_hour": sen_per_sample / dt_hours,
-        "ci_low": ci_lo_per_sample / dt_hours,
-        "ci_high": ci_hi_per_sample / dt_hours,
+        "sen_slope_per_hour": sen_per_hour,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
         "mk_z": mk_z, "mk_p": mk_p, "mk_trend": mk_trend,
     }
 
@@ -203,18 +211,32 @@ def downsample_to_minutes(df: pd.DataFrame, ts_col: str, window_seconds: int = 6
     df["_bin"] = (df[ts_col] // window_seconds).astype(np.int64)
     numeric = df.select_dtypes(include=[np.number]).columns.tolist()
     numeric = [c for c in numeric if c not in {ts_col, "_bin"}]
-    return df.groupby("_bin")[numeric].median().reset_index(drop=True)
+    grouped = df.groupby("_bin")[numeric].median()
+    # Real elapsed-hours axis from the bin ids. A missing bin (engine
+    # restart, monitor gap, process_alive filtering) then leaves a real gap
+    # instead of being collapsed into a compressed integer index, which would
+    # inflate the slope. On a gap-free run this equals arange(n)*window/3600.
+    grouped["_t_hours"] = (grouped.index - grouped.index.min()) * (window_seconds / 3600.0)
+    return grouped.reset_index(drop=True)
 
 
 def downsample_client(df: pd.DataFrame, window_seconds: int = 60) -> pd.DataFrame:
     df = df.dropna(subset=["submitted_at_unix"]).copy()
     df["_bin"] = (df["submitted_at_unix"] // window_seconds).astype(np.int64)
+    first_bin = int(df["_bin"].min()) if len(df) > 0 else 0
     rows = []
     for bin_id, group in df.groupby("_bin"):
         n = len(group)
         ok = group[group["status"] == "ok"]
         dropped = group[group["status"] == "dropped"]
-        streaming = ok[ok.get("streaming", False) == True]
+        streaming = ok[truthy_series(ok["streaming"])] if "streaming" in ok.columns else ok.iloc[0:0]
+        # tokens_per_sec must be NaN ("unavailable") when no request reports a
+        # token count: a Series of all-NaN .sum() would otherwise read as a
+        # real 0 throughput. Triton never fills actual_output_tokens, so this
+        # keeps its throughput out of the catalog instead of a fake zero trend.
+        tps = np.nan
+        if "actual_output_tokens" in ok.columns and len(ok) > 0 and ok["actual_output_tokens"].notna().any():
+            tps = ok["actual_output_tokens"].sum() / window_seconds
         rows.append({
             "n_requests": n,
             "drop_rate": (len(dropped) / n) if n > 0 else 0.0,
@@ -223,10 +245,8 @@ def downsample_client(df: pd.DataFrame, window_seconds: int = 60) -> pd.DataFram
             "e2e_p99": ok["e2e_latency_s"].quantile(0.99) if len(ok) > 0 else np.nan,
             "ttft_p50": streaming["ttft_s"].quantile(0.5) if len(streaming) > 0 else np.nan,
             "ttft_p99": streaming["ttft_s"].quantile(0.99) if len(streaming) > 0 else np.nan,
-            "tokens_per_sec": (
-                ok["actual_output_tokens"].sum() / window_seconds
-                if "actual_output_tokens" in ok.columns and len(ok) > 0 else np.nan
-            ),
+            "tokens_per_sec": tps,
+            "_t_hours": (bin_id - first_bin) * (window_seconds / 3600.0),
         })
     return pd.DataFrame(rows)
 
@@ -326,13 +346,15 @@ def main() -> None:
         client_ds = downsample_client(client, args.downsample_seconds)
         print(f"  client: {len(client)} post-warmup -> {len(client_ds)} per-window samples", file=progress)
 
+    # Each catalog entry carries the value series and its aligned real
+    # elapsed-hours axis (the per-frame _t_hours column from downsampling).
     catalog = []
     if gpu_ds is not None:
         for col in ["vram_used_bytes", "gpu_util_percent", "mem_util_percent",
                     "temperature_c", "power_draw_w", "sm_clock_mhz", "mem_clock_mhz",
                     "ecc_db_volatile", "ecc_sb_volatile"]:
             if col in gpu_ds.columns:
-                catalog.append(("gpu", col, gpu_ds[col]))
+                catalog.append(("gpu", col, gpu_ds[col], gpu_ds["_t_hours"]))
     if proc_ds is not None:
         for col in ["rss_bytes", "vms_bytes", "uss_bytes", "pss_bytes",
                     "num_threads", "num_fds", "cpu_percent",
@@ -340,29 +362,28 @@ def main() -> None:
                     "io_read_bytes_rate", "io_write_bytes_rate",
                     "io_read_count_rate", "io_write_count_rate"]:
             if col in proc_ds.columns:
-                catalog.append(("proc", col, proc_ds[col]))
+                catalog.append(("proc", col, proc_ds[col], proc_ds["_t_hours"]))
     if system_ds is not None:
         for col in ["mem_used_bytes", "swap_used_bytes",
                     "load_avg_1m", "cpu_percent_total", "fd_allocated"]:
             if col in system_ds.columns:
-                catalog.append(("system", col, system_ds[col]))
+                catalog.append(("system", col, system_ds[col], system_ds["_t_hours"]))
     if client_ds is not None:
         for col in ["drop_rate", "e2e_p50", "e2e_p95", "e2e_p99",
                     "ttft_p50", "ttft_p99", "tokens_per_sec"]:
             if col in client_ds.columns:
-                catalog.append(("client", col, client_ds[col]))
+                catalog.append(("client", col, client_ds[col], client_ds["_t_hours"]))
 
     if not catalog:
         print("No indicators to analyze. Aborting.", file=sys.stderr); sys.exit(1)
 
     print(f"\nAnalyzing {len(catalog)} indicators ...", file=progress)
-    dt_hours = args.downsample_seconds / 3600.0
 
     rows = []
-    for source, name, series in catalog:
+    for source, name, series, t_hours in catalog:
         print(f"  {source}.{name} (n={series.notna().sum()}) ...", end=" ",
               flush=True, file=progress)
-        s = trend_one_indicator(series, dt_hours)
+        s = trend_one_indicator(series, t_hours)
         s["source"] = source; s["indicator"] = name
         rows.append(s)
         print(f"slope={s['sen_slope_per_hour']:.4g}/h, rho={s['rho']:.2f}, p={s['mk_p']:.4f}",
@@ -376,7 +397,9 @@ def main() -> None:
             np.isnan(r["ci_low"]) or np.isnan(r["ci_high"])
             or (r["ci_low"] <= 0 <= r["ci_high"])
         )
-        mk_significant = (not np.isnan(q)) and (q < args.alpha)
+        # BH 1995 rejection is q <= alpha (equality is a rejection), matching
+        # aggregate_slopes.bh_fdr and fdr_aggregate. Unified across the three.
+        mk_significant = (not np.isnan(q)) and (q <= args.alpha)
         r["significant"] = bool(mk_significant and ci_excludes_zero)
 
     if args.csv:

@@ -60,7 +60,9 @@ def bh_fdr_manual(pvals: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarr
     q_valid = np.empty(n)
     q_valid[order] = adj
     q[valid] = q_valid
-    reject[valid] = q_valid < alpha
+    # BH 1995: reject when q <= alpha (equality is a rejection). Unified with
+    # aggregate_slopes.bh_fdr and aging_trends; previously this used < alpha.
+    reject[valid] = q_valid <= alpha
     return q, reject
 
 
@@ -76,9 +78,12 @@ def bh_fdr(pvals: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarray, str
     reject = np.zeros(len(p), dtype=bool)
     if int(valid.sum()) == 0:
         return q, reject, "statsmodels"
-    rej_v, q_v, _, _ = multipletests(p[valid], alpha=alpha, method="fdr_bh")
+    _rej_v, q_v, _, _ = multipletests(p[valid], alpha=alpha, method="fdr_bh")
     q[valid] = q_v
-    reject[valid] = rej_v
+    # Derive reject from the adjusted q ourselves (q <= alpha) rather than
+    # trusting statsmodels' mask, so the boundary rule is identical whether or
+    # not statsmodels is installed (BH 1995, unified with the manual path).
+    reject[valid] = q_v <= alpha
     return q, reject, "statsmodels"
 
 
