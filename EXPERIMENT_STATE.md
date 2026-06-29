@@ -883,6 +883,35 @@ Notable n=3 findings already locked (n>=2):
   `calibrate_rate.py` supporterà sia "load-once + sweep N workload combos" sia il
   caso singola-cella; ceiling conservativo (achieved/offered >= 0.98 + backlog
   piatto + p99 sotto bound) scritto nel manifest con fraction e rate_calibrated.
+- 2026-06-29 ET: **STEP 1 — vLLM PIN CONFERMATO e LOCKED a 0.16.0** (intersezione
+  NON vuota dei tre stack). Immagini:
+  - Dynamo: `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13` (vLLM 0.16.0,
+    NIXL 0.10.1, CUDA 13.0). Dynamo 1.0.1 stable (GA 2026-03-16).
+  - Triton: `nvcr.io/nvidia/tritonserver:26.03-vllm-python-py3` (vLLM 0.16.0).
+    Si sposta dal 25.09 del preprint allo stack version-aligned (Triton 25.12 era
+    ancora 0.11.1; arriva a 0.16.0 col 26.03). Da dichiarare nel paper come scelta
+    deliberata verso lo stack corrente e allineato.
+  - Standalone: `vllm/vllm-openai:v0.16.0-cu130` (Docker Hub upstream; esiste anche
+    il tag bare `v0.16.0`, si usa `-cu130` per allineare CUDA 13). NON l'NGC
+    `nvcr.io/nvidia/vllm:26.03` (quello e' 0.17.1).
+  Fatto Triton confermato da DUE fonti: `server/build.py` @ branch r26.03
+  version_map `"vllm_version": "0.16.0"`, e la riga container-contents delle note
+  26.03 "vLLM version 0.16.0". Verifica finale al pull sulla box:
+  `docker run --rm <img> pip show vllm`. Digest registrati al pull in
+  `engines/*/image_pin*.json` (3 file creati; campo digest vuoto fino al pull;
+  comandi di cattura nel file).
+  **TTV (testo locked):** il SUBSTRATO per-immagine differisce (CUDA caching
+  allocator, torch, glibc) - esattamente cio' che la metrica di stepness sonda.
+  Questa differenza e' intrinseca a qualsiasi confronto cross-system (non si puo'
+  eseguire "Triton" senza l'immagine di Triton); e' mitigata tenendo IDENTICO a
+  0.16.0 il layer di orchestrazione vLLM, che e' strettamente meglio del confound
+  da version-drift del preprint. NON dire "differisce solo il compute path".
+  **Process tree Dynamo disaggregato (per WS2; regex da confermare sulla box):**
+  frontend `python -m dynamo.frontend` (KV-router integrato, non separato);
+  prefill `python -m dynamo.vllm --is-prefill-worker`; decode `python -m
+  dynamo.vllm` (senza flag); NIXL in-worker (no PID proprio); infra `etcd` +
+  `nats-server` (separati, FUORI dall'aggregato USS engine). Topologia worker
+  fissa, autoscaling OFF.
 - 2026-05-20 evening ET: **Five-class taxonomy adopted (committed).**
   Pilot n=1 sanity check after the four-class patch surfaced two
   retrospective reclassifications:

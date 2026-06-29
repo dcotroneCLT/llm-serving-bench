@@ -1,0 +1,15 @@
+{
+  "image_tag": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13",
+  "digest": "",
+  "source_tag": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13",
+  "pinned_at": "",
+  "vllm_version": "0.16.0",
+  "nixl_version": "0.10.1",
+  "cuda": "13.0",
+  "dynamo_release": "1.0.1",
+  "role": "Extension campaign: NVIDIA Dynamo disaggregated (and aggregated) vLLM serving.",
+  "_digest_TODO": "Record at pull time on cci-csgpu11; the digest field above must be filled before any production run.",
+  "_digest_capture_cmd": "docker pull nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13 && docker inspect --format '{{index .RepoDigests 0}}' nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13",
+  "_vllm_verify_cmd": "docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13 pip show vllm | grep Version  # expect 0.16.0",
+  "_source": "Dynamo release artifacts (docs.nvidia.com/dynamo/dev/resources/release-artifacts); Dynamo 1.0.1 GA 2026-03-16."
+}
