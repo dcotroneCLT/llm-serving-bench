@@ -37,6 +37,15 @@ max_tokens:
 # Probability that a request is streaming.
 streaming_prob: 0.7
 
+# --- Prefix-repeat injection (KV-cache prefix-reuse stress) ---
+# A fixed shared prefix of shared_prefix_len tokens is prepended to a
+# Bernoulli(prefix_repeat_fraction) subset of requests. The prefix is built
+# once, identically across requests, to exercise the engine's prefix cache.
+# fraction 0.0 (the default) disables it and reproduces the prior behavior
+# exactly (no extra RNG draw, no prefix). DoW levels: 0.0 / 0.8.
+prefix_repeat_fraction: 0.0
+shared_prefix_len: 0
+
 # Inter-arrival distribution: poisson | constant
 request_distribution: poisson
 

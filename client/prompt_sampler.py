@@ -93,6 +93,29 @@ class PromptSampler:
         after = self._token_counts[i]
         return i if (after - target) < (target - before) else i - 1
 
+    def fixed_prefix(self, target_tokens: int) -> tuple[str, int]:
+        """Deterministic (RNG-free) prefix of ~target_tokens tokens.
+
+        Used for prefix-repeat injection: the same blob is prepended to a
+        subset of requests to exercise KV-cache prefix reuse, so it must be
+        byte-identical across requests and across processes. It is built
+        WITHOUT touching self.rng, so enabling prefix-repeat does not perturb
+        the per-request prompt sampling stream (a run with the prefix off and
+        one with it on draw the same per-request prompts for a given seed).
+        """
+        if target_tokens <= 0 or not self.corpus:
+            return "", 0
+        item = self.corpus[self._nearest_idx(target_tokens)]
+        if item.token_count >= target_tokens:
+            ratio = target_tokens / item.token_count
+            return item.text[: max(1, int(len(item.text) * ratio))], target_tokens
+        # Item shorter than target: repeat it deterministically, then truncate.
+        reps = (target_tokens // max(1, item.token_count)) + 1
+        text = "\n\n".join([item.text] * reps)
+        total = item.token_count * reps
+        ratio = target_tokens / total
+        return text[: max(1, int(len(text) * ratio))], target_tokens
+
     def sample(self, target_tokens: int, tolerance_frac: float = 0.15) -> tuple[str, int]:
         """Return (prompt_text, approx_token_count)."""
         idx = self._nearest_idx(target_tokens)

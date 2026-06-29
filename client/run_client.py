@@ -93,6 +93,8 @@ def main() -> None:
         request_distribution=cfg.get("request_distribution", "poisson"),
         rotation_seconds=int(cfg.get("rotation_seconds", 60)),
         seed=int(cfg.get("seed", 0)),
+        prefix_repeat_fraction=float(cfg.get("prefix_repeat_fraction", 0.0)),
+        shared_prefix_len=int(cfg.get("shared_prefix_len", 0)),
     )
 
     loop = asyncio.new_event_loop()

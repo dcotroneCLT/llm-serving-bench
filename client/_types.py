@@ -27,6 +27,7 @@ class RequestResult:
     requested_input_tokens: Optional[int] = None
     requested_max_output_tokens: Optional[int] = None
     streaming: bool = False
+    shared_prefix_applied: bool = False   # prefix-repeat injection (KV-cache reuse stress)
     # Workload outcome (what actually happened)
     actual_input_tokens: Optional[int] = None
     actual_output_tokens: Optional[int] = None
@@ -59,6 +60,7 @@ CSV_FIELDNAMES = [
     "requested_input_tokens",
     "requested_max_output_tokens",
     "streaming",
+    "shared_prefix_applied",
     "actual_input_tokens",
     "actual_output_tokens",
     "queue_time_s",

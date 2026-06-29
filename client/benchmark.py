@@ -135,6 +135,8 @@ class BenchmarkEngine:
         request_distribution: str = "poisson",
         rotation_seconds: int = 60,
         seed: int = 0,
+        prefix_repeat_fraction: float = 0.0,
+        shared_prefix_len: int = 0,
     ) -> None:
         self.adapter = adapter
         self.sampler = sampler
@@ -147,6 +149,18 @@ class BenchmarkEngine:
         self.request_distribution = request_distribution
         self.rotation_seconds = rotation_seconds
         self.rng = random.Random(seed)
+
+        # Prefix-repeat injection. The shared prefix is built once, RNG-free,
+        # so it is identical across requests (KV-cache reuse) and so that
+        # enabling the feature does NOT shift the per-request sampling stream.
+        # fraction 0 (or len 0) disables it: no extra RNG draw is taken, so a
+        # disabled run is byte-identical to the prior behavior.
+        self.prefix_repeat_fraction = float(prefix_repeat_fraction)
+        self.shared_prefix_len = int(shared_prefix_len)
+        if self.prefix_repeat_fraction > 0.0 and self.shared_prefix_len > 0:
+            self._shared_prefix, self._shared_prefix_tokens = sampler.fixed_prefix(self.shared_prefix_len)
+        else:
+            self._shared_prefix, self._shared_prefix_tokens = "", 0
 
         self.writer = CsvRotatingWriter(
             output_dir=output_dir,
@@ -190,6 +204,15 @@ class BenchmarkEngine:
             self.max_tokens["min"], self.max_tokens["max"],
         )
         stream = self.rng.random() < self.streaming_prob
+        # Prefix-repeat draw LAST, and only when enabled, so prompt_len /
+        # max_tokens / streaming see the same RNG draws as a prefix-disabled
+        # run for the same seed (only the prefix decision is appended).
+        shared_prefix_applied = False
+        if self._shared_prefix:
+            shared_prefix_applied = self.rng.random() < self.prefix_repeat_fraction
+            if shared_prefix_applied:
+                prompt = self._shared_prefix + "\n\n" + prompt
+                approx_in += self._shared_prefix_tokens
         try:
             result = await self.adapter.request(
                 http=http,
@@ -200,6 +223,7 @@ class BenchmarkEngine:
                 stream=stream,
             )
             result.requested_input_tokens = approx_in
+            result.shared_prefix_applied = shared_prefix_applied
             fill_derived_latencies(result)
             self.writer.write(result.to_csv_row())
         except asyncio.CancelledError:
@@ -214,6 +238,7 @@ class BenchmarkEngine:
                 requested_input_tokens=approx_in,
                 requested_max_output_tokens=target_out,
                 streaming=stream,
+                shared_prefix_applied=shared_prefix_applied,
             )
             fill_derived_latencies(result)
             self.writer.write(result.to_csv_row())
@@ -230,6 +255,7 @@ class BenchmarkEngine:
                 requested_input_tokens=approx_in,
                 requested_max_output_tokens=target_out,
                 streaming=stream,
+                shared_prefix_applied=shared_prefix_applied,
             )
             fill_derived_latencies(result)
             self.writer.write(result.to_csv_row())
