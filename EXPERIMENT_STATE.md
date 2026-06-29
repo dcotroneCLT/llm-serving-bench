@@ -4,7 +4,7 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-05-23 (afternoon ET).
+Last updated: 2026-06-07 (ET).
 
 ---
 
@@ -171,13 +171,72 @@ it reports on a realistic multi-tenant deployment.
 
 ---
 
-## TL;DR (operational, 2026-05-23)
+## TL;DR (operational, 2026-06-06)
 
-n=3 campaign on day 7 of ~10.5. **Round 2 complete** (all 12 r01+r02
-runs across the 6 cells, all paper-grade significant on USS). **Round 3
-batch 1** (e1, e2, e3 r03) currently running on gpu0/1/2, ~14-15h to
-go (ETA fine batch ~2026-05-24 mattina ET). **Round 3 batch 2** (a1,
-a2, e3b r03) still to launch.
+**CAMPAGNA COMPLETATA.** 18 production run (6 cells × 3 replicas
+× 36h ciascuno) + 1 sanity run (e2_r99: 6h, e2 on gpu0 invece di
+gpu1, per Section V threats-to-validity sulla GPU-index sensitivity).
+State summary: `completed=19, running=0, failed=0`. 0 FAIL, 10 soft
+WARN (3 `proc.sample_error` storici di r01 batch 2 + 3 `client.dropped`
+su e3 r01/r02/r03 a 14.3-15.7% = regime stazionario confermato su
+n=3). Campagna terminata intorno al 2026-05-25.
+
+**Dati sincronizzati in locale sul Mac** (2026-06-06): tutte le 19
+run directory in `~/Documents/Github/llm-serving-bench/runs/`
+(2.2 GB totali, gitignored). Trasferimento via tar.gz + scp
+(611 MB compressi) dopo che rsync incrementale aveva avuto
+problemi di rete stallita. Pipeline locale validata bit-exact
+vs server: `aging_trends.py` su `wosar2026_e1_r01` ridà USS slope
+6957.82 byte/h con CI [1495.5, 22341.8] byte/h, identico al numero
+documentato il 23 maggio.
+
+**Pulizia eseguita** (2026-06-06):
+- Server: tar di trasferimento cancellato (611 MB), `runs_aborted_20260516_052308`
+  cancellato (54 MB), `runs_failed_attempts` cancellato (97 MB).
+  Conservati `~/wosar/runs/wosar2026_*`, `~/wosar/runs_n1_baseline/`,
+  immagini Docker `wosar2026_*`, `~/wosar/hf_cache/`.
+- Mac: tar di trasferimento cancellato (611 MB). `runs/` directory
+  conservata (gitignored, 2.2 GB).
+
+**Stato analisi paper-grade n=3.**
+- aging_trends.py girato in locale su tutti i 18 production
+  run, output in `/tmp/wosar_n3/*_trends.csv`. **Anomalia da
+  indagare nella prossima sessione**: 405 righe totali vs ~520
+  attese (alcuni run mancano indicator, probabilmente per
+  detection di GPU index o client missing). I file CSV per-run
+  comunque tutti generati. Da rilanciare con debug per capire
+  cosa manca.
+- fdr_aggregate.py e aggregate_slopes.py NON ancora lanciati su
+  n=3 (sono i comandi che producono la **tabella per-cell
+  paper-grade source of truth** per Section IV.C). Pipeline pronta
+  in repo, basta lanciarla.
+- stepness.py ancora da lanciare sui 6 run di r03 per consolidare
+  la classificazione mechanism a 5 classi su n=3 (su n=2 era già:
+  E2 mmap-style step-wise × 2, altre 5 celle continuous drift × 2).
+
+**Stato scrittura paper.** Preprint (`docs/WOSAR_2026.pdf`, n=1
+24h, 8 pagine) ricaricato e riletto integralmente il 2026-06-06.
+**LaTeX sources del preprint vivono su Overleaf** (canonical source,
+non nel repo Git). La cartella `paper/` nel repo è vuota a parte
+`.gitkeep` e `PAPER_UPDATE_PLAN.md` (documento di riferimento per
+la rescrittura, vedi sotto).
+
+**Workflow per la scrittura del camera-ready** (deciso 2026-06-06):
+- Domenico scrive personalmente il paper su Overleaf interagendo
+  con l'assistente. NON deleghiamo il drafting full-text
+  all'assistente.
+- Si lavora **sezione per sezione**: Domenico discute una sezione
+  con l'assistente, scrive il LaTeX su Overleaf, pasta il testo
+  in chat, l'assistente commenta/suggerisce/propone alternative,
+  Domenico itera sul Overleaf.
+- `paper/PAPER_UPDATE_PLAN.md` resta come **reference document**
+  per sapere cosa cambia in ogni sezione (preprint → camera-ready),
+  con draft di testo proposti come spunto. NON è da incollare
+  meccanicamente nel LaTeX; è guida e checklist.
+- I numeri paper-grade (Tabelle III, IV, V e dati Figure 2) vanno
+  prodotti dalla pipeline `analysis/aggregate_slopes.py` +
+  `analysis/stepness.py` sui 18 run n=3 in locale, una volta sola,
+  e poi citati nel paper.
 
 Five findings are now locked in on n>=2 data (will appear in the
 camera-ready regardless of r03 outcome):
@@ -254,7 +313,7 @@ Open headline questions for the paper (within-n=3, not vs preprint):
 
 - Venue: WoSAR 2026 (ISSRE workshop on Software Aging and Rejuvenation)
 - Deadline: 30 June 2026
-- Authors: Domenico Cotroneo (UniNa Federico II / UNCC), Bojan Cukic (UNCC)
+- Authors: Domenico Cotroneo (UNC Charlotte), Bojan Cukic (UNCC)
 - Working title: "The Aging Surface of LLM Serving Engines: An Empirical Study"
 - **Preprint (n=1) version**: `docs/WOSAR_2026.pdf`. Used as background
   scaffolding for the camera-ready, not as a reference to replicate.
@@ -667,6 +726,117 @@ Notable n=3 findings already locked (n>=2):
   instance allocation) is non-deterministic across replicas and
   propagates into the engine process footprint. To be checked
   on n=3 with r03.
+- ~2026-05-25 ET: **Campaign completed.** All 18 production +
+  1 sanity. r03 batch 1 (e1, e2, e3) finished ~24 May, r03 batch
+  2 (a1, a2, e3b) finished ~26 May, sanity e2_r99 (6h e2 on gpu0)
+  scheduled and completed after.
+- 2026-06-06 ET: **Local sync + cleanup.** All 19 run directories
+  rsynced (via tar.gz + scp due to rsync incremental stalling on
+  one of the runs) to `~/Documents/Github/llm-serving-bench/runs/`
+  on the Mac (2.2 GB, gitignored). Pipeline `aging_trends.py`
+  validated bit-exact in local against server numbers. Cleanup
+  on server: cancellati `runs_aborted_20260516_052308` (54 MB),
+  `runs_failed_attempts` (97 MB), tar di trasferimento (611 MB).
+- 2026-06-06 ET: **Paper writing kickoff.** Preprint riletto
+  integralmente (`docs/WOSAR_2026.pdf`, 8 pagine). Creato
+  `paper/PAPER_UPDATE_PLAN.md` con piano di rescrittura
+  sezione-per-sezione per la nuova chat di Opus 4.8.
+  **Open question per Domenico**: dove sono le LaTeX sources
+  originali del preprint? La cartella `paper/` nel repo è vuota
+  (solo `.gitkeep`), il preprint è solo in PDF. Per applicare
+  i cambiamenti serve recuperare le sources (Overleaf? altra
+  repo? file locale?) o ricostruire il LaTeX da zero dal PDF.
+- 2026-06-07 ET: **Paper-grade n=3 pipeline RUN in locale (TODO #1/#2
+  RESOLVED).** Output committati in `paper/n3_analysis/`: `per_cell.csv`,
+  `per_cell.txt`, `fdr_per_run.csv`, `stepness_all.csv`, e il riepilogo
+  `N3_RESULTS.md`. Pipeline = aging_trends (per-run) -> fdr_aggregate
+  (per-run BH-FDR) -> aggregate_slopes (per-cell DL-RE + median, q=0.10,
+  expected-replicas=3) -> stepness (5-class). Tutti i 18 production run
+  danno il catalogo completo a 34 indicatori = 612 righe totali.
+- 2026-06-07 ET: **BUG in `aging_trends.py` trovato e diagnosticato
+  (causa dell'anomalia 405-vs-520).** Due difetti nella discovery locale
+  dei monitor, che NON usa `aging_io.discover_proc_prefix`:
+  (1) prefisso GPU hardcoded a `gpu0` (riga ~285) -> indicatori GPU persi
+      su tutte le celle gpu1/gpu2 (e2, a2, e3, e3b).
+  (2) il loop del `proc_prefix` (righe ~293-297) esclude solo
+      `("gpu0","system")` e itera un glob NON ordinato -> sulle celle
+      gpu1/gpu2 puo' scegliere `gpu1`/`gpu2` come monitor di processo,
+      calcolando proc.* (RSS/USS/VMS, cioe' il leak indicator canonico)
+      sul file sbagliato. Esito dipendente dall'ordine del filesystem,
+      quindi NON-DETERMINISTICO tra macchine (nel sandbox a2 si rompeva
+      ed e2 no). Spiega sia le 405 righe sia perche' alcune celle uscivano
+      e altre no sul server.
+  Workaround usato per produrre i numeri n=3: copia patchata
+  `paper/n3_analysis/aging_trends_FIXED_reference.py` (gpu-prefix discovery
+  + esclusione `gpuN`/`system` via glob ordinato). Riproduce ESATTAMENTE i
+  valori gia' documentati (a2_r01 USS 42.5, e2_r01 19.1, e1_r01 7.0 KB/h),
+  quindi i numeri n=3 sono affidabili.
+  **FIX UFFICIALE DA APPLICARE IN REPO (via Claude Code):** sostituire la
+  discovery locale in `aging_trends.py` con `aging_io.discover_proc_prefix`
+  (gia' corretta: legge il manifest, esclude gpu*/system) + una discovery
+  analoga del prefisso GPU. Chiude il long-tail TODO #9.
+- 2026-06-07 ET: **Numeri n=3 chiave (USS DL-RE, KB/h).** E1 4.73 (CI
+  [-1.66, 11.11], NON significativo), A1 13.16 (I^2=0, la piu' riproducibile),
+  E2 55.75 (I^2=89%, repliche in forte disaccordo), A2 22.74 (I^2=60%),
+  E3 19.95 (I^2=54%), E3b 61.65 (I^2=0). 5/6 celle RE-significative su USS
+  (E1 l'eccezione). Stepness: E2 unica con step events (r01/r02 mmap-style,
+  r03 border; sanity e2_r99 border), tutte le altre 5 continuous drift 3/3.
+  VMS VAS-only solo su r02 di e3 (+52 MB/h) e e3b (+127 MB/h), non per-cella.
+  Drop rate e3 15.7/15.6/14.3%, e3b 0/0/0%.
+- 2026-06-07 ET: **Ribaltamenti rispetto al draft n=1** (vedi
+  `paper/PAPER_UPDATE_PLAN.md` per le conseguenze editoriali). Il gap
+  draft->n=3 e' STRUTTURALE (pipeline + version drift), non varianza tra
+  run: anche la replica piu' alta resta 13-1300x sotto i numeri del draft
+  sugli engine ottimizzati (E1 ~1300x). Due claim del draft cadono:
+  "naive baseline e' il piu' pulito" (falsa: E1 e' il piu' pulito) e
+  "leak rates span ~3 ordini di grandezza" (su n=3 e' ~1 ordine, tutto in
+  KB/h, decine di MB/mese). Il draft non era mai stato sottomesso; le sue
+  cifre eclatanti erano artefatti, come sospettato.
+- 2026-06-07 ET: **DECISIONE EDITORIALE: due paper (vedi
+  PAPER_UPDATE_PLAN.md).** Workshop WoSAR 2026 = single-run (replica r02),
+  36h, framing multi-tenant, stesso scheletro del draft con risultati
+  sostituiti e reframing del testo. Journal = estensione n=3 +
+  meta-analisi (DL-RE + Stouffer + per-cell FDR) + riproducibilita'/
+  eterogeneita'. Intro del journal gia' redatta e CONGELATA in questa
+  sessione (nuovi bib key: dersimonian1986, stouffer1949, opz. whitlock2005).
+- 2026-06-07 ET (sessione 2): **PRIMA BOZZA WORKSHOP COMPLETA.** Tutte le
+  sezioni redatte su r02 (Abstract, I, II, III, IV.A-E, V, VI; Table I-V;
+  Figura 2 = `paper/n3_analysis/figures/uss_factorial.pdf`, pannello
+  singolo USS). Dettagli completi di decisioni, numeri e finding in
+  `paper/PAPER_UPDATE_PLAN.md` sezione "2026-06-07 (session 2)". Da
+  riprendere: pass di coerenza titoli, scelta abstract, discussione
+  "c'e' aging davvero?", fix pipeline in repo (TODO #9), e la **proposal
+  NVIDIA** (angolo reliability->security sullo step-wise di E2: vedi seed
+  in PAPER_UPDATE_PLAN). Estensione journal: n=3 + meta-analisi.
+- 2026-06-10 ET: **Paper finalizzato e su arXiv (arXiv:2606.11916, cs.SE/cs.AI, 10 giu).** Titolo finale
+  "Characterizing Software Aging in GPU-Based LLM Serving Systems" (7 pagine
+  IEEE, dentro il limite WoSAR). Hardware UNCC = L40S (4 GPU). WoSAR 2026:
+  submission 20 luglio, notifica 10 agosto, camera-ready 17 agosto;
+  review NON double-blind -> arXiv col proprio nome consentito. Licenza
+  arXiv: non-exclusive (compatibile col copyright transfer IEEE). Fix
+  minori residui sul paper: citazione rotta `[?]` nell'intro, grammatica
+  "we give the evidence", coerenza maiuscole titoli di sezione.
+- 2026-06-10 ET: **PROSSIMA CAMPAGNA PIANIFICATA (estensione NVIDIA /
+  journal).** Tutto il design e il conteggio GPU-hours in
+  `proposals/nvidia/proposal_context.md`. Sintesi operativa per quando si
+  riparte (tra ~1 mese), esperimenti PRIMA in locale su L40S:
+  - **Installare NVIDIA Dynamo** in locale (server ha 4 L40S -> regge il
+    disaggregated serving a 2+ GPU). Dynamo = successore di Triton, backend
+    vLLM, open-source (`ai-dynamo/dynamo`).
+  - **DoE 2x2**: piattaforma {vLLM standalone, Triton+vLLM, Dynamo} x
+    hardware {L40S locale, A100 da grant}, **48h x 3 repliche**.
+  - **Run lunghe 7gg (n=1)** sulle config non-convergenti (dai dati 36h:
+    E2/Triton e PyTorch-VAS in locale; Dynamo su A100).
+  - **Stress-workload probe** (NON chiamarlo "adversarial"): varia
+    dimensione/ripetizione/burstiness/rate; misura il fattore di
+    amplificazione del leak. Security come implicazione, responsible
+    disclosure.
+  - **Conferma condizionale 14gg su A100** sotto stress workload se il probe
+    mostra amplificazione.
+  - **BLOCCO PRE-ANALISI:** prima di analizzare la nuova campagna applicare
+    il fix di `aging_trends.py` (TODO #9) - Dynamo e multi-GPU generano nomi
+    di CSV nuovi, la discovery non-deterministica ricolpisce. Codice per ora
+    LASCIATO COM'E' su richiesta di Domenico.
 - 2026-05-20 evening ET: **Five-class taxonomy adopted (committed).**
   Pilot n=1 sanity check after the four-class patch surfaced two
   retrospective reclassifications:
@@ -765,12 +935,65 @@ Notable n=3 findings already locked (n>=2):
 
 ## Open TODOs
 
-In order of priority for the next session:
+In order of priority for the next session (2026-06-06):
 
-1. **DONE 2026-05-20: paper-grade r01/r02 slopes for e1, e2, e3.**
+0. **RESOLVED 2026-06-06: LaTeX sources sono su Overleaf** (canonical
+   source). Domenico scrive il paper personalmente su Overleaf, in
+   modalità conversazionale con l'assistente. Workflow:
+   discussione-per-sezione → scrittura su Overleaf → paste in chat
+   per review/feedback → iterazione. `paper/PAPER_UPDATE_PLAN.md` è
+   il reference document per sapere cosa cambia in ogni sezione,
+   non da incollare meccanicamente.
+
+1. **RESOLVED 2026-06-07: paper-grade n=3 per-cell tables prodotte**
+   (output in `paper/n3_analysis/`, vedi Decisions 2026-06-07). NB: girate
+   con la copia patchata di aging_trends; il fix va ancora applicato in
+   repo (vedi Decisions / TODO #9). Sequenza originale qui sotto per
+   riferimento. Pipeline ready, basta lanciarla in locale:
+   ```bash
+   cd ~/Documents/Github/llm-serving-bench
+   source .venv/bin/activate
+   setopt interactive_comments  # zsh per evitare bug `#` argument
+   # aging_trends già fatto ma con anomalia (405 vs 520 righe).
+   # rifare con logging completo:
+   rm -rf /tmp/wosar_n3 && mkdir -p /tmp/wosar_n3
+   for cell in a1 a2 e1 e2 e3 e3b; do
+     for r in r01 r02 r03; do
+       python3 analysis/aging_trends.py \
+         --run-dir runs/wosar2026_${cell}_${r} --csv \
+         > /tmp/wosar_n3/${cell}_${r}_trends.csv \
+         2>/tmp/wosar_n3/${cell}_${r}.log
+     done
+   done
+   wc -l /tmp/wosar_n3/*_trends.csv | tail -1
+   # se ancora 405 invece di 520: grep '[warn]' /tmp/wosar_n3/*.log
+   # per capire cosa skipping per quali cells
+   python3 analysis/fdr_aggregate.py \
+     $(ls /tmp/wosar_n3/*_trends.csv | sed 's|^|--trends-csv |') \
+     --csv > /tmp/wosar_n3/fdr_per_run.csv
+   python3 analysis/aggregate_slopes.py \
+     $(ls /tmp/wosar_n3/*_trends.csv | sed 's|^|--trends-csv |') \
+     --alpha 0.10 --expected-replicas 3 \
+     > /tmp/wosar_n3/per_cell.txt
+   ```
+   Output `/tmp/wosar_n3/per_cell.txt` = source of truth Section IV.C.
+
+2. **RESOLVED 2026-06-07: stepness n=3 prodotta** (`paper/n3_analysis/
+   stepness_all.csv`). Esito: E2 unica step-wise (r01/r02 mmap-style,
+   r03 border; sanity e2_r99 border), altre 5 celle continuous drift 3/3.
+   VAS-only su e3/e3b resta r02-only. Comando di riferimento:
+   ```bash
+   python3 analysis/stepness.py --logs-root runs --csv \
+     > /tmp/wosar_n3/stepness_all.csv
+   ```
+   Confermare: E2 r03 ancora mmap-style step-wise? Le altre 5
+   celle r03 ancora continuous drift? VAS-only su e3/e3b si
+   manifesta su r03 o resta r02-only?
+
+3. **DONE 2026-05-20: paper-grade r01/r02 slopes for e1, e2, e3.**
    See Status snapshot for the per-cell CI table (now USS-canonical).
 
-2. **DONE 2026-05-23: paper-grade slopes on the full n=2 (12 runs).**
+4. **DONE 2026-05-23: paper-grade slopes on the full n=2 (12 runs).**
    USS adopted as canonical leak indicator. RSS reported alongside.
    VMS-only growth confirmed on e3/e3b r02 with empirical mechanism
    verification.
@@ -876,9 +1099,178 @@ In order of priority for the next session:
    - Restore Docker data-root on /home per ADR-002.
    - Complete refactor of `analysis/aging_trends.py` onto
      `analysis/aging_io.py`. Warmup discard, --csv mode, process_alive
-     parsing already done in the 2026-05-19 evening hardening commit;
-     remaining: `load_csvs` and `proc_prefix` discovery still local.
-     Code-quality debt, not correctness.
+     parsing already done in the 2026-05-19 evening hardening commit.
+     **PARTIALLY RESOLVED 2026-06-29:** the `proc_prefix` discovery now
+     calls `aging_io.discover_proc_prefix` (reads manifest, excludes
+     gpu*/system) and the GPU prefix is discovered dynamically instead
+     of hardcoded `gpu0`. This closes the non-deterministic monitor
+     discovery defect (the cause of the 405-vs-520-rows anomaly).
+     Remaining code-quality debt: `load_csvs` is still local to
+     aging_trends and does not sort rows by `ts_unix` after concat
+     (see Code review CR-A5 below).
+
+---
+
+## Code review (2026-06-29) — long-running-systems + scientific-integrity pass
+
+Full read of the operational core (campaign / launch_cell / monitors /
+client) plus the analysis pipeline, with the two failure classes that
+matter for this study in mind: (1) silent measurement bias on a 36h+
+window, (2) supervision gaps when a process dies uncleanly. Findings
+were verified against the source where they touch published numbers.
+Severity: HIGH = can corrupt a paper number or break a long run;
+MED = real defect, narrow blast radius; LOW = defensive / cosmetic.
+"Verified" = read in source this session; "reported" = from the review
+sub-agents, not re-confirmed line-by-line.
+
+Code left AS-IS for now (per Domenico's standing instruction); this is
+the actionable backlog. Apply BEFORE analyzing the next campaign
+(Dynamo / multi-GPU / 7-14d runs), which is exactly where the latent
+defects start to bite.
+
+### Analysis / statistics (touches paper numbers)
+
+- **CR-A1 (HIGH, verified). Slope-per-hour inflated by dropped time
+  bins.** `aging_trends.trend_one_indicator` builds `x = np.arange(n)`
+  and divides by `dt_hours` (`downsample_seconds/3600`), but
+  `downsample_to_minutes` drops empty bins (`groupby().median()`), and
+  the `process_alive=True` filter creates exactly such gaps on engine
+  restarts. Slope is then overestimated proportional to the
+  missing-bin fraction. Exact (~0 error) on clean gap-free runs; bites
+  runs with restarts / sample_error stretches. **Recheck E2** (the
+  r02>>r01 "disjoint" cell, Triton worker churn). `validation_check.py`
+  already does the right thing (Theil-Sen on real `ts_unix`). Fix:
+  carry per-bin median `ts_unix` through downsampling, pass real
+  elapsed-hours as `x`, drop the `/dt_hours` rescale.
+
+- **CR-A2 (MED, verified). BH rejection boundary inconsistent across
+  the three aggregators.** `aging_trends.main` and `fdr_aggregate` use
+  `q < alpha`; `aggregate_slopes` uses `q <= alpha`; statsmodels path
+  uses its own. BH 1995 is `<=`. Only bites at the exact boundary or
+  across machines (statsmodels present/absent), but it is
+  non-determinism in a paper-grade pipeline. Fix: one shared
+  `aging_io.bh_fdr` (`<=`), derive `reject` from q even on the
+  statsmodels path.
+
+- **CR-A3 (MED, verified). No PID segmentation in the slope pipeline.**
+  `stepness.py` segments deltas per PID; `aging_trends` filters
+  `process_alive` but runs Theil-Sen/MK across PID boundaries. Theil-Sen
+  (median) is robust to a single restart jump; MK's S and the lag-1 rho
+  are not, and level indicators (vram_used, num_fds) reset. Fix: apply
+  the same pid-change mask before level trends, or document why levels
+  tolerate restarts.
+
+- **CR-A4 (MED, verified, methods-description). Docstring overclaims
+  the autocorrelation correction.** The Theil-Sen CI uses a lag-1
+  AR(1) inflation `(1+rho)/(1-rho)`; the MK test uses pymannkendall's
+  Hamed-Rao. The docstring/header calls the AR(1) factor the "leading
+  Hamed-Rao term", which it is not. The dual correction is defensible;
+  the wording will draw a reviewer. Fix: state honestly (CI = AR(1)
+  lag-1 approximation, test = Hamed-Rao), or recompute the CI variance
+  from the rank autocorrelation.
+
+- **CR-A5 (LOW, verified). Theil-Sen CI off-by-one on the order
+  statistics.** `sen_slope_and_ci` uses the rank as a 0-based index
+  without the `-1` conversion, shifting both CI bounds up by one
+  order statistic (slightly anti-conservative on "CI excludes 0").
+  Numerically negligible for headline indicators (M ~ 2e6 pairwise
+  slopes at n~2160); only matters at small n (client indicators).
+  Fix + add a unit test against a Gilbert worked example.
+
+- **CR-A6 (LOW, verified). `load_csvs` does not sort rows by `ts_unix`
+  after concatenating rotated files.** Safe today (zero-padded
+  monotonic filenames) but fragile; `aging_io.load_proc` already sorts.
+  Add `.sort_values(ts_col).reset_index(drop=True)`.
+
+- **CR-A7 (LOW, verified). GPU prefix discovery still keys on the
+  first-rotation file** (`gpu*_000000.csv`). If `_000000` is missing
+  the whole GPU family is silently dropped (same 405-vs-520 class).
+  Robust fix: mirror `discover_proc_prefix` (glob `gpu*_*.csv`, regex
+  the `_\d{6}.csv` suffix, common stem).
+
+- **CR-A8 (LOW, verified, defensive). `streaming == True` instead of
+  `truthy_series`** in `downsample_client` (and `sweep_summary`).
+  Probably harmless (pandas infers bool dtype) but inconsistent with
+  the defense already adopted elsewhere; a mixed-dtype column would make
+  the TTFT family vanish silently.
+
+### Operational / long-running supervision
+
+- **CR-O1 (HIGH, verified). No orphan reaper if `launch_cell` dies
+  uncleanly.** Monitors + client run with `start_new_session=True`;
+  cleanup lives only in `launch_cell`'s `finally`. On SIGKILL / OOM /
+  crash they keep running to their own 36h deadline (proc_monitor under
+  sudo) and the container is never torn down. Worse: monitors reopen
+  output files by path with `mkdir(parents=True)` each rotation, so if
+  the orchestrator archives/renames the run_dir, orphans recreate the
+  original dir and collide with attempt 2's CSVs. Fix: write monitor/
+  client PIDs to a file and reap stale same-run processes at launch /
+  retry, or use PR_SET_PDEATHSIG / `systemd-run --scope`.
+
+- **CR-O2 (MED, verified). Race on `current_proc` during shutdown.**
+  `campaign.SlotWorker.interrupt()` (signal thread) reads
+  `self.current_proc` while the worker nulls it in `finally`;
+  `AttributeError` between the None-check and `.send_signal` can swallow
+  the shutdown of the other slots. Fix: snapshot to a local, catch
+  `AttributeError`.
+
+- **CR-O3 (MED, verified). Watchdog sentinel is a shared, mutated
+  dict.** `gpu/proc/system_monitor` pass one sentinel object;
+  `steady_sampler` does `setdefault("ts_unix", ...)`, so after the
+  first watchdog timeout every later timeout row reuses that first
+  timestamp. Rare (NVML/psutil deadlock only) but real timestamp
+  corruption. Fix: build a fresh sentinel per call, or `dict(sentinel)`
+  inside `Watchdog.call`.
+
+- **CR-O4 (LOW, verified). `steady_sampler` catch-up vs documented
+  skip.** The docstring says overruns "skip deadlines (no backfill)";
+  the code fires the backlog back-to-back (`n += 1` while
+  `deadline = start + n*period`). With CR-O3 it produces a burst of
+  degenerate-timestamp rows. Downsampling to 60s masks most of it.
+  Fix: skip (`n = ceil((now-start)/period)`) or fix the docstring.
+
+- **CR-O5 (LOW, verified, durability). No periodic flush in
+  `CsvRotatingWriter`** (monitors and client): rows sit in the Python
+  buffer until rotation/close, so a hard kill loses up to one rotation
+  window. The "bounded data loss" claim only holds with a periodic
+  flush. Add `flush()` per row (cheap).
+
+### Client / load generator
+
+- **CR-C1 (HIGH, verified). Arrival process drifts.**
+  `benchmark.run` does `next_arrival = time.monotonic() + inter`
+  instead of `next_arrival += inter`. Per-iteration cost (RNG, task
+  creation, the synchronous CSV write on the drop path) is added to the
+  inter-arrival gap, so the realized rate sits below target AND the
+  deficit grows as the server ages (busier loop, more inline drop I/O).
+  This couples the independent variable (offered load) to the dependent
+  variable (aging) — a silent validity threat on the core workload.
+  Fix: `next_arrival += inter` (the existing `if now < next_arrival`
+  guard already handles catch-up correctly for open-loop Poisson).
+
+- **CR-C2..C7 (reported, not re-verified line-by-line):** wall-clock vs
+  monotonic for latency/TTFT with NTP steps over 36h silently clamped
+  to 0 (`fill_derived_latencies`); scalar `httpx.Timeout` with no
+  per-chunk read timeout (a stalled stream holds a slot 600s); restart
+  overwrites `requests_000000.csv` (writer restarts at `_seq=0` in "w"
+  mode); `asyncio.Event.set()` from an OS signal handler is not
+  loop-safe (use `loop.add_signal_handler`); no per-row flush (= CR-O5);
+  **to verify in analysis:** whether Triton `extras.output_chars` is
+  converted to `actual_output_tokens` (else token/ITL metrics missing
+  for one of three engines → cross-engine bias).
+
+### Priority order before the next campaign
+
+1. **CR-C1** (arrival accumulator) — one-line fix, corrupts the load
+   variable.
+2. **CR-A1** (real time axis in slopes) — recheck E2; may touch
+   published numbers on runs with gaps.
+3. **CR-C2** (monotonic vs NTP) — silent TTFT bias.
+4. **CR-O1 / CR-O2** (orphan reaper + shutdown race) — supervision
+   robustness for the longer 7-14d runs.
+5. **CR-A2 / CR-A4 / CR-A5** — reviewer-proofing (BH `<=`, AR(1)
+   docstring, CI unit test).
+6. **CR-O5 / CR-C2 (read timeout)** — durability + no slot leak.
 
 ---
 

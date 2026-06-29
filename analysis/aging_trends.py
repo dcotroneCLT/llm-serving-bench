@@ -63,7 +63,7 @@ except ImportError:
     print("pymannkendall not installed. Run: pip install pymannkendall", file=sys.stderr)
     sys.exit(2)
 
-from aging_io import infer_cell_id, load_manifest, resolve_warmup, truthy_series
+from aging_io import infer_cell_id, load_manifest, resolve_warmup, truthy_series, discover_proc_prefix
 
 
 # ---------- data loading ----------
@@ -282,19 +282,20 @@ def main() -> None:
     progress = sys.stderr if args.csv else sys.stdout
     print(f"Loading run from {run_dir} ...", file=progress)
 
-    gpu = load_csvs(run_dir, "gpu0")
+    gpu_prefix = None
+    for f in sorted(run_dir.glob("gpu*_000000.csv")):
+        nm = f.stem.rsplit("_", 1)[0]
+        if nm[3:].isdigit():
+            gpu_prefix = nm; break
+    gpu = load_csvs(run_dir, gpu_prefix) if gpu_prefix else None
     if gpu is None:
-        print("  [warn] no gpu0 CSVs found", file=sys.stderr); gpu_ds = None
+        print("  [warn] no gpu CSVs found", file=sys.stderr); gpu_ds = None
     else:
         gpu = filter_warmup(gpu, "ts_unix", warmup_s)
         gpu_ds = downsample_to_minutes(gpu, "ts_unix", args.downsample_seconds)
         print(f"  gpu: {len(gpu)} post-warmup -> {len(gpu_ds)} per-window samples", file=progress)
 
-    proc_prefix = None
-    for f in run_dir.glob("*_000000.csv"):
-        name = f.stem.rsplit("_", 1)[0]
-        if name not in ("gpu0", "system"):
-            proc_prefix = name; break
+    proc_prefix = discover_proc_prefix(run_dir, manifest)
     if proc_prefix:
         proc = load_csvs(run_dir, proc_prefix)
         if proc is not None:

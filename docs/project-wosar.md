@@ -9,7 +9,7 @@ minutes.
 
 - **Venue**: WoSAR 2026 (ISSRE workshop on Software Aging and Rejuvenation)
 - **Deadline**: 30 June 2026 (extended)
-- **Authors**: Domenico Cotroneo (UniNa Federico II / UNC Charlotte), Bojan Cukic (UNCC Dean of CCI)
+- **Authors**: Domenico Cotroneo (UNC Charlotte), Bojan Cukic (UNCC Dean of CCI)
 - **Title (working)**: aging in LLM serving engines on GPU
 - **Target length**: 7 pages, full paper track
 
@@ -144,6 +144,15 @@ Interpret FAILs:
 - `run_monitors.py` no longer overwrites `manifest.json`; legacy archived runs from before this fix have monitor-shape manifest. Health check has fallback logic to handle both shapes.
 - Other client adapters (triton_vllm.py, pytorch_hf.py) could benefit from strict base_url validation similar to vllm_openai.py. Defense-in-depth, not urgent (current yamls are correct).
 - VRAM saturation differs slightly between Triton (98%) and vLLM standalone (90-92%) due to backend default `gpu_memory_utilization`. Cite in paper as out-of-the-box production deployment characteristic.
+
+## Code review backlog (2026-06-29)
+
+Full long-running-systems + scientific-integrity review of the operational core (campaign / launch_cell / monitors / client) and the analysis pipeline. The complete, prioritized backlog with severities, `file:line`, verification status, and fixes lives in `EXPERIMENT_STATE.md` under "Code review (2026-06-29)". Headlines (apply before analyzing the next campaign):
+
+- **CR-A1 (HIGH):** `aging_trends` computes slope-per-hour on a synthetic integer axis (`np.arange(n)` / `dt_hours`) while `downsample_to_minutes` drops empty bins, so slopes inflate proportional to the missing-bin fraction on runs with engine restarts. Recheck E2. Fix: use real per-bin `ts_unix` as the time axis.
+- **CR-C1 (HIGH):** client arrival process drifts (`next_arrival = monotonic() + inter` instead of `+= inter`); realized rate sits below target and the deficit grows as the server ages, coupling offered load to the aging signal. One-line fix.
+- **CR-O1 (HIGH):** no orphan reaper if `launch_cell` dies uncleanly; monitors (one under sudo) and the container survive, and renamed run_dirs get recreated by orphaned monitors.
+- Resolved in this pass: monitor discovery in `aging_trends.py` now uses `aging_io.discover_proc_prefix` + dynamic GPU-prefix discovery (closes the non-deterministic 405-vs-520-rows defect, TODO #9).
 
 ## Archive of aborted attempts
 
