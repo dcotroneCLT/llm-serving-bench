@@ -274,12 +274,24 @@ class BenchmarkEngine:
                     self._tasks.add(task)
                     task.add_done_callback(self._tasks.discard)
 
-                # Schedule next arrival
+                # Schedule next arrival.
+                #
+                # Accumulate onto the previous *scheduled* time, not onto a
+                # freshly sampled monotonic clock. Rebasing on time.monotonic()
+                # here would fold every per-iteration cost (RNG, task creation,
+                # the inline CSV write on the drop path) into the inter-arrival
+                # gap, pushing the realized rate below target by an amount that
+                # grows as the server ages and the loop gets busier. That would
+                # couple offered load to the aging signal under measurement.
+                # With the accumulator, if the loop falls behind, next_arrival
+                # lands in the past and the `if now < next_arrival` guard above
+                # dispatches back-to-back to recover the long-run rate, which is
+                # the correct open-loop Poisson behavior.
                 if self.request_distribution == "poisson":
                     inter = self.rng.expovariate(rate) if rate > 0 else float("inf")
                 else:
                     inter = 1.0 / rate if rate > 0 else float("inf")
-                next_arrival = time.monotonic() + inter
+                next_arrival += inter
 
                 # Periodic state persistence
                 if (time.monotonic() - last_state_persist) >= 30.0:

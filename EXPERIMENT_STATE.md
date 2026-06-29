@@ -1237,16 +1237,20 @@ defects start to bite.
 
 ### Client / load generator
 
-- **CR-C1 (HIGH, verified). Arrival process drifts.**
-  `benchmark.run` does `next_arrival = time.monotonic() + inter`
+- **CR-C1 (HIGH, verified). RESOLVED 2026-06-29.** Arrival process
+  drifted: `benchmark.run` did `next_arrival = time.monotonic() + inter`
   instead of `next_arrival += inter`. Per-iteration cost (RNG, task
-  creation, the synchronous CSV write on the drop path) is added to the
-  inter-arrival gap, so the realized rate sits below target AND the
-  deficit grows as the server ages (busier loop, more inline drop I/O).
-  This couples the independent variable (offered load) to the dependent
-  variable (aging) — a silent validity threat on the core workload.
-  Fix: `next_arrival += inter` (the existing `if now < next_arrival`
-  guard already handles catch-up correctly for open-loop Poisson).
+  creation, the synchronous CSV write on the drop path) was added to the
+  inter-arrival gap, so the realized rate sat below target AND the
+  deficit grew as the server aged (busier loop, more inline drop I/O),
+  coupling the independent variable (offered load) to the dependent
+  variable (aging). Fixed to the accumulator form `next_arrival += inter`
+  (the existing `if now < next_arrival` guard handles catch-up correctly
+  for open-loop Poisson). NB: the runs already on arXiv were generated
+  with the drifting scheduler; the bias direction is "offered slightly
+  below target", which is conservative for an aging claim (we under-, not
+  over-, stressed), but quantify it before reusing those numbers in the
+  journal extension.
 
 - **CR-C2..C7 (reported, not re-verified line-by-line):** wall-clock vs
   monotonic for latency/TTFT with NTP steps over 36h silently clamped
@@ -1261,8 +1265,7 @@ defects start to bite.
 
 ### Priority order before the next campaign
 
-1. **CR-C1** (arrival accumulator) — one-line fix, corrupts the load
-   variable.
+1. ~~**CR-C1** (arrival accumulator)~~ — DONE 2026-06-29.
 2. **CR-A1** (real time axis in slopes) — recheck E2; may touch
    published numbers on runs with gaps.
 3. **CR-C2** (monotonic vs NTP) — silent TTFT bias.
