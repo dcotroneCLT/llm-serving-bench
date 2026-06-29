@@ -816,27 +816,73 @@ Notable n=3 findings already locked (n>=2):
   arXiv: non-exclusive (compatibile col copyright transfer IEEE). Fix
   minori residui sul paper: citazione rotta `[?]` nell'intro, grammatica
   "we give the evidence", coerenza maiuscole titoli di sezione.
-- 2026-06-10 ET: **PROSSIMA CAMPAGNA PIANIFICATA (estensione NVIDIA /
-  journal).** Tutto il design e il conteggio GPU-hours in
-  `proposals/nvidia/proposal_context.md`. Sintesi operativa per quando si
-  riparte (tra ~1 mese), esperimenti PRIMA in locale su L40S:
-  - **Installare NVIDIA Dynamo** in locale (server ha 4 L40S -> regge il
-    disaggregated serving a 2+ GPU). Dynamo = successore di Triton, backend
-    vLLM, open-source (`ai-dynamo/dynamo`).
-  - **DoE 2x2**: piattaforma {vLLM standalone, Triton+vLLM, Dynamo} x
-    hardware {L40S locale, A100 da grant}, **48h x 3 repliche**.
-  - **Run lunghe 7gg (n=1)** sulle config non-convergenti (dai dati 36h:
-    E2/Triton e PyTorch-VAS in locale; Dynamo su A100).
-  - **Stress-workload probe** (NON chiamarlo "adversarial"): varia
-    dimensione/ripetizione/burstiness/rate; misura il fattore di
-    amplificazione del leak. Security come implicazione, responsible
-    disclosure.
-  - **Conferma condizionale 14gg su A100** sotto stress workload se il probe
-    mostra amplificazione.
-  - **BLOCCO PRE-ANALISI:** prima di analizzare la nuova campagna applicare
-    il fix di `aging_trends.py` (TODO #9) - Dynamo e multi-GPU generano nomi
-    di CSV nuovi, la discovery non-deterministica ricolpisce. Codice per ora
-    LASCIATO COM'E' su richiesta di Domenico.
+- 2026-06-12 ET: **PROSSIMA CAMPAGNA RIDISEGNATA come DoW di workload**
+  (supera il "DoE 2x2" del 2026-06-10). Esperimenti PRIMA in locale su L40S
+  (de-risking); ~2 mesi di server disponibili. Pipeline: **fix di
+  `aging_trends.py` (TODO #9) APPLICATO** (ora usa
+  `aging_io.discover_proc_prefix` + discovery dinamica del prefisso GPU).
+  Disegno: un unico **screening DoW** girato identico su **3 sistemi**
+  (Dynamo disaggregato 2 GPU, Triton+vLLM, vLLM standalone), 5 fattori
+  (rate, prompt-len, output-len, prefix-repeat, burstiness) in **Res V
+  16-run + 3 center point, finestra 48h**, rate = frazione-del-ceiling con
+  calibrazione per run; risposte: slope/ora + slope/richiesta (time vs
+  load) + stepness + per-componente (router/prefill/decode/KV-transfer).
+  Modello **Qwen** in locale; **Nemotron + asse hardware A100 = arm grant**.
+  **Piano completo + razionale + budget in `paper/PAPER_UPDATE_PLAN.md`**,
+  sezione "2026-06-12: EXPERIMENTAL PLAN — DoW".
+- 2026-06-29 ET: **Livelli fattori e STEP 1 CONFERMATI.** Livelli mild/stressful
+  (Qwen, ctx 8192): rate 30%/85% ceiling; prompt ~512/~6000 tok; output
+  ~64/~1024 tok; prefix-repeat 0%/80%; burstiness Poisson/bursty; center point
+  = valori mediani. **PROSSIMO PASSO = STEP 1**: bring-up Dynamo (aggregato +
+  disaggregato) + decisione di monitoring (mappare i PID dei componenti:
+  router/prefill/decode/KV-transfer) + due feature client (prefix-repeat
+  injection, burst arrival) + validazione harness (2 run brevi) + tooling di
+  calibrazione rate per-run. **Nessun run DoW parte prima di STEP 1.** STEP 0
+  (Domenico, in parallelo): run di validazione 48h di una cella nota su L40S.
+- 2026-06-29 ET: **STEP 1 IN CORSO** via Claude Code (VS Code). Prompt lanciato
+  con i 5 workstream: (1) bring-up Dynamo aggregato+disaggregato + script/README
+  + pin versione vLLM; (2) monitoring per-componente (PID->router/prefill/decode/
+  KV-transfer + CSV per-componente + aggregato, backward-compatible coi sistemi
+  single-process); (3) client prefix-repeat injection (0%/80%); (4) client burst
+  arrival mode (poisson/bursty); (5) tooling calibrazione rate = frazione del
+  ceiling. Chiusura STEP 1 = 2 run brevi (~20-30 min) su vLLM standalone +
+  Dynamo disaggregato per validare harness+monitor+manifest+pipeline end-to-end.
+- 2026-06-29 ET: **STEP 1 — decisioni di design LOCKED** (dopo review del piano
+  Claude Code). Vincolo globale: **parallelismo minimo**, run SERIALI (un run per
+  volta, niente run concorrenti che condividono GPU/host); campagna sequenziale e
+  restartable, non parallela. Monitoring per-componente: un componente = *gruppo*
+  di PID (somma entro il gruppo; PID singoli nel manifest); **fidarsi
+  dell'aggregato solo su USS** (privata, no double-count, confrontabile coi
+  single-process), RSS/PSS aggregati solo diagnostici; **topologia worker fissa,
+  autoscaling Dynamo disattivato** (membership costante sulle 48h); KV-transfer
+  (NIXL) come componente solo se ha PID proprio; etcd/NATS come componenti "infra"
+  ma FUORI dall'aggregato engine; campionamento stesso-tick. Ceiling (WS5):
+  definizione conservativa (achieved/offered ≥ 0.98 + backlog piatto + p99 sotto
+  bound, non il bordo 0.95) per dare margine all'85% sulle 48h; **ceiling
+  PER-CELLA** (dipende da prompt/output/prefix/burst): calibrare ognuna delle 19
+  celle variando solo il rate, registrare ceiling/fraction/rate_calibrated nel
+  manifest; calibrare a t0 e FISSARE il rate (l'erosione di capacità sulle 48h è
+  un risultato da osservare, non assorbire); ricontrollare il budget ~150 GPU-h
+  vs 19 celle × 3 sistemi. Versione vLLM = quella supportata da Dynamo, pinnata
+  IDENTICA sui 3 sistemi via image digest. Deploy Dynamo locale via CLI (no k8s
+  su singola box). `request_distribution` assorbito in `arrival_mode`; aggiunta
+  colonna `shared_prefix_applied`. `attach_run.py` solo per i 2 run di
+  validazione: la campagna 48h × 19 × 3 deve essere guidata da
+  launch_cell/campaign.py (bring-up/readiness/teardown Dynamo, run non
+  presidiati e serializzati). DA REGISTRARE a chiusura STEP 1: topologia worker
+  scelta + versioni pinnate.
+- 2026-06-29 ET: **STEP 1 — budget calibrazione ricontrollato (WS5).** Ottimizzazione
+  chiave: i 5 fattori della DoW sono TUTTI di workload; il sistema di serving e la
+  sua config sono FISSI per sistema. Quindi una sola istanza engine per sistema si
+  riusa per tutte le 19 calibrazioni (load una volta, poi 19 sweep di solo-rate
+  back-to-back, serial): 19 cold-load -> 1 per sistema. Stima: sweep per cella
+  ~6-8 punti rate x ~4min + cooldown ~30min wallclock; per sistema ~1 cold-load +
+  19 sweep ~10h. GPU-h: standalone/Triton (1 GPU) ~10 ciascuno, Dynamo (2 GPU) ~20
+  -> **~40 GPU-h totali**, dentro i ~150 con margine (anche raddoppiando le finestre
+  ~80). Coerente col vincolo seriale (le calibrazioni stesse girano una per volta).
+  `calibrate_rate.py` supporterà sia "load-once + sweep N workload combos" sia il
+  caso singola-cella; ceiling conservativo (achieved/offered >= 0.98 + backlog
+  piatto + p99 sotto bound) scritto nel manifest con fraction e rate_calibrated.
 - 2026-05-20 evening ET: **Five-class taxonomy adopted (committed).**
   Pilot n=1 sanity check after the four-class patch surfaced two
   retrospective reclassifications:
