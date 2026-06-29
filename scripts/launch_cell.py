@@ -455,32 +455,62 @@ def setup_pid_strategy(
 # ---------------------------------------------------------------------------
 
 
+def gpu_devices_for_cell(cell: dict) -> list[int]:
+    """Devices to sample: engine.gpu_devices (list, multi-GPU e.g. Dynamo) if
+    present, else the single engine.gpu_device."""
+    eng = cell["engine"]
+    if eng.get("gpu_devices"):
+        return [int(x) for x in eng["gpu_devices"]]
+    return [int(eng["gpu_device"])]
+
+
+def proc_prefix_for_cell(cell: dict) -> str:
+    """The proc-series prefix the analysis should read for this cell.
+
+    Multi-process cells expose monitors.components: the analysis reads the
+    engine aggregate (agg_<engine_group>). Single-process cells read the
+    proc monitor's label. Recorded in the manifest as manifest.proc_prefix.
+    """
+    monitors = cell["monitors"]
+    components = monitors.get("components")
+    if components:
+        return f"agg_{components.get('engine_group', 'engine')}"
+    return monitors["proc"]["label"]
+
+
 def spawn_monitors(
     repo_root: Path,
     run_dir: Path,
     cell: dict,
-    pidfile: Path,
+    pidfile: Optional[Path],
     duration_s: int,
     log_dir: Path,
     runs_root: Path,
     run_id: str,
 ) -> subprocess.Popen:
     monitors = cell["monitors"]
-    gpu_device = cell["engine"]["gpu_device"]
+    components = monitors.get("components")
+    gpu_indices = ",".join(str(d) for d in gpu_devices_for_cell(cell))
     cmd = [
         sys.executable,
         str(repo_root / "monitoring" / "run_monitors.py"),
         "--run-id", run_id,
         "--runs-root", str(runs_root),
-        "--gpu-index", str(gpu_device),
-        "--pidfile", str(pidfile),
+        "--gpu-indices", gpu_indices,
         "--duration-seconds", str(duration_s),
-        "--label-engine", monitors["proc"]["label"],
         "--gpu-period", str(monitors["gpu"]["period_s"]),
         "--proc-period", str(monitors["proc"]["period_s"]),
         "--system-period", str(monitors["system"]["period_s"]),
         "--rotation-seconds", str(monitors["rotation_s"]),
     ]
+    if components:
+        # Multi-process system (e.g. Dynamo): materialize the component spec and
+        # let run_monitors spawn the per-component multiproc monitor.
+        comp_file = run_dir / "components.json"
+        comp_file.write_text(json.dumps(components, indent=2))
+        cmd += ["--components-file", str(comp_file)]
+    else:
+        cmd += ["--pidfile", str(pidfile), "--label-engine", monitors["proc"]["label"]]
     log_path = log_dir / "run_monitors.log"
     log_f = log_path.open("ab", buffering=0)
     return subprocess.Popen(
@@ -837,6 +867,7 @@ def main() -> None:
         },
         "engine": cell["engine"],
         "monitors": cell["monitors"],
+        "proc_prefix": proc_prefix_for_cell(cell),
         "workload": cell["workload"],
         "duration_s": cell["duration_s"],
         "warmup_discard_s": cell["warmup_discard_s"],

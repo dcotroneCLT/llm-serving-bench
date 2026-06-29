@@ -71,6 +71,30 @@ def get_container_pid(container_name: str) -> Optional[int]:
         return None
 
 
+def cmdline_matches(
+    cmdline: str,
+    pattern: re.Pattern[str],
+    require: Optional[re.Pattern[str]] = None,
+    exclude: Optional[re.Pattern[str]] = None,
+) -> bool:
+    """Cmdline match predicate shared by the single-PID resolver and the
+    multi-process component monitor.
+
+    A cmdline matches when it matches `pattern`, AND (if given) matches
+    `require`, AND (if given) does NOT match `exclude`. `exclude` is what makes
+    the decode-vs-prefill split correct: decode = matches 'dynamo.vllm' but
+    NOT '--is-prefill-worker', so a naive positive-only regex would otherwise
+    pull prefill workers into the decode group.
+    """
+    if not pattern.search(cmdline):
+        return False
+    if require is not None and not require.search(cmdline):
+        return False
+    if exclude is not None and exclude.search(cmdline):
+        return False
+    return True
+
+
 def find_matching_descendant(
     root_pid: int, pattern: re.Pattern[str]
 ) -> Optional[psutil.Process]:

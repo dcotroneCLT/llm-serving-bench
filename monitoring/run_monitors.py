@@ -120,16 +120,29 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Spawn and supervise monitoring agents for one run.")
     p.add_argument("--run-id", type=str, required=True)
     p.add_argument("--runs-root", type=Path, required=True)
-    p.add_argument("--gpu-index", type=int, required=True)
-    p.add_argument("--pidfile", type=Path, required=True, help="File where the engine's PID will appear.")
-    p.add_argument("--duration-seconds", type=int, default=129600, help="Monitoring duration in seconds (default 36h to match the WoSAR 2026 campaign duration_s); 0 means run forever until signaled.")
-    p.add_argument("--label-engine", type=str, required=True, help="Engine label for the proc monitor CSV name.")
+    p.add_argument("--gpu-index", type=int, default=None, help="Single GPU to sample (single-device systems).")
+    p.add_argument("--gpu-indices", type=str, default=None, help="Comma-separated GPUs to sample (multi-device systems, e.g. Dynamo). Overrides --gpu-index.")
+    p.add_argument("--pidfile", type=Path, default=None, help="Single-process systems: file where the engine's PID appears.")
+    p.add_argument("--components-file", type=Path, default=None, help="Multi-process systems (e.g. Dynamo): JSON component spec for multiproc_monitor. Mutually exclusive with --pidfile.")
+    p.add_argument("--duration-seconds", type=int, default=129600, help="Monitoring duration in seconds (default 36h); 0 means run forever until signaled.")
+    p.add_argument("--label-engine", type=str, default="proc", help="Engine label for the single-process proc monitor CSV name.")
     p.add_argument("--gpu-period", type=float, default=1.0)
     p.add_argument("--proc-period", type=float, default=5.0)
     p.add_argument("--system-period", type=float, default=5.0)
     p.add_argument("--rotation-seconds", type=int, default=60)
     p.add_argument("--grace-period-s", type=float, default=15.0)
     args = p.parse_args()
+
+    # Resolve the GPU device list (multi-device for Dynamo; single otherwise).
+    if args.gpu_indices:
+        gpu_indices = [int(x) for x in args.gpu_indices.split(",") if x.strip() != ""]
+    elif args.gpu_index is not None:
+        gpu_indices = [args.gpu_index]
+    else:
+        gpu_indices = []
+    # Exactly one process-monitoring mode.
+    if bool(args.pidfile) == bool(args.components_file):
+        p.error("specify exactly one of --pidfile (single-process) or --components-file (multi-process)")
 
     run_dir = args.runs_root / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -141,7 +154,7 @@ def main() -> None:
         "run_id": args.run_id,
         "started_at": utc_iso(),
         "started_at_unix": started_at_unix,
-        "host": collect_host_info(args.gpu_index),
+        "host": collect_host_info(gpu_indices[0] if gpu_indices else 0),
         "args": vars(args).copy(),
         "monitors": [],
     }
@@ -150,72 +163,68 @@ def main() -> None:
 
     here = Path(__file__).parent
 
-    monitor_specs = [
-        (
-            "gpu",
+    # One GPU monitor per device (each writes gpu<idx>_*.csv).
+    monitor_specs: list[tuple[str, list[str], Path]] = []
+    for idx in gpu_indices:
+        monitor_specs.append((
+            f"gpu{idx}",
             [
-                sys.executable,
-                str(here / "gpu_monitor.py"),
-                "--gpu-index",
-                str(args.gpu_index),
-                "--output-dir",
-                str(run_dir),
-                "--period-seconds",
-                str(args.gpu_period),
-                "--rotation-seconds",
-                str(args.rotation_seconds),
+                sys.executable, str(here / "gpu_monitor.py"),
+                "--gpu-index", str(idx),
+                "--output-dir", str(run_dir),
+                "--period-seconds", str(args.gpu_period),
+                "--rotation-seconds", str(args.rotation_seconds),
             ],
-            log_dir / "gpu_monitor.log",
-        ),
-        (
+            log_dir / f"gpu_monitor_{idx}.log",
+        ))
+
+    # Process monitoring. proc_monitor / multiproc_monitor read smaps_rollup
+    # (USS/PSS), which needs PTRACE_MODE_READ_FSCREDS. On hosts with
+    # ptrace_scope=1 and a nosuid /home (file caps disabled for python), the
+    # only practical path is sudo -n with a NOPASSWD sudoers entry. We pass
+    # realpath(sys.executable) so the path matches the sudoers entry (sudo does
+    # not follow symlinks). CsvRotatingWriter chmod/chowns the output back to
+    # SUDO_USER so the CSVs stay readable by the analysis user.
+    if args.components_file is not None:
+        monitor_specs.append((
+            "proc",  # multi-process per-component monitor (Dynamo etc.)
+            [
+                "sudo", "-n", "--",
+                os.path.realpath(sys.executable),
+                str(here / "multiproc_monitor.py"),
+                "--components-file", str(args.components_file),
+                "--output-dir", str(run_dir),
+                "--period-seconds", str(args.proc_period),
+                "--rotation-seconds", str(args.rotation_seconds),
+            ],
+            log_dir / "multiproc_monitor.log",
+        ))
+    else:
+        monitor_specs.append((
             "proc",
-            # proc_monitor reads /proc/<pid>/smaps_rollup which requires
-            # PTRACE_MODE_READ_FSCREDS. On hosts with ptrace_scope=1 and a
-            # nosuid /home (which disables file capabilities for python),
-            # the only practical path is sudo. We invoke proc_monitor.py
-            # via sudo -n with a NOPASSWD entry in /etc/sudoers.d/.
-            #
-            # Use realpath(sys.executable) so the path passed to sudo matches
-            # the sudoers entry regardless of how Python was invoked: sudo
-            # path matching is strict and does NOT follow symlinks, so
-            # /home/.../envs/wosar/bin/python (symlink) would not match an
-            # entry for /home/.../envs/wosar/bin/python3.11 (the real binary).
-            #
-            # The CsvRotatingWriter chmods/chowns its output files so the
-            # resulting CSVs are readable by the original (non-root) user
-            # under SUDO_USER.
             [
                 "sudo", "-n", "--",
                 os.path.realpath(sys.executable),
                 str(here / "proc_monitor.py"),
-                "--pidfile",
-                str(args.pidfile),
-                "--label",
-                args.label_engine,
-                "--output-dir",
-                str(run_dir),
-                "--period-seconds",
-                str(args.proc_period),
-                "--rotation-seconds",
-                str(args.rotation_seconds),
+                "--pidfile", str(args.pidfile),
+                "--label", args.label_engine,
+                "--output-dir", str(run_dir),
+                "--period-seconds", str(args.proc_period),
+                "--rotation-seconds", str(args.rotation_seconds),
             ],
             log_dir / "proc_monitor.log",
-        ),
-        (
-            "system",
-            [
-                sys.executable,
-                str(here / "system_monitor.py"),
-                "--output-dir",
-                str(run_dir),
-                "--period-seconds",
-                str(args.system_period),
-                "--rotation-seconds",
-                str(args.rotation_seconds),
-            ],
-            log_dir / "system_monitor.log",
-        ),
-    ]
+        ))
+
+    monitor_specs.append((
+        "system",
+        [
+            sys.executable, str(here / "system_monitor.py"),
+            "--output-dir", str(run_dir),
+            "--period-seconds", str(args.system_period),
+            "--rotation-seconds", str(args.rotation_seconds),
+        ],
+        log_dir / "system_monitor.log",
+    ))
 
     procs: list[tuple[str, subprocess.Popen, Path]] = []
     for name, cmd, log_path in monitor_specs:

@@ -169,6 +169,13 @@ def infer_replica(name: str, manifest: Optional[dict] = None) -> Optional[str]:
 
 
 def proc_prefix_from_manifest(manifest: dict) -> Optional[str]:
+    # Explicit prefix wins: launch_cell records the proc series to analyze
+    # (single-process label, or the engine aggregate agg_<group> for
+    # multi-process systems like Dynamo). Old manifests lack it -> fall through.
+    explicit = manifest.get("proc_prefix")
+    if explicit:
+        return str(explicit)
+
     monitors = manifest.get("monitors")
     if isinstance(monitors, dict):
         proc = monitors.get("proc")
