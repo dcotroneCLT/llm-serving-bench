@@ -43,6 +43,93 @@ from prompt_sampler import PromptSampler
 from protocols import ProtocolAdapter
 
 
+# ---------------------------------------------------------------------------
+# Arrival processes
+#
+# Every process exposes next_interval() -> seconds until the next arrival.
+# poisson reproduces the historical exponential interarrival exactly (same
+# RNG draw on the shared engine RNG), so a poisson run is unchanged.
+# ---------------------------------------------------------------------------
+
+
+class PoissonArrival:
+    def __init__(self, rate: float, rng: random.Random) -> None:
+        self.rate = rate
+        self.rng = rng
+
+    def next_interval(self) -> float:
+        return self.rng.expovariate(self.rate) if self.rate > 0 else float("inf")
+
+
+class ConstantArrival:
+    def __init__(self, rate: float) -> None:
+        self.gap = 1.0 / rate if rate > 0 else float("inf")
+
+    def next_interval(self) -> float:
+        return self.gap
+
+
+class BurstyArrival:
+    """MMPP-2 on/off arrival process with the mean rate preserved.
+
+    Arrivals occur only during ON periods, at on_rate = rate * burst_factor;
+    the process spends a fraction 1/burst_factor of time ON, so the long-run
+    mean rate equals `rate` and only the variance (burstiness) changes. This
+    keeps the DoW "rate" factor comparable across Poisson and bursty levels.
+    burst_factor is the peak/mean ratio (CoV knob); on_seconds is the mean ON
+    sojourn (burst timescale). next_interval() returns the gap to the next
+    arrival, transparently spanning idle OFF periods.
+    """
+
+    def __init__(self, rate: float, rng: random.Random, burst_factor: float = 4.0, on_seconds: float = 10.0) -> None:
+        self.rng = rng
+        self.mean_rate = rate
+        self.burst_factor = max(1.0, float(burst_factor))
+        self.on_rate = rate * self.burst_factor if rate > 0 else 0.0
+        on_frac = 1.0 / self.burst_factor
+        self.mean_on = max(1e-6, float(on_seconds))
+        self.mean_off = self.mean_on * (1.0 - on_frac) / on_frac if on_frac < 1.0 else 0.0
+        self.in_on = True
+        self.t_left = self._draw_on()
+
+    def _draw_on(self) -> float:
+        return self.rng.expovariate(1.0 / self.mean_on)
+
+    def _draw_off(self) -> float:
+        return self.rng.expovariate(1.0 / self.mean_off) if self.mean_off > 0 else 0.0
+
+    def next_interval(self) -> float:
+        if self.mean_rate <= 0 or self.on_rate <= 0:
+            return float("inf")
+        elapsed = 0.0
+        while True:
+            if self.in_on:
+                gap = self.rng.expovariate(self.on_rate)
+                if gap <= self.t_left:
+                    self.t_left -= gap
+                    return elapsed + gap
+                elapsed += self.t_left
+                self.in_on = False
+                self.t_left = self._draw_off()
+            else:
+                elapsed += self.t_left
+                self.in_on = True
+                self.t_left = self._draw_on()
+
+
+def make_arrival_process(
+    arrival_mode: str, rate: float, rng: random.Random,
+    burst_factor: float = 4.0, burst_on_seconds: float = 10.0,
+):
+    mode = (arrival_mode or "poisson").lower()
+    if mode == "constant":
+        return ConstantArrival(rate)
+    if mode == "bursty":
+        return BurstyArrival(rate, rng, burst_factor=burst_factor, on_seconds=burst_on_seconds)
+    # default / "poisson"
+    return PoissonArrival(rate, rng)
+
+
 class CsvRotatingWriter:
     """Same idea as the monitoring writer, kept local to avoid cross-package imports."""
 
@@ -137,6 +224,9 @@ class BenchmarkEngine:
         seed: int = 0,
         prefix_repeat_fraction: float = 0.0,
         shared_prefix_len: int = 0,
+        arrival_mode: Optional[str] = None,
+        burst_factor: float = 4.0,
+        burst_on_seconds: float = 10.0,
     ) -> None:
         self.adapter = adapter
         self.sampler = sampler
@@ -146,9 +236,21 @@ class BenchmarkEngine:
         self.prompt_len = prompt_len
         self.max_tokens = max_tokens
         self.streaming_prob = streaming_prob
-        self.request_distribution = request_distribution
         self.rotation_seconds = rotation_seconds
         self.rng = random.Random(seed)
+
+        # arrival_mode supersedes the legacy request_distribution; the old
+        # field is still read for back-compat (poisson | constant). poisson
+        # uses the shared engine RNG with the same expovariate(rate) draw as
+        # before, so a poisson run is unchanged.
+        self.arrival_mode = (arrival_mode or request_distribution or "poisson").lower()
+        self.request_distribution = self.arrival_mode  # kept for any external reader
+        self.burst_factor = float(burst_factor)
+        self.burst_on_seconds = float(burst_on_seconds)
+        self.arrival = make_arrival_process(
+            self.arrival_mode, target_rate_rps, self.rng,
+            burst_factor=self.burst_factor, burst_on_seconds=self.burst_on_seconds,
+        )
 
         # Prefix-repeat injection. The shared prefix is built once, RNG-free,
         # so it is identical across requests (KV-cache reuse) and so that
@@ -281,6 +383,14 @@ class BenchmarkEngine:
         next_arrival = time.monotonic()
         last_state_persist = time.monotonic()
 
+        # Realized arrival statistics (streaming accumulators, no per-arrival
+        # storage). Measured on the actual dispatch instants so the recorded
+        # CoV reflects what the server saw, including bursty idle gaps.
+        arr_n = 0
+        arr_first = arr_last = arr_prev = None
+        arr_gap_sum = 0.0
+        arr_gap_sumsq = 0.0
+
         timeout = httpx.Timeout(self.adapter.timeout_s)
         limits = httpx.Limits(max_connections=self.concurrency_cap * 2, max_keepalive_connections=self.concurrency_cap)
         async with httpx.AsyncClient(timeout=timeout, limits=limits) as http:
@@ -296,6 +406,17 @@ class BenchmarkEngine:
                 req_id = self.req_id_next
                 self.req_id_next += 1
                 submitted_at_unix = time.time()
+
+                # Record the realized interarrival (on the monotonic clock).
+                arr_now = time.monotonic()
+                arr_n += 1
+                if arr_first is None:
+                    arr_first = arr_now
+                else:
+                    gap = arr_now - arr_prev
+                    arr_gap_sum += gap
+                    arr_gap_sumsq += gap * gap
+                arr_prev = arr_last = arr_now
 
                 if self.in_flight >= self.concurrency_cap:
                     self._drop(req_id, submitted_at_unix)
@@ -317,11 +438,10 @@ class BenchmarkEngine:
                 # With the accumulator, if the loop falls behind, next_arrival
                 # lands in the past and the `if now < next_arrival` guard above
                 # dispatches back-to-back to recover the long-run rate, which is
-                # the correct open-loop Poisson behavior.
-                if self.request_distribution == "poisson":
-                    inter = self.rng.expovariate(rate) if rate > 0 else float("inf")
-                else:
-                    inter = 1.0 / rate if rate > 0 else float("inf")
+                # the correct open-loop behavior. The arrival process owns the
+                # interarrival law (poisson / constant / bursty); poisson draws
+                # the same expovariate(rate) on the shared RNG as before.
+                inter = self.arrival.next_interval()
                 next_arrival += inter
 
                 # Periodic state persistence
@@ -339,3 +459,28 @@ class BenchmarkEngine:
                             t.cancel()
             self._persist_state()
             self.writer.close()
+
+            # Record the realized arrival statistics so the manifest can show
+            # what the server actually saw (esp. the bursty CoV vs poisson).
+            realized_dur = (arr_last - arr_first) if (arr_first is not None and arr_last is not None) else 0.0
+            mean_gap = (arr_gap_sum / (arr_n - 1)) if arr_n > 1 else float("nan")
+            cv = float("nan")
+            if arr_n > 2 and mean_gap and mean_gap == mean_gap and mean_gap > 0:
+                var = max(0.0, arr_gap_sumsq / (arr_n - 1) - mean_gap * mean_gap)
+                cv = (var ** 0.5) / mean_gap
+            stats = {
+                "arrival_mode": self.arrival_mode,
+                "target_rate_rps": self.target_rate_rps,
+                "realized_count": arr_n,
+                "realized_duration_s": realized_dur,
+                "realized_rate_rps": (arr_n / realized_dur) if realized_dur > 0 else 0.0,
+                "interarrival_mean_s": mean_gap,
+                "interarrival_cv": cv,
+            }
+            if self.arrival_mode == "bursty":
+                stats["burst_factor"] = self.burst_factor
+                stats["burst_on_seconds"] = self.burst_on_seconds
+            try:
+                (self.output_dir / "arrival_stats.json").write_text(json.dumps(stats, indent=2))
+            except OSError:
+                pass

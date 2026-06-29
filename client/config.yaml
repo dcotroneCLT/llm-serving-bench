@@ -46,7 +46,19 @@ streaming_prob: 0.7
 prefix_repeat_fraction: 0.0
 shared_prefix_len: 0
 
-# Inter-arrival distribution: poisson | constant
+# --- Arrival process ---
+# arrival_mode: poisson | constant | bursty. Supersedes the legacy
+# request_distribution field below (still read for back-compat when
+# arrival_mode is absent). bursty = MMPP-2 on/off with the SAME mean rate as
+# poisson (only the variance changes), so the DoW "rate" factor stays
+# comparable. burst_factor = peak/mean ratio (CoV knob); burst_on_seconds =
+# mean ON sojourn (burst timescale). DoW levels: poisson / bursty.
+arrival_mode: poisson
+burst_factor: 4.0
+burst_on_seconds: 10.0
+
+# Legacy inter-arrival distribution (poisson | constant). Kept for
+# back-compat; ignored when arrival_mode is set.
 request_distribution: poisson
 
 # --- Misc ---

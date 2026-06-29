@@ -95,6 +95,11 @@ def main() -> None:
         seed=int(cfg.get("seed", 0)),
         prefix_repeat_fraction=float(cfg.get("prefix_repeat_fraction", 0.0)),
         shared_prefix_len=int(cfg.get("shared_prefix_len", 0)),
+        # arrival_mode supersedes request_distribution; if absent, fall back to
+        # the legacy field so existing configs keep working unchanged.
+        arrival_mode=cfg.get("arrival_mode") or cfg.get("request_distribution", "poisson"),
+        burst_factor=float(cfg.get("burst_factor", 4.0)),
+        burst_on_seconds=float(cfg.get("burst_on_seconds", 10.0)),
     )
 
     loop = asyncio.new_event_loop()
