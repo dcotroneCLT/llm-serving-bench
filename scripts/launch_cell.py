@@ -722,6 +722,15 @@ def main() -> None:
         default=None,
         help="Override cell.duration_s. Used by sanity_runs.",
     )
+    p.add_argument(
+        "--calibration-file",
+        type=Path,
+        default=None,
+        help="JSON from scripts/calibrate_rate.py. If given, its "
+             "rate_calibrated_rps overrides the cell's target_rate_rps and the "
+             "ceiling/fraction/rate are recorded in the manifest. The rate is "
+             "fixed for the whole run (no mid-run re-calibration).",
+    )
     args = p.parse_args()
 
     # 1. Load and substitute placeholders.
@@ -845,6 +854,32 @@ def main() -> None:
 
     client_config = materialize_client_config(args.repo_root, run_dir, cell, replica)
     manifest["client_config_path"] = str(client_config)
+
+    # Apply the pre-run rate calibration, if provided. The calibrated rate is
+    # fixed for the whole run; capacity erosion over the window is a result we
+    # want to observe, not absorb by re-calibrating.
+    if args.calibration_file is not None:
+        try:
+            calib = json.loads(args.calibration_file.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            die(f"could not read calibration file {args.calibration_file}: {e}")
+        rate_cal = calib.get("rate_calibrated_rps")
+        if rate_cal is None:
+            die(f"calibration file has no rate_calibrated_rps (status={calib.get('status')!r}): {args.calibration_file}")
+        cfg = yaml.safe_load(client_config.read_text())
+        cfg["target_rate_rps"] = float(rate_cal)
+        client_config.write_text(yaml.safe_dump(cfg, sort_keys=False))
+        manifest["calibration"] = {
+            "source_file": str(args.calibration_file),
+            "ceiling_rps": calib.get("ceiling_rps"),
+            "ceiling_offered_rps": calib.get("ceiling_offered_rps"),
+            "fraction": calib.get("fraction"),
+            "rate_calibrated_rps": float(rate_cal),
+            "status": calib.get("status"),
+        }
+        log(f"calibration applied: ceiling={calib.get('ceiling_rps')} rps -> "
+            f"target_rate_rps={rate_cal} (fraction {calib.get('fraction')})")
+
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
     client_proc = spawn_client(args.repo_root, run_dir, client_config, duration_s, log_dir)
     log(f"client pid={client_proc.pid}")
