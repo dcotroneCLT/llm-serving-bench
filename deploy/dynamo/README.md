@@ -4,6 +4,11 @@ Local CLI deploy (no Kubernetes), single L40S box. Part of the 3-system
 extension campaign that holds **vLLM 0.20.1 identical** across Dynamo,
 Triton+vLLM, and standalone vLLM (see the pin files in `engines/*/image_pin*`).
 
+Authoritative constraints: **`docs/extension_pin_constraint.md`** (the vLLM pin)
+and EXPERIMENT_STATE.md "Standing constraints" SC-2 (disk-space management). The
+docker runs here cap container logs (`--log-opt`); keep the docker data-root on
+/home (not the 126G /var/lib).
+
 Pin history: 0.16.0 was the first choice but the box gate found Triton ships
 no 0.16.0 build (it skips from 0.15.1 at 26.02 to 0.17.1 at 26.03). The
 three-way native intersection is **0.20.1** (Dynamo 1.2.0 + Triton 26.05 +

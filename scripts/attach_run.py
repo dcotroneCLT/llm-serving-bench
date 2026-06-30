@@ -53,6 +53,8 @@ def main() -> None:
     p.add_argument("--engine-pid", type=int, default=None, help="Single-process systems: host PID of the running engine.")
     p.add_argument("--gpu-indices", type=str, default=None, help="Override GPU device list to sample, e.g. 0,1.")
     p.add_argument("--hf-cache-host", type=Path, default=Path(""), help="Only needed if the cell yaml references {hf_cache_host}.")
+    p.add_argument("--min-free-gb", type=float, default=20.0,
+                   help="SC-2 pre-run free-space gate (runs-root + docker data-root).")
     args = p.parse_args()
 
     cell_raw = yaml.safe_load(args.cell_yaml.read_text())
@@ -74,6 +76,10 @@ def main() -> None:
     log_dir = run_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     lc.log(f"attach run_id={run_id} run_dir={run_dir}")
+
+    # SC-2 #1: pre-run free-space gate (runs-root for CSVs, docker data-root for
+    # the hand-started containers' fs + logs).
+    lc.require_free_space([args.runs_root, lc.docker_root_dir()], args.min_free_gb, label=run_id)
 
     monitors = cell["monitors"]
     components = monitors.get("components")

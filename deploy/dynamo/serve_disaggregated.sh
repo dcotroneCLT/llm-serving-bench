@@ -36,7 +36,7 @@ for i in $(seq 1 "$N_DECODE");  do docker rm -f "${DYN_DECODE_PREFIX}_${i}"  >/d
 
 # --- Frontend (HTTP ingress + in-process KV router; no separate router PID) ---
 echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT"
-docker run -d --name "$DYN_FRONTEND_NAME" --network host "${COMMON_ENV[@]}" \
+docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
   "$DYNAMO_IMAGE" \
   python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT"
 
@@ -44,7 +44,7 @@ docker run -d --name "$DYN_FRONTEND_NAME" --network host "${COMMON_ENV[@]}" \
 for i in $(seq 1 "$N_PREFILL"); do
   echo "[dynamo] prefill #$i on gpu $PREFILL_GPU"
   docker run -d --name "${DYN_PREFILL_PREFIX}_${i}" --network host \
-    --gpus "\"device=${PREFILL_GPU}\"" "${COMMON_ENV[@]}" "${COMMON_MOUNT[@]}" \
+    --gpus "\"device=${PREFILL_GPU}\"" "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" "${COMMON_MOUNT[@]}" \
     "$DYNAMO_IMAGE" \
     python -m dynamo.vllm \
       --model "$MODEL" --max-model-len "$MAX_MODEL_LEN" \
@@ -56,7 +56,7 @@ done
 for i in $(seq 1 "$N_DECODE"); do
   echo "[dynamo] decode #$i on gpu $DECODE_GPU"
   docker run -d --name "${DYN_DECODE_PREFIX}_${i}" --network host \
-    --gpus "\"device=${DECODE_GPU}\"" "${COMMON_ENV[@]}" "${COMMON_MOUNT[@]}" \
+    --gpus "\"device=${DECODE_GPU}\"" "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" "${COMMON_MOUNT[@]}" \
     "$DYNAMO_IMAGE" \
     python -m dynamo.vllm \
       --model "$MODEL" --max-model-len "$MAX_MODEL_LEN" \

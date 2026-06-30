@@ -10,14 +10,14 @@ source "$(dirname "$0")/env.sh"
 docker rm -f "$ETCD_NAME" "$NATS_NAME" >/dev/null 2>&1 || true
 
 echo "[infra] starting etcd ($ETCD_IMAGE)"
-docker run -d --name "$ETCD_NAME" --network host "$ETCD_IMAGE" \
+docker run -d --name "$ETCD_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "$ETCD_IMAGE" \
   /usr/local/bin/etcd \
   --listen-client-urls "http://0.0.0.0:${ETCD_CLIENT_PORT}" \
   --advertise-client-urls "http://localhost:${ETCD_CLIENT_PORT}" \
   --listen-peer-urls "http://0.0.0.0:${ETCD_PEER_PORT}"
 
 echo "[infra] starting NATS ($NATS_IMAGE) with JetStream"
-docker run -d --name "$NATS_NAME" --network host "$NATS_IMAGE" \
+docker run -d --name "$NATS_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "$NATS_IMAGE" \
   -js -p "$NATS_PORT"
 
 echo "[infra] up. etcd :$ETCD_CLIENT_PORT  nats :$NATS_PORT"

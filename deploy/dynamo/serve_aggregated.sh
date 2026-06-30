@@ -17,12 +17,12 @@ COMMON_ENV=(
 docker rm -f "$DYN_FRONTEND_NAME" "$DYN_AGG_WORKER_NAME" >/dev/null 2>&1 || true
 
 echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT"
-docker run -d --name "$DYN_FRONTEND_NAME" --network host "${COMMON_ENV[@]}" \
+docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
   "$DYNAMO_IMAGE" \
   python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT"
 
 echo "[dynamo] worker on gpu $AGG_GPU"
-docker run -d --name "$DYN_AGG_WORKER_NAME" --network host \
+docker run -d --name "$DYN_AGG_WORKER_NAME" --network host "${DOCKER_LOG_OPTS[@]}" \
   --gpus "\"device=${AGG_GPU}\"" "${COMMON_ENV[@]}" \
   -v "${HF_CACHE}:/root/.cache/huggingface" \
   "$DYNAMO_IMAGE" \

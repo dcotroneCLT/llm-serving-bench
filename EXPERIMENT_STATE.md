@@ -62,6 +62,59 @@ every wasted run is a wasted day.
 
 ---
 
+## Standing constraints (extension campaign) — READ BEFORE RUNNING ANYTHING
+
+### SC-1. Cross-system vLLM pin (hard)
+All three systems (Dynamo / Triton+vLLM / standalone) run the IDENTICAL vLLM,
+pinned by image digest, from the NATIVE three-way intersection; verified on the
+box by `pip show vllm` (remote notes are NOT authoritative). Full statement +
+version map + current pin (0.20.1) in **`docs/extension_pin_constraint.md`**.
+Never bump one system's release alone.
+
+### SC-2. Disk-space management (hard, enforced in code — not by discipline)
+The preprint campaign hit disk exhaustion (Docker images/layers + container
+json-file logs on the 126G `/var/lib` data-root, NOT the trace CSVs). The
+extension is higher-risk (3 large new images, per-component monitoring multiplies
+Dynamo CSVs, 2 GPUs sampled). Enforce in code:
+
+1. **Pre-run free-space GATE** — refuse to start a run if free space on the
+   runs-root AND the docker data-root is below a configurable threshold.
+   STATUS: implemented in `launch_cell.py` + `attach_run.py` (helper
+   `require_free_space`).
+2. **Mid-run disk WATCHDOG** — if free space drops below a floor during a run,
+   trigger a GRACEFUL teardown (finalize manifest, stop cleanly) and mark the
+   run for reschedule; never let a run die uncontrolled. STATUS: to land with
+   the lifecycle/orchestration refactor (post-gate), in the supervise loops.
+3. **Docker container log rotation** on every `docker run`:
+   `--log-opt max-size=50m --log-opt max-file=3`. STATUS: implemented in
+   `deploy/dynamo/*.sh`, `launch_cell.build_docker_run_cmd`, README.
+4. **Gzip rotated CSV segments** on rotation (client per-request CSV is the
+   largest single stream). STATUS: to land with the lifecycle, together with
+   making the analysis readers (`aging_io`, `aging_trends`, gate checker,
+   calibrate) transparently read `.csv` and `.csv.gz`. Deferred deliberately so
+   the CSV read path is not changed in the same step the gate validates it.
+5. **Images pre-pulled ONCE, reused across all runs** (never a per-run pull;
+   launch_cell/attach verify the local digest, they do not pull). **Docker
+   data-root MUST be on /home (6.9T), not /var/lib (126G)** — ADR-002's move was
+   lost; restore it before the campaign (ops action on the box: set
+   `data-root` in `/etc/docker/daemon.json` to `/home/dcotrone/docker-data`,
+   restart docker, re-pull the 3 images). Cleanup discipline: `docker system df`,
+   `docker image prune`, remove superseded pins.
+6. **Footprint estimate (computed 2026-06-29).** Per 48h run, new layout:
+   - gpu 1 Hz x 2 GPUs ~= 100 MB; system 5 s ~= 7 MB; proc/per-component:
+     single-process ~7 MB, Dynamo (5 components + 2 aggregates @ 5 s) ~50 MB;
+     client per-request (the largest) ~70-300 MB depending on rate.
+   - => ~0.15-0.25 GB/run single-process, ~0.26-0.46 GB/run Dynamo (uncompressed);
+     gzip ~5-10x smaller.
+   - x ~57 runs + calibrations + 1-2 7-day runs => ~20-35 GB uncompressed
+     (~3-7 GB gzipped) of TRACE data -> trivial on /home (6.3T).
+   - **Conclusion: the trace CSVs are NOT the disk risk.** The risk is Docker
+     images (~75 GB for 3) + 48h container json-file logs, both on the 126G
+     data-root. Hence the priority order: data-root on /home (#5) + log rotation
+     (#3) >> CSV gzip (#4).
+
+---
+
 ## Paper framing (the key decision)
 
 The camera-ready WoSAR 2026 paper is a **standalone study on n=3 data**.

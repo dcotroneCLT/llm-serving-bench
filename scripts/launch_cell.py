@@ -125,6 +125,47 @@ def die(msg: str, rc: int = 1) -> None:
     sys.exit(rc)
 
 
+def free_gb(path: Path) -> float:
+    try:
+        return shutil.disk_usage(str(path)).free / (1024 ** 3)
+    except OSError:
+        return float("inf")
+
+
+def docker_root_dir() -> Optional[Path]:
+    """The Docker data-root volume (where images/layers/container logs live)."""
+    try:
+        r = subprocess.run(["docker", "info", "-f", "{{.DockerRootDir}}"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and r.stdout.strip():
+            return Path(r.stdout.strip())
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return None
+
+
+def require_free_space(paths: list[Optional[Path]], min_gb: float, label: str = "run") -> None:
+    """SC-2 #1: pre-run free-space GATE across the distinct filesystems behind
+    `paths` (runs-root for CSVs, docker data-root for images/container logs).
+    Refuses to start if any is below min_gb."""
+    seen: set = set()
+    for p in paths:
+        if p is None:
+            continue
+        try:
+            key = os.stat(str(p)).st_dev
+        except OSError:
+            key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        g = free_gb(p)
+        log(f"free-space gate: {p} has {g:.1f} GB free")
+        if g < min_gb:
+            die(f"free-space gate: {p} has {g:.1f} GB < {min_gb} GB required to start {label}. "
+                f"Free space (docker image prune; move data-root to /home) or lower --min-free-gb.", rc=7)
+
+
 def render(template: str, **subs: str) -> str:
     """Substitute {placeholder} tokens in a template string."""
     out = template
@@ -280,6 +321,9 @@ def build_docker_run_cmd(
         "--name", container_name,
         "--gpus", f'"device={eng["gpu_device"]}"',
         "--shm-size", eng["shm_size"],
+        # SC-2 #3: cap container json-file logs so a 48h run cannot fill the
+        # docker data-root disk.
+        "--log-opt", "max-size=50m", "--log-opt", "max-file=3",
     ]
     for port_map in eng.get("port_mapping", []):
         cmd += ["-p", port_map]
@@ -753,6 +797,13 @@ def main() -> None:
         help="Override cell.duration_s. Used by sanity_runs.",
     )
     p.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=20.0,
+        help="SC-2 pre-run free-space gate: refuse to start if free space on the "
+             "runs-root or the docker data-root is below this (GB).",
+    )
+    p.add_argument(
         "--calibration-file",
         type=Path,
         default=None,
@@ -794,6 +845,10 @@ def main() -> None:
 
     log(f"run_id={run_id}")
     log(f"run_dir={run_dir}")
+
+    # SC-2 #1: pre-run free-space gate (runs-root for CSVs, docker data-root for
+    # images + 48h container logs).
+    require_free_space([args.runs_root, docker_root_dir()], args.min_free_gb, label=run_id)
 
     # 2. Verify image pin.
     pin = load_image_pin(args.repo_root / cell["engine"]["digest_pin_file"])

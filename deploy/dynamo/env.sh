@@ -44,6 +44,10 @@ N_DECODE="${N_DECODE:-1}"
 ETCD_IMAGE="${ETCD_IMAGE:-quay.io/coreos/etcd:v3.5.21}"
 NATS_IMAGE="${NATS_IMAGE:-nats:2.11-alpine}"
 
+# Docker container log rotation (SC-2 #3): cap json-file logs so a 48h
+# container cannot fill the OS/data-root disk. Used on every docker run.
+DOCKER_LOG_OPTS=(--log-opt max-size=50m --log-opt max-file=3)
+
 # Container names (so teardown is deterministic).
 ETCD_NAME="${ETCD_NAME:-dyn_etcd}"
 NATS_NAME="${NATS_NAME:-dyn_nats}"
