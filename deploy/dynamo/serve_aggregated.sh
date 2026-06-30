@@ -37,18 +37,26 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 
+# Frontend snapshots the model registry at startup and won't pick up a model that
+# finalizes later, so (re)start it and check /v1/models; if empty, restart and
+# retry. See serve_disaggregated.sh for the full rationale.
 echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT"
-docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
-  "$DYNAMO_IMAGE" \
-  python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT"
-
-echo "[dynamo] waiting for /v1/models to list the model..."
-for _ in $(seq 1 24); do
-  if curl -sf "http://localhost:${FRONTEND_HTTP_PORT}/v1/models" 2>/dev/null | grep -q '"id"'; then
-    echo "[dynamo] model is served"; break
-  fi
-  sleep 5
+served=0
+for attempt in $(seq 1 6); do
+  docker rm -f "$DYN_FRONTEND_NAME" >/dev/null 2>&1 || true
+  docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
+    "$DYNAMO_IMAGE" \
+    python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
+  for _ in $(seq 1 6); do   # ~30s per attempt
+    if curl -sf "http://localhost:${FRONTEND_HTTP_PORT}/v1/models" 2>/dev/null | grep -q '"id"'; then
+      served=1; break
+    fi
+    sleep 5
+  done
+  [ "$served" = 1 ] && { echo "[dynamo] model is served (frontend attempt $attempt)"; break; }
+  echo "[dynamo] /v1/models still empty; restarting frontend (attempt $attempt)..."
 done
+[ "$served" = 1 ] || echo "[dynamo] WARNING: model not served after frontend restarts; check worker logs."
 
 echo "[dynamo] launched: 1 worker + frontend."
 echo "[dynamo] readiness: curl -sf http://localhost:${FRONTEND_HTTP_PORT}/v1/models"

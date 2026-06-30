@@ -95,19 +95,29 @@ for c in "${WORKER_NAMES[@]}"; do
 done
 
 # --- Frontend (HTTP ingress + in-process KV router; no separate router PID) ---
+# The frontend snapshots the model registry at startup and does NOT pick up a
+# model that finalizes afterward, even minutes later (observed: a frontend
+# started right after the workers log "Registered base model" serves an empty
+# /v1/models for 2+ min, while a plain restart once the workers are fully ready
+# serves immediately). So the reliable readiness signal is to (re)start the
+# frontend and check /v1/models; if empty, restart and retry.
 echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT"
-docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
-  "$DYNAMO_IMAGE" \
-  python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT"
-
-# Confirm the model is actually served before declaring the stack up.
-echo "[dynamo] waiting for /v1/models to list the model..."
-for _ in $(seq 1 24); do
-  if curl -sf "http://localhost:${FRONTEND_HTTP_PORT}/v1/models" 2>/dev/null | grep -q '"id"'; then
-    echo "[dynamo] model is served"; break
-  fi
-  sleep 5
+served=0
+for attempt in $(seq 1 6); do
+  docker rm -f "$DYN_FRONTEND_NAME" >/dev/null 2>&1 || true
+  docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
+    "$DYNAMO_IMAGE" \
+    python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
+  for _ in $(seq 1 6); do   # ~30s per attempt
+    if curl -sf "http://localhost:${FRONTEND_HTTP_PORT}/v1/models" 2>/dev/null | grep -q '"id"'; then
+      served=1; break
+    fi
+    sleep 5
+  done
+  [ "$served" = 1 ] && { echo "[dynamo] model is served (frontend attempt $attempt)"; break; }
+  echo "[dynamo] /v1/models still empty; restarting frontend (attempt $attempt)..."
 done
+[ "$served" = 1 ] || echo "[dynamo] WARNING: model not served after frontend restarts; check worker logs."
 
 echo "[dynamo] launched: ${N_PREFILL} prefill + ${N_DECODE} decode + frontend (planner/autoscaler NOT started)."
 echo "[dynamo] readiness: curl -sf http://localhost:${FRONTEND_HTTP_PORT}/v1/models"

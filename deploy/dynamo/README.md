@@ -98,9 +98,13 @@ All real-hardware issues, found by the STEP 1 gate before any 48h run:
 - **distinct `VLLM_NIXL_SIDE_CHANNEL_PORT` per worker** (5600, 5601, ...): all
   workers share the host network and otherwise clash on the default 5600
   ("Address already in use" in the NIXL handshake listener).
-- **start order**: workers first, frontend last (the script waits for each worker
-  to log "Registered base model", then for `/v1/models`). A frontend started
-  before registration serves an empty `/v1/models` and 404s every request.
+- **frontend start + restart-retry**: the frontend snapshots the model registry
+  at startup and does NOT pick up a model that finalizes afterward (a frontend
+  started right after the workers log "Registered base model" serves an empty
+  `/v1/models` for 2+ min; a plain restart once the workers are fully ready
+  serves immediately). So the script launches workers first, then (re)starts the
+  frontend and polls `/v1/models`, restarting it until the model is listed. A
+  frontend that serves an empty `/v1/models` 404s every request.
 
 Known benign warning: `'EngineCoreProc' object has no attribute
 get_kv_cache_group_metadata` — a Dynamo-1.2.0/vLLM-0.20.1 API drift that falls
