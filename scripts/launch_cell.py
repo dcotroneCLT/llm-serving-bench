@@ -522,6 +522,30 @@ def proc_prefix_for_cell(cell: dict) -> str:
     return monitors["proc"]["label"]
 
 
+class CalibrationError(Exception):
+    """A calibration file cannot be accepted for a production run."""
+
+
+def resolve_calibrated_rate(calib: dict, allow_lower_bound: bool) -> float:
+    """Return the calibrated rate to apply, or raise CalibrationError.
+
+    Only an `ok` calibration is accepted by default: a non-saturated ceiling
+    (status did_not_saturate / no_stable_point) makes the DoW 'fraction-of-
+    ceiling' rate factor meaningless. allow_lower_bound is the explicit operator
+    override (recorded in the manifest)."""
+    rate_cal = calib.get("rate_calibrated_rps")
+    if rate_cal is None:
+        raise CalibrationError(
+            f"calibration file has no rate_calibrated_rps (status={calib.get('status')!r})")
+    status = (calib.get("status") or "").strip().lower()
+    if status != "ok" and not allow_lower_bound:
+        raise CalibrationError(
+            f"calibration status={status!r} (not 'ok'): the ceiling is not a saturated value, "
+            f"so the fraction-of-ceiling rate is meaningless. Re-calibrate, or pass "
+            f"--allow-lower-bound-calibration to override deliberately.")
+    return float(rate_cal)
+
+
 def merge_component_identity(cell: dict, identity_path: Path) -> None:
     """Inject the bring-up's recorded PGID identity into the cell's component
     specs, IN PLACE, so the materialized components.json scopes the monitor to
@@ -848,6 +872,14 @@ def main() -> None:
              "ceiling/fraction/rate are recorded in the manifest. The rate is "
              "fixed for the whole run (no mid-run re-calibration).",
     )
+    p.add_argument(
+        "--allow-lower-bound-calibration",
+        action="store_true",
+        help="Permit a calibration whose status != 'ok' (e.g. did_not_saturate, "
+             "where the ceiling is only a lower bound). Off by default: a "
+             "non-saturated ceiling makes the 'fraction-of-ceiling' rate factor "
+             "meaningless and must be an explicit, recorded operator decision.",
+    )
     args = p.parse_args()
 
     # 1. Load and substitute placeholders.
@@ -985,9 +1017,10 @@ def main() -> None:
             calib = json.loads(args.calibration_file.read_text())
         except (OSError, json.JSONDecodeError) as e:
             die(f"could not read calibration file {args.calibration_file}: {e}")
-        rate_cal = calib.get("rate_calibrated_rps")
-        if rate_cal is None:
-            die(f"calibration file has no rate_calibrated_rps (status={calib.get('status')!r}): {args.calibration_file}")
+        try:
+            rate_cal = resolve_calibrated_rate(calib, args.allow_lower_bound_calibration)
+        except CalibrationError as e:
+            die(f"{e} (file: {args.calibration_file})", rc=5)
         cfg = yaml.safe_load(client_config.read_text())
         cfg["target_rate_rps"] = float(rate_cal)
         client_config.write_text(yaml.safe_dump(cfg, sort_keys=False))
@@ -998,6 +1031,7 @@ def main() -> None:
             "fraction": calib.get("fraction"),
             "rate_calibrated_rps": float(rate_cal),
             "status": calib.get("status"),
+            "allow_lower_bound_override": bool(args.allow_lower_bound_calibration),
         }
         log(f"calibration applied: ceiling={calib.get('ceiling_rps')} rps -> "
             f"target_rate_rps={rate_cal} (fraction {calib.get('fraction')})")

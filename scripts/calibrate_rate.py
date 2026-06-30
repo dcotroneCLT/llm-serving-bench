@@ -186,6 +186,13 @@ def run_one_rate(
     return stats
 
 
+def exit_code_for_status(status: str) -> int:
+    """Single source of truth for the calibration verdict -> process exit code.
+    0 ok; 3 no_stable_point (no ceiling at all); 4 did_not_saturate (ceiling is
+    only a lower bound, so a fraction-of-ceiling rate is not meaningful)."""
+    return {"ok": 0, "no_stable_point": 3, "did_not_saturate": 4}.get(status, 0)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Per-cell rate calibration (conservative ceiling).")
     p.add_argument("--config", type=Path, required=True, help="Materialized client config for the cell (all factors except rate).")
@@ -268,10 +275,17 @@ def main() -> None:
     args.output.write_text(json.dumps(out, indent=2))
     print(f"[calibrate] status={status} ceiling={out['ceiling_rps']} "
           f"rate_calibrated={out['rate_calibrated_rps']} -> {args.output}", flush=True)
+    # Exit codes carry the calibration verdict so callers (launch_cell / the
+    # campaign) can refuse a non-saturated ceiling without re-parsing the file.
     if status == "no_stable_point":
-        sys.exit(3)
-    if status == "did_not_saturate":
-        print("[calibrate] WARNING: sweep never saturated; extend --rates upward.", file=sys.stderr)
+        print("[calibrate] ERROR: no stable operating point found in the sweep.", file=sys.stderr)
+    elif status == "did_not_saturate":
+        print("[calibrate] ERROR: sweep never saturated; the ceiling is only a LOWER BOUND, "
+              "so a 'fraction-of-ceiling' rate is not meaningful. Extend --rates upward and "
+              "re-run.", file=sys.stderr)
+    code = exit_code_for_status(status)
+    if code:
+        sys.exit(code)
 
 
 if __name__ == "__main__":
