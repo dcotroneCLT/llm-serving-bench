@@ -110,7 +110,20 @@ DO NOT use `campaign.py` for 48h DoW until BATCH 2 is done and gate 2 re-passed.
     must print `VERDICT: COMPLETE`. Local synthetic-process-group test confirms
     the scoping/membership logic (exact membership, EngineCore-child summed, stray
     excluded+flagged, under-count -> incomplete).
-- #2 reaper, #3 aging_trends multi-GPU, #4 validation_check refuse: TODO (next).
+- **#2 orphan reaper DONE** (attach path; launch_cell wiring lands with BATCH 2).
+  `scripts/reaper.py`: at spawn, `record_children` writes `run_dir/child_pids.json`
+  and upserts a per-runs-root ledger `<runs-root>/.active_children.json`. At run
+  start, `reap_orphans` SIGKILLs the process GROUP of any recorded child of a
+  prior run, but ONLY if the live cmdline still carries BOTH that run-id AND one
+  of OUR_SCRIPTS (run_monitors/multiproc_monitor/proc_monitor/gpu_monitor/
+  system_monitor/run_client) -- PID-reuse-safe and scoped. Root-owned children
+  (the sudo'd proc monitor) are killed via `sudo -n kill`. Grandchild monitor
+  pids are read from `monitor_manifest.json`. Wired into `attach_run.py` (reap
+  before spawn, record after). Engine containers are NOT reaped on the attach
+  path (engine brought up by hand). Synthetic test confirms: orphan with matching
+  run-id+script killed; decoy with the run-id but a foreign script spared; decoy
+  with our script but a different run-id spared.
+- #3 aging_trends multi-GPU, #4 validation_check refuse: TODO (next).
 
 Reminders: env `conda activate wosar`; always pass `--repo-root
 /home/dcotrone/wosar/llm-serving-bench` (absolute) so the sudo'd monitor path

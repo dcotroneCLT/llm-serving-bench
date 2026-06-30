@@ -40,6 +40,7 @@ from typing import Any, Optional
 import yaml  # type: ignore
 
 import launch_cell as lc
+import reaper
 
 
 def main() -> None:
@@ -85,6 +86,13 @@ def main() -> None:
     # SC-2 #1: pre-run free-space gate (runs-root for CSVs, docker data-root for
     # the hand-started containers' fs + logs).
     lc.require_free_space([args.runs_root, lc.docker_root_dir()], args.min_free_gb, label=run_id)
+
+    # Pre-run orphan reaper: kill leftover monitor/client children of a prior run
+    # (run-id + script-name verified, PID-reuse-safe) so they cannot contaminate
+    # this run's load or CSVs. Engine containers are NOT touched here (the engine
+    # is brought up by hand on the attach path).
+    for line in reaper.reap_orphans(args.runs_root, current_run_id=run_id):
+        lc.log(line)
 
     monitors = cell["monitors"]
     components = monitors.get("components")
@@ -136,6 +144,10 @@ def main() -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
     client_proc = lc.spawn_client(args.repo_root, run_dir, client_config, duration_s, log_dir)
     lc.log(f"client pid={client_proc.pid}")
+
+    # Record this run's children so a future run's pre-run reaper can clean them
+    # up if this launcher dies without running its finally block.
+    reaper.record_children(args.runs_root, run_dir, run_id, monitors_proc.pid, client_proc.pid)
 
     interrupted = False
 
