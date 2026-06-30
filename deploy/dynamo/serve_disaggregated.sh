@@ -119,7 +119,22 @@ for attempt in $(seq 1 6); do
 done
 [ "$served" = 1 ] || echo "[dynamo] WARNING: model not served after frontend restarts; check worker logs."
 
+# Record each component's process-group identity so the monitor scopes to EXACTLY
+# these PGIDs (not a host-wide cmdline regex). One --component per label, with all
+# instance containers of that label grouped together.
+PREFILL_CONTAINERS=(); for i in $(seq 1 "$N_PREFILL"); do PREFILL_CONTAINERS+=("${DYN_PREFILL_PREFIX}_${i}"); done
+DECODE_CONTAINERS=();  for i in $(seq 1 "$N_DECODE");  do DECODE_CONTAINERS+=("${DYN_DECODE_PREFIX}_${i}");  done
+echo "[dynamo] recording component PGID identity -> $COMPONENT_PIDS_FILE"
+python3 "$(dirname "$0")/record_component_pids.py" --engine-group "${DYN_ENGINE_GROUP:-dynamo}" \
+  --out "$COMPONENT_PIDS_FILE" \
+  --component dynamo_frontend "$DYN_FRONTEND_NAME" \
+  --component dynamo_prefill  "${PREFILL_CONTAINERS[@]}" \
+  --component dynamo_decode   "${DECODE_CONTAINERS[@]}" \
+  --component etcd            "$ETCD_NAME" \
+  --component nats            "$NATS_NAME"
+
 echo "[dynamo] launched: ${N_PREFILL} prefill + ${N_DECODE} decode + frontend (planner/autoscaler NOT started)."
 echo "[dynamo] readiness: curl -sf http://localhost:${FRONTEND_HTTP_PORT}/v1/models"
+echo "[dynamo] component identity: $COMPONENT_PIDS_FILE"
 echo "[dynamo] host process tree (freeze these cmdlines into the cell yaml regexes):"
 echo "         ps -eo pid,cmd | grep -E 'dynamo.frontend|dynamo.vllm' | grep -v grep"

@@ -27,24 +27,90 @@ setup is done:
 - **sudoers** `/etc/sudoers.d/wosar_proc_monitor` now also allows
   `multiproc_monitor.py` (absolute path), verified without cached creds.
 
-**WAITING ON:** gate run 1 (vLLM standalone) launched in tmux `gate1`, logging to
-`~/wosar/gate1.log` (~24 min, unattended). It runs attach_run on
-`campaigns/extension/cells/val_vllm.yaml` then `analysis/validate_extension_run.py`
-on `~/wosar/runs/ext_attach_val_vllm_r01`.
+**GATE 1 & GATE 2: BOTH PASS** (2026-06-30). Gate 1 (vLLM standalone, single-
+process byte-compat) and gate 2 (Dynamo disaggregated, multi-process) both green
+on real hardware. Dynamo disaggregated bring-up validated end-to-end; 6 real bugs
+caught by the gate and committed: `5a2a5fc` (disaggregation-mode + regex),
+`4cc3357` (etcd 127.0.0.1), `f84e047` (NIXL kv-transfer + root cache + start
+order), `e673df6` (frontend restart-retry). All in `deploy/dynamo/README.md`.
+Component regexes in `val_dynamo_disagg.yaml` frozen against the real `ps` tree.
 
-**NEXT (resume):**
-1. Read `~/wosar/gate1.log` -> the "GATE CHECKER" section. Expect `GATE: PASS`:
-   `[3]` shared_prefix ~0.80 + bursty CoV >> 1; `[4]` aging_trends emits
-   proc.uss_bytes. (`[1]/[2]` skipped: single-process.) This is the
-   single-process byte-compat confirmation.
-2. Then **gate run 2 — Dynamo disaggregated**: `bash deploy/dynamo/infra_up.sh`
-   + `serve_disaggregated.sh`; confirm `python -m dynamo.* --help` flags; FREEZE
-   the component regexes in `val_dynamo_disagg.yaml` against the real
-   `ps -eo pid,cmd | grep dynamo`; attach_run; gate checker (all 5 points).
-3. Gate PASS (both runs) => only THEN the serial campaign + Dynamo lifecycle
-   refactor (campaign.py/launch_cell), per the de-risk discipline.
-   Remaining SC-2 items to land WITH that refactor: #2 mid-run disk watchdog,
-   #4 gzip rotated CSV (+ gz-aware readers).
+**NOW: REFACTOR FIRST, then the long test (decided 2026-06-30).** A soak test
+before the refactor would exercise code we are about to replace (host-wide
+scoping, no lifecycle, no mid-run watchdog) and would have to be repeated. So we
+do BATCH 1 then BATCH 2, and the long test runs on the PRODUCTION path — where it
+simultaneously validates the refactor (unattended lifecycle bring-up/teardown,
+serial scheduling, disk watchdog), runs safely (the BATCH 2 watchdog is what
+makes a long unattended run safe), and becomes the first run whose data starts to
+be trustworthy (BATCH 1 = per-PID scoping + multi-GPU in). Order:
+  BATCH 1 (data integrity) -> BATCH 2 (serial + lifecycle + watchdog +
+  calibration enforce) -> LONG TEST on the production path.
+
+**PLAN (reordered after Domenico's static review, 2026-06-29). Coordinated by the
+review chat; Domenico relays prompts to Claude Code.**
+
+Three findings corrupt data SILENTLY (you don't notice) vs merely kill a run
+(you do) — fix the silent ones first.
+
+BATCH 1 — data integrity, BEFORE trusting any Dynamo run / production:
+1. Dynamo PID scoping by RECORDED pids from bring-up, NOT host-wide regex.
+   Bring-up writes a component PID/PGID file; monitor verifies EXACT membership;
+   `n_matched != expected_count` (over OR under) => tick incomplete, never `>=`.
+   (Today: `root_pid: null` -> host-wide `process_iter` + `>=` can sum a stale/
+   duplicate worker into the aggregate USS. Regex becomes a sanity-check.)
+2. Orphan reaper: child PIDs/PGID written at start; pre-run reaper kills
+   leftovers before a new run starts. (Coupled with #1: stops orphan pollution.)
+3. `aging_trends.py` multi-GPU aware: aggregate ALL `gpu*_000000.csv`, not the
+   first (Dynamo = 2 GPU, half the GPU signal is currently dropped).
+4. `validation_check.py`: hard-refuse multi-process runs -> `validate_extension_run.py`.
+
+THEN re-confirm gate 2 with hardened scoping: engine USS aggregate = clean sum of
+exactly {frontend, prefill-group, decode-group}, infra (etcd+nats) separate, both
+GPUs sampled. Freeze regexes.
+
+BATCH 2 — unattended-safe, BEFORE production 48h, after gate 2 PASS:
+- Serial `campaign.py` (no parallel slots) + full Dynamo lifecycle in
+  `launch_cell` (bring-up/readiness/teardown), reusing the BATCH 1 PID file.
+- Dynamo scripts fail HARD on incomplete bring-up (non-zero exit if frontend/
+  workers don't register the model; not a silent `set -uo pipefail` pass).
+- `launch_cell` rejects calibration `status != "ok"` (a non-saturated ceiling
+  makes "30%/85% of ceiling" meaningless -> invalidates the DoW rate factor).
+- Mid-run disk watchdog (extend `_common.py` Watchdog) -> graceful teardown +
+  reschedule below floor; gzip rotated CSV (+ gz-aware readers). Fix ALL disk
+  checks (`smoke_test.sh`, `campaign_health.sh`, `server_setup.md`) to use the
+  real DockerRootDir + runs-root, NOT `/var/lib`, so the watchdog watches the
+  correct filesystem.
+
+DO NOT use `campaign.py` for 48h DoW until BATCH 2 is done and gate 2 re-passed.
+
+**BATCH 1 progress (2026-06-30):**
+- **#1 PGID scoping DONE** (not yet box-re-passed). Mechanism: the bring-up
+  (`deploy/dynamo/record_component_pids.py`, called at the end of
+  `serve_disaggregated.sh`) records each component's host PGID
+  (`docker inspect .State.Pid` -> `os.getpgid`) to an identity file
+  (`$COMPONENT_PIDS_FILE`, default `~/wosar/dynamo_component_pids.json`).
+  `attach_run --component-pids <file>` (BATCH 2: `launch_cell`) merges the pgids
+  into `components.json` via `launch_cell.merge_component_identity` (fails hard on
+  a missing component or an expected_count mismatch). `multiproc_monitor` sums
+  EXACTLY the processes whose PGID is in the recorded set (captures EngineCore
+  forks in the same group), requires EXACT membership
+  (`n_pgids_alive == expected`, never `>=`), and counts any regex match OUTSIDE
+  the recorded pgids into `n_pids_unexpected` without summing it. The cmdline
+  regexes in `val_dynamo_disagg.yaml` are now a SANITY CHECK / labeling aid, not
+  the identity source. Single-process path (`proc_monitor` + engine.pid) is
+  untouched and byte-compatible.
+  - **Diagnostic vs red flag (locked):** `n_pids_unexpected` is a PURE PER-TICK
+    DIAGNOSTIC -- the stray is outside the pgids so the tick aggregate is already
+    correct; NEVER invalidate the tick on it. Enforcement is RUN-LEVEL:
+    `validate_extension_run.py` FAILS (check `no_orphans`) if any tick has
+    `n_pids_unexpected>0` (almost always an orphan the #2 reaper should clear).
+  - **Gate-2 re-pass adds a one-time completeness check** (PGID scoping's only
+    failure mode = a child that `setsid`s out of the recorded pgid):
+    `sudo -E python3 deploy/dynamo/verify_scoping.py --component-pids "$COMPONENT_PIDS_FILE"`
+    must print `VERDICT: COMPLETE`. Local synthetic-process-group test confirms
+    the scoping/membership logic (exact membership, EngineCore-child summed, stray
+    excluded+flagged, under-count -> incomplete).
+- #2 reaper, #3 aging_trends multi-GPU, #4 validation_check refuse: TODO (next).
 
 Reminders: env `conda activate wosar`; always pass `--repo-root
 /home/dcotrone/wosar/llm-serving-bench` (absolute) so the sudo'd monitor path

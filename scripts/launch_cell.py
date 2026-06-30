@@ -522,6 +522,42 @@ def proc_prefix_for_cell(cell: dict) -> str:
     return monitors["proc"]["label"]
 
 
+def merge_component_identity(cell: dict, identity_path: Path) -> None:
+    """Inject the bring-up's recorded PGID identity into the cell's component
+    specs, IN PLACE, so the materialized components.json scopes the monitor to
+    exactly the recorded process groups (not a host-wide cmdline regex).
+
+    The identity file is produced by deploy/dynamo/record_component_pids.py.
+    Every component the cell declares must have a recorded entry, else we fail:
+    a missing entry would otherwise silently fall back to regex scoping for that
+    component, which is exactly the contamination this batch removes.
+    """
+    components = cell.get("monitors", {}).get("components")
+    if not components:
+        die("merge_component_identity called on a cell with no monitors.components")
+    comp_list = components["components"]
+    if not identity_path.exists():
+        die(f"component identity file not found: {identity_path} "
+            f"(run the bring-up so it records component PGIDs)")
+    identity = json.loads(identity_path.read_text())
+    recorded = identity.get("components", {})
+    missing = [c["label"] for c in comp_list if c["label"] not in recorded]
+    if missing:
+        die(f"identity file {identity_path} is missing components {missing}; "
+            f"recorded={sorted(recorded)}")
+    for c in comp_list:
+        entry = recorded[c["label"]]
+        c["pgids"] = list(entry["pgids"])
+        # The recorded instance count is authoritative; flag a cell/bring-up
+        # mismatch rather than silently trusting either side.
+        rec_expected = int(entry["expected_count"])
+        if c.get("expected_count") is not None and int(c["expected_count"]) != rec_expected:
+            die(f"component {c['label']}: cell expected_count={c['expected_count']} "
+                f"!= recorded {rec_expected} (topology mismatch)")
+        c["expected_count"] = rec_expected
+    log(f"merged PGID identity for {len(comp_list)} components from {identity_path}")
+
+
 def spawn_monitors(
     repo_root: Path,
     run_dir: Path,

@@ -24,19 +24,31 @@ Design (locked):
     aggregate sets process_alive = membership_complete so the EXISTING analysis
     process_alive filter drops those ticks instead of treating the dip as data.
 
+Identity, NOT regex (locked after gate 2): each component carries `pgids`, the
+host process-group ids recorded by the bring-up (deploy/dynamo/record_component_
+pids.py). The component is EXACTLY the processes in those PGIDs; we sum all of
+them (which captures vLLM EngineCore subprocess forks a single recorded PID would
+miss). The cmdline regex is kept only as a sanity check: a process that matches a
+component's regex but lies OUTSIDE its recorded PGIDs is a stale/duplicate worker;
+it is NOT summed, and is counted into `n_pids_unexpected` so the validator can
+catch it. A spec WITHOUT `pgids` falls back to regex matching (legacy / tests).
+
 Component spec (JSON, --components-file):
   {
     "engine_group": "dynamo",        # name of the engine aggregate -> agg_dynamo_*
     "root_pid": null,                # int to restrict to a container's descendants; null = host-wide scan
     "components": [
-      {"label": "dynamo_frontend", "pattern": "dynamo\\.frontend", "group": "engine",
+      {"label": "dynamo_frontend", "pattern": "dynamo\\.frontend", "group": "engine", "expected_count": 1, "pgids": [763985],
        "note": "ingress + KV-router (router is in-process in the frontend, not a separate PID)"},
-      {"label": "dynamo_prefill",  "pattern": "dynamo\\.vllm", "require": "--disaggregation-mode prefill", "group": "engine", "expected_count": 1},
-      {"label": "dynamo_decode",   "pattern": "dynamo\\.vllm", "require": "--disaggregation-mode decode", "group": "engine", "expected_count": 1},
-      {"label": "etcd",            "pattern": "(^|/)etcd($|\\s)", "group": "infra"},
-      {"label": "nats",            "pattern": "nats-server", "group": "infra"}
+      {"label": "dynamo_prefill",  "pattern": "dynamo\\.vllm", "require": "--disaggregation-mode prefill", "group": "engine", "expected_count": 1, "pgids": [751535]},
+      {"label": "dynamo_decode",   "pattern": "dynamo\\.vllm", "require": "--disaggregation-mode decode", "group": "engine", "expected_count": 1, "pgids": [751793]},
+      {"label": "etcd",            "pattern": "(^|/)etcd($|\\s)", "group": "infra", "expected_count": 1, "pgids": [666100]},
+      {"label": "nats",            "pattern": "nats-server", "group": "infra", "expected_count": 1, "pgids": [666239]}
     ]
   }
+
+`expected_count` is the number of recorded PGIDs (logical instances). `pgids`
+is injected by attach_run/launch_cell from the bring-up identity file.
 
 Runs under sudo (like proc_monitor) so USS/PSS are readable for processes not
 owned by the launching user.
@@ -46,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -62,7 +75,8 @@ from find_engine_pid import cmdline_matches
 
 COMPONENT_FIELDS = [
     "ts_unix", "label", "group",
-    "n_pids_matched", "n_pids_sampled", "membership_complete",
+    "n_pids_matched", "n_pids_sampled", "n_pgids_alive", "n_pids_unexpected",
+    "membership_complete",
     "uss_bytes", "rss_bytes", "vms_bytes", "pss_bytes",
     "pids", "_sample_duration_s", "_wall_clock_unix",
 ]
@@ -70,6 +84,7 @@ COMPONENT_FIELDS = [
 AGG_FIELDS = [
     "ts_unix", "group", "process_alive", "membership_complete",
     "n_components_expected", "n_components_complete", "n_pids_sampled",
+    "n_pids_unexpected",
     "uss_bytes", "rss_bytes", "vms_bytes", "pss_bytes",
     "_sample_duration_s", "_wall_clock_unix",
 ]
@@ -83,19 +98,41 @@ class Component:
         self.require = re.compile(spec["require"]) if spec.get("require") else None
         self.exclude = re.compile(spec["exclude"]) if spec.get("exclude") else None
         self.expected_count = spec.get("expected_count")  # may be None
+        # Recorded process-group identity. When present it is the AUTHORITATIVE
+        # scope; the regex is then only a sanity check (n_pids_unexpected).
+        self.pgids = set(int(g) for g in spec["pgids"]) if spec.get("pgids") else None
         self.note = spec.get("note", "")
 
     def matches(self, cmdline: str) -> bool:
         return cmdline_matches(cmdline, self.pattern, self.require, self.exclude)
 
 
-def resolve_all(components: list[Component], root_pid: Optional[int]) -> dict[str, list[psutil.Process]]:
-    """ONE process_iter pass; bucket each live process into matching components.
+def _pgid_of(pid: int) -> Optional[int]:
+    try:
+        return os.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
 
-    A process may match more than one component only if the specs overlap; for
-    the Dynamo spec the require/exclude split keeps prefill and decode disjoint.
+
+def resolve_all(
+    components: list[Component], root_pid: Optional[int]
+) -> tuple[dict[str, list[psutil.Process]], dict[str, int]]:
+    """ONE process_iter pass; bucket each live process into its component.
+
+    PGID-scoped components (the locked Dynamo path): a process belongs to the
+    component iff its PGID is in the component's recorded `pgids`. A process that
+    matches the component's cmdline regex but is OUTSIDE those PGIDs is a stale /
+    duplicate worker: it is NOT bucketed (never summed) and is counted into
+    `unexpected[label]`.
+
+    Regex-only components (legacy / tests, no `pgids`): bucket by cmdline match,
+    as before. The require/exclude split keeps prefill and decode disjoint.
     """
     buckets: dict[str, list[psutil.Process]] = {c.label: [] for c in components}
+    unexpected: dict[str, int] = {c.label: 0 for c in components if c.pgids is not None}
+    pgid_components = [c for c in components if c.pgids is not None]
+    regex_components = [c for c in components if c.pgids is None]
+
     if root_pid is not None:
         try:
             candidates = psutil.Process(root_pid).children(recursive=True)
@@ -103,17 +140,23 @@ def resolve_all(components: list[Component], root_pid: Optional[int]) -> dict[st
             candidates = []
     else:
         candidates = list(psutil.process_iter())
+
     for proc in candidates:
         try:
             cmdline = " ".join(proc.cmdline())
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
-        if not cmdline:
-            continue
-        for c in components:
-            if c.matches(cmdline):
-                buckets[c.label].append(proc)
-    return buckets
+        pgid = _pgid_of(proc.pid)
+        for c in pgid_components:
+            if pgid is not None and pgid in c.pgids:
+                buckets[c.label].append(proc)            # in the recorded group: counted
+            elif cmdline and c.matches(cmdline):
+                unexpected[c.label] += 1                 # regex match outside the group: stray, NOT counted
+        if cmdline:
+            for c in regex_components:
+                if c.matches(cmdline):
+                    buckets[c.label].append(proc)
+    return buckets, unexpected
 
 
 def sample_component(procs: list[psutil.Process]) -> dict[str, Any]:
@@ -140,7 +183,7 @@ def sample_component(procs: list[psutil.Process]) -> dict[str, Any]:
 
 def tick(components: list[Component], root_pid: Optional[int], ts: float) -> tuple[list[dict], dict[str, dict]]:
     """One coherent measurement: resolve-all then sample-all under one ts."""
-    buckets = resolve_all(components, root_pid)
+    buckets, unexpected = resolve_all(components, root_pid)
     comp_rows: list[dict] = []
     by_group: dict[str, dict] = {}
     for c in components:
@@ -148,12 +191,32 @@ def tick(components: list[Component], root_pid: Optional[int], ts: float) -> tup
         n_matched = len(procs)
         s = sample_component(procs)
         n_sampled = len(s["sampled_pids"])
-        complete = (n_sampled == n_matched) and (n_matched > 0)
-        if c.expected_count is not None:
-            complete = complete and (n_matched >= int(c.expected_count))
+        n_unexpected = unexpected.get(c.label, 0)
+
+        # ---- membership_complete: the data-integrity decision ----
+        # Every resolved process must have been sampled (no read failed mid-tick).
+        all_sampled = (n_sampled == n_matched) and (n_matched > 0)
+        if c.pgids is not None:
+            # Identity scope: count how many of the RECORDED pgids are alive this
+            # tick, and require EXACT membership (==, never >=). A dead instance
+            # (under) or an extra recorded pgid (over) marks the tick incomplete;
+            # a stray duplicate (n_unexpected>0) is recorded but, being outside
+            # the recorded pgids, was never summed in the first place.
+            alive_pgids = {pg for p in procs if (pg := _pgid_of(p.pid)) is not None} & c.pgids
+            n_pgids_alive = len(alive_pgids)
+            expected = int(c.expected_count) if c.expected_count is not None else len(c.pgids)
+            complete = all_sampled and (n_pgids_alive == expected)
+        else:
+            # Legacy regex path: exact count when expected_count is given.
+            n_pgids_alive = None
+            complete = all_sampled
+            if c.expected_count is not None:
+                complete = complete and (n_matched == int(c.expected_count))
+
         row = {
             "ts_unix": ts, "label": c.label, "group": c.group,
             "n_pids_matched": n_matched, "n_pids_sampled": n_sampled,
+            "n_pgids_alive": n_pgids_alive, "n_pids_unexpected": n_unexpected,
             "membership_complete": complete,
             "uss_bytes": s["uss_bytes"] if n_sampled > 0 else None,
             "rss_bytes": s["rss_bytes"] if n_sampled > 0 else None,
@@ -164,10 +227,12 @@ def tick(components: list[Component], root_pid: Optional[int], ts: float) -> tup
         comp_rows.append(row)
         g = by_group.setdefault(c.group, {
             "n_components_expected": 0, "n_components_complete": 0, "n_pids_sampled": 0,
+            "n_pids_unexpected": 0,
             "uss_bytes": 0, "rss_bytes": 0, "vms_bytes": 0, "pss_bytes": 0,
         })
         g["n_components_expected"] += 1
         g["n_pids_sampled"] += n_sampled
+        g["n_pids_unexpected"] += n_unexpected
         if complete:
             g["n_components_complete"] += 1
             g["uss_bytes"] += s["uss_bytes"]
@@ -234,6 +299,7 @@ def main() -> None:
                     comp_writers[c.label].write({
                         "ts_unix": ts, "label": c.label, "group": c.group,
                         "n_pids_matched": None, "n_pids_sampled": 0,
+                        "n_pgids_alive": None, "n_pids_unexpected": None,
                         "membership_complete": False, "uss_bytes": None,
                         "rss_bytes": None, "vms_bytes": None, "pss_bytes": None,
                         "pids": "", "_sample_duration_s": dur, "_wall_clock_unix": wall,
@@ -243,6 +309,7 @@ def main() -> None:
                         "ts_unix": ts, "group": g, "process_alive": False,
                         "membership_complete": False, "n_components_expected": None,
                         "n_components_complete": 0, "n_pids_sampled": 0,
+                        "n_pids_unexpected": None,
                         "uss_bytes": None, "rss_bytes": None, "vms_bytes": None,
                         "pss_bytes": None, "_sample_duration_s": dur, "_wall_clock_unix": wall,
                     })
@@ -262,6 +329,7 @@ def main() -> None:
                     "n_components_expected": agg["n_components_expected"],
                     "n_components_complete": agg["n_components_complete"],
                     "n_pids_sampled": agg["n_pids_sampled"],
+                    "n_pids_unexpected": agg["n_pids_unexpected"],
                     "uss_bytes": agg["uss_bytes"], "rss_bytes": agg["rss_bytes"],
                     "vms_bytes": agg["vms_bytes"], "pss_bytes": agg["pss_bytes"],
                     "_sample_duration_s": dur, "_wall_clock_unix": wall,

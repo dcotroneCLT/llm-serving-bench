@@ -74,6 +74,12 @@ DYN_PREFILL_PREFIX="${DYN_PREFILL_PREFIX:-dyn_prefill}"
 DYN_DECODE_PREFIX="${DYN_DECODE_PREFIX:-dyn_decode}"
 DYN_AGG_WORKER_NAME="${DYN_AGG_WORKER_NAME:-dyn_worker}"
 
+# Engine aggregate name (-> agg_<group>) and the component PGID identity file the
+# bring-up records and the monitor (via attach_run/launch_cell) scopes to. Keep
+# DYN_ENGINE_GROUP in sync with monitors.components.engine_group in the cell yaml.
+DYN_ENGINE_GROUP="${DYN_ENGINE_GROUP:-dynamo}"
+COMPONENT_PIDS_FILE="${WOSAR_COMPONENT_PIDS:-$HOME/wosar/dynamo_component_pids.json}"
+
 echo "[dynamo-env] image=$DYNAMO_IMAGE model=$MODEL ctx=$MAX_MODEL_LEN"
 echo "[dynamo-env] frontend :$FRONTEND_HTTP_PORT  etcd :$ETCD_CLIENT_PORT  nats :$NATS_PORT"
 echo "[dynamo-env] topology: prefill x$N_PREFILL (gpu $PREFILL_GPU), decode x$N_DECODE (gpu $DECODE_GPU)"

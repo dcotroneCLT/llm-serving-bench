@@ -110,18 +110,53 @@ Known benign warning: `'EngineCoreProc' object has no attribute
 get_kv_cache_group_metadata` — a Dynamo-1.2.0/vLLM-0.20.1 API drift that falls
 back to `cache_config.block_size`; the worker still registers and serves.
 
-## 3. Freeze the component regexes against the REAL process tree
+## 3. Component identity = recorded PGIDs (NOT a host-wide regex)
 
-This closes "WS2 against the real process tree". After 2b is healthy:
+The per-component monitor sums EXACTLY the processes the bring-up recorded, not
+whatever a host-wide cmdline regex matches. At the end of
+`serve_disaggregated.sh`, `record_component_pids.py` writes the host PGID of each
+component's container init process to the identity file
+(`$COMPONENT_PIDS_FILE`, default `~/wosar/dynamo_component_pids.json`):
 
-```bash
-ps -eo pid,cmd | grep -E 'dynamo.frontend|dynamo.vllm' | grep -v grep
+```json
+{"engine_group":"dynamo","components":{
+  "dynamo_prefill":{"containers":["dyn_prefill_1"],"host_pids":[751535],"pgids":[751535],"expected_count":1}, ...}}
 ```
 
-Confirm the cmdlines and freeze the `pattern` / `require` / `exclude` regexes in
-`campaigns/extension/cells/val_dynamo_disagg.yaml` under `monitors.components`
-so they match reality (prefill = `dynamo.vllm --disaggregation-mode prefill`,
-decode = `dynamo.vllm --disaggregation-mode decode`).
+`attach_run.py --component-pids <file>` (and, in BATCH 2, `launch_cell`) merges
+those pgids into the `components.json` the monitor reads. The monitor then:
+
+- sums every process whose PGID is in the recorded set (so a vLLM EngineCore
+  fork in the same group is captured; a single recorded PID would miss it);
+- `membership_complete` requires EXACT membership (`n_pgids_alive == expected`,
+  never `>=`): a dead instance (under) marks the tick incomplete;
+- a process matching a component's cmdline regex but OUTSIDE its pgids is a stray
+  (orphan / duplicate): it is NEVER summed and is counted into `n_pids_unexpected`.
+
+The frozen `pattern` / `require` / `exclude` regexes in
+`campaigns/extension/cells/val_dynamo_disagg.yaml` are now a SANITY CHECK and the
+labeling aid (prefill = `--disaggregation-mode prefill`, decode = `decode`), not
+the identity source. Sanity-eyeball the real tree once:
+
+```bash
+ps -eo pid,pgid,cmd | grep -E 'dynamo.frontend|dynamo.vllm' | grep -v grep
+```
+
+**Diagnostic vs red flag (locked):** `n_pids_unexpected` is a PURE PER-TICK
+DIAGNOSTIC (the stray is outside the pgids, so the tick's aggregate is already
+correct; never invalidate the tick on it). Enforcement is at RUN level:
+`validate_extension_run.py` FAILS the run if any tick has `n_pids_unexpected>0`,
+because a stray almost always means an orphan from a prior run that the BATCH 1
+#2 reaper should have cleared.
+
+**One-time completeness check (gate-2 re-pass).** PGID scoping's only failure
+mode is a component child that `setsid`s into a different pgid, escaping the sum
+without tripping `membership_complete`. Confirm none exists, live, under sudo:
+
+```bash
+sudo -E python3 deploy/dynamo/verify_scoping.py --component-pids "$COMPONENT_PIDS_FILE"
+# VERDICT: COMPLETE  => every dynamo-related memory-holding PID is in a recorded pgid
+```
 
 ## 4. First-bring-up flag check
 

@@ -129,6 +129,31 @@ def check_aggregate(run_dir: Path, engine_group: str, components: list[dict]) ->
     return ok, msgs
 
 
+def check_no_orphans(run_dir: Path, components: list[dict]) -> tuple[bool, list[str]]:
+    """Run-level red flag: ANY tick with n_pids_unexpected>0 on a component.
+
+    A stray sits OUTSIDE the recorded pgids, so it is never summed and each
+    tick's aggregate is correct (the field is a pure per-tick diagnostic). But a
+    process matching a component's cmdline regex that is not in its process group
+    almost always means an orphan from a prior run survived (the pre-run reaper
+    failed). The data is valid; for a 48h production run it is an operational red
+    flag to clear before launch. So we enforce it here, at run level, not per tick.
+    """
+    msgs: list[str] = []
+    ok = True
+    for c in components:
+        rows = _read_csvs(run_dir, c["label"])
+        vals = [int(v) for r in rows if (v := r.get("n_pids_unexpected")) not in (None, "")]
+        bad = [v for v in vals if v > 0]
+        if bad:
+            ok = False
+            msgs.append(f"    FAIL: {c['label']} has {len(bad)} tick(s) with a stray regex-match "
+                        f"outside its pgids (max {max(bad)}) -> orphan on host, run the reaper")
+    if ok:
+        msgs.append("    no stray processes outside recorded pgids (n_pids_unexpected==0 everywhere)")
+    return ok, msgs
+
+
 def check_multi_gpu(run_dir: Path, gpu_devices: list[int]) -> tuple[bool, list[str]]:
     msgs = []
     ok = True
@@ -212,6 +237,8 @@ def main() -> None:
         ok2, m2 = check_aggregate(args.run_dir, engine_group, components); print("\n".join(m2))
         okg, mg = check_multi_gpu(args.run_dir, gpu_devices); print("\n".join(mg))
         results.append(("aggregate", ok2)); results.append(("multi_gpu", okg))
+        print("\n[2b] No stray processes outside recorded pgids (orphan red flag):")
+        oko, mo = check_no_orphans(args.run_dir, components); print("\n".join(mo)); results.append(("no_orphans", oko))
 
     print("\n[3] Client features (prefix-repeat + burst):")
     okc, mc = check_client_features(args.run_dir, args.target_prefix_frac); print("\n".join(mc)); results.append(("client_features", okc))

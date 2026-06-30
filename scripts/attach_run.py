@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
@@ -51,6 +52,10 @@ def main() -> None:
     p.add_argument("--run-id", type=str, default=None, help="Defaults to ext_attach_<cell>_r<NN>.")
     p.add_argument("--base-url", type=str, default=None, help="Override the cell's client base_url.")
     p.add_argument("--engine-pid", type=int, default=None, help="Single-process systems: host PID of the running engine.")
+    p.add_argument("--component-pids", type=Path,
+                   default=Path(os.environ.get("WOSAR_COMPONENT_PIDS", str(Path.home() / "wosar" / "dynamo_component_pids.json"))),
+                   help="Multi-process systems: identity file written by the bring-up "
+                        "(deploy/dynamo/record_component_pids.py). The monitor is scoped to its recorded PGIDs.")
     p.add_argument("--gpu-indices", type=str, default=None, help="Override GPU device list to sample, e.g. 0,1.")
     p.add_argument("--hf-cache-host", type=Path, default=Path(""), help="Only needed if the cell yaml references {hf_cache_host}.")
     p.add_argument("--min-free-gb", type=float, default=20.0,
@@ -91,6 +96,11 @@ def main() -> None:
         pidfile = run_dir / "engine.pid"
         pidfile.write_text(f"{args.engine_pid}\n")
         lc.log(f"single-process: engine.pid={args.engine_pid}")
+    else:
+        # Multi-process: scope the monitor to the PGIDs the bring-up recorded,
+        # not a host-wide cmdline regex. Mutates cell["monitors"]["components"]
+        # in place so spawn_monitors materializes a pgid-scoped components.json.
+        lc.merge_component_identity(cell, args.component_pids)
 
     gpu_dev0 = lc.gpu_devices_for_cell(cell)[0]
     duration_s = int(args.duration_seconds)
