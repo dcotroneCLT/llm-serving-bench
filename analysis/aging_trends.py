@@ -251,6 +251,71 @@ def downsample_client(df: pd.DataFrame, window_seconds: int = 60) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
+# GPU columns that are ADDITIVE across devices (a total over the GPUs in use);
+# everything else (utilisation %, temperature, clocks) is intensive and averaged.
+ADDITIVE_GPU_COLS = {"vram_used_bytes", "power_draw_w", "ecc_db_volatile", "ecc_sb_volatile"}
+
+
+def discover_gpu_prefixes(run_dir: Path) -> list[str]:
+    """All gpuN prefixes present (gpu0, gpu1, ...), sorted, de-duplicated."""
+    prefixes: list[str] = []
+    for f in sorted(run_dir.glob("gpu*_000000.csv")):
+        nm = f.stem.rsplit("_", 1)[0]
+        if nm[3:].isdigit() and nm not in prefixes:
+            prefixes.append(nm)
+    return prefixes
+
+
+def _downsample_one_gpu(df: pd.DataFrame, warmup_s: float, window_seconds: int) -> pd.DataFrame:
+    """Per-device per-bin median, indexed by the ABSOLUTE minute bin so devices
+    align when combined."""
+    df = filter_warmup(df, "ts_unix", warmup_s)
+    df = df.dropna(subset=["ts_unix"]).copy()
+    df["_bin"] = (df["ts_unix"] // window_seconds).astype(np.int64)
+    numeric = [c for c in df.select_dtypes(include=[np.number]).columns if c not in {"ts_unix", "_bin"}]
+    return df.groupby("_bin")[numeric].median()
+
+
+def load_gpu_downsampled(run_dir: Path, warmup_s: float, window_seconds: int) -> Optional[pd.DataFrame]:
+    """Load + downsample the GPU monitor CSVs.
+
+    Single device: byte-identical to the prior path (load_csvs -> filter_warmup ->
+    downsample_to_minutes). Multiple devices (e.g. Dynamo on 2 GPUs): combine the
+    per-device per-bin frames -> SUM the additive columns (vram, power, ecc),
+    MEAN the intensive ones (util, temp, clocks). For one device sum==mean==the
+    value, so this reduces exactly to the single-device output.
+    """
+    prefixes = discover_gpu_prefixes(run_dir)
+    if not prefixes:
+        return None
+    if len(prefixes) == 1:
+        gpu = load_csvs(run_dir, prefixes[0])
+        if gpu is None:
+            return None
+        gpu = filter_warmup(gpu, "ts_unix", warmup_s)
+        return downsample_to_minutes(gpu, "ts_unix", window_seconds)
+
+    per_gpu = []
+    for pfx in prefixes:
+        g = load_csvs(run_dir, pfx)
+        if g is not None and not g.empty:
+            per_gpu.append(_downsample_one_gpu(g, warmup_s, window_seconds))
+    if not per_gpu:
+        return None
+    stacked = pd.concat(per_gpu)  # rows keyed by absolute _bin, one per device per bin
+    cols = list(per_gpu[0].columns)
+    add_cols = [c for c in cols if c in ADDITIVE_GPU_COLS]
+    mean_cols = [c for c in cols if c not in ADDITIVE_GPU_COLS]
+    parts = []
+    if add_cols:
+        parts.append(stacked.groupby(level=0)[add_cols].sum())
+    if mean_cols:
+        parts.append(stacked.groupby(level=0)[mean_cols].mean())
+    combined = pd.concat(parts, axis=1)[cols]
+    combined["_t_hours"] = (combined.index - combined.index.min()) * (window_seconds / 3600.0)
+    return combined.reset_index(drop=True)
+
+
 def bh_fdr(pvalues: list[float], alpha: float = 0.10) -> list[float]:
     p = np.asarray(pvalues, dtype=float)
     valid = ~np.isnan(p)
@@ -302,18 +367,14 @@ def main() -> None:
     progress = sys.stderr if args.csv else sys.stdout
     print(f"Loading run from {run_dir} ...", file=progress)
 
-    gpu_prefix = None
-    for f in sorted(run_dir.glob("gpu*_000000.csv")):
-        nm = f.stem.rsplit("_", 1)[0]
-        if nm[3:].isdigit():
-            gpu_prefix = nm; break
-    gpu = load_csvs(run_dir, gpu_prefix) if gpu_prefix else None
-    if gpu is None:
-        print("  [warn] no gpu CSVs found", file=sys.stderr); gpu_ds = None
+    gpu_prefixes = discover_gpu_prefixes(run_dir)
+    gpu_ds = load_gpu_downsampled(run_dir, warmup_s, args.downsample_seconds)
+    if gpu_ds is None:
+        print("  [warn] no gpu CSVs found", file=sys.stderr)
     else:
-        gpu = filter_warmup(gpu, "ts_unix", warmup_s)
-        gpu_ds = downsample_to_minutes(gpu, "ts_unix", args.downsample_seconds)
-        print(f"  gpu: {len(gpu)} post-warmup -> {len(gpu_ds)} per-window samples", file=progress)
+        agg = "" if len(gpu_prefixes) <= 1 else (
+            f" (aggregated over {len(gpu_prefixes)} GPUs: sum vram/power/ecc, mean util/temp/clocks)")
+        print(f"  gpu: {len(gpu_prefixes)} device(s) -> {len(gpu_ds)} per-window samples{agg}", file=progress)
 
     proc_prefix = discover_proc_prefix(run_dir, manifest)
     if proc_prefix:

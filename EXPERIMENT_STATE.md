@@ -123,7 +123,13 @@ DO NOT use `campaign.py` for 48h DoW until BATCH 2 is done and gate 2 re-passed.
   path (engine brought up by hand). Synthetic test confirms: orphan with matching
   run-id+script killed; decoy with the run-id but a foreign script spared; decoy
   with our script but a different run-id spared.
-- #3 aging_trends multi-GPU, #4 validation_check refuse: TODO (next).
+- **#3 aging_trends multi-GPU DONE.** `load_gpu_downsampled` discovers ALL `gpuN`
+  prefixes. One device -> byte-identical to the old path (verified with
+  `DataFrame.equals`). Multiple devices (Dynamo = 2 GPU) -> per-device per-bin
+  median, then SUM the additive columns (vram_used_bytes, power_draw_w, ecc) and
+  MEAN the intensive ones (util, temp, clocks); source label stays `gpu.*`. Was:
+  read only the first `gpu*_000000.csv` -> half the Dynamo GPU signal dropped.
+- #4 validation_check refuse multi-process: TODO (next).
 
 Reminders: env `conda activate wosar`; always pass `--repo-root
 /home/dcotrone/wosar/llm-serving-bench` (absolute) so the sudo'd monitor path
