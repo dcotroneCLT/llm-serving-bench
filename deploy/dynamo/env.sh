@@ -2,12 +2,14 @@
 # Shared configuration for the local NVIDIA Dynamo bring-up (extension campaign).
 #
 # Source this from the serve_*.sh scripts: `source "$(dirname "$0")/env.sh"`.
-# Single box, local CLI deploy (no Kubernetes). Pinned vLLM 0.16.0 stack.
+# Single box, local CLI deploy (no Kubernetes). Pinned vLLM 0.20.1 stack.
 
 set -uo pipefail
 
-# --- Pinned image (vLLM 0.16.0; see engines/dynamo_vllm/image_pin.json) ---
-DYNAMO_IMAGE="${DYNAMO_IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13}"
+# --- Pinned image (vLLM 0.20.1; see engines/dynamo_vllm/image_pin.json) ---
+# Pin re-derived after the box gate: 0.16.0 had no Triton release, so the
+# three-way intersection is 0.20.1 (Dynamo 1.2.0 + Triton 26.05 + standalone).
+DYNAMO_IMAGE="${DYNAMO_IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13}"
 
 # --- Model (identical to the Triton and standalone arms) ---
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bring up NVIDIA Dynamo in DISAGGREGATED mode (prefill workers + decode workers
-# + frontend with in-process KV router) on the local L40S box, vLLM 0.16.0.
+# + frontend with in-process KV router) on the local L40S box, vLLM 0.20.1.
 #
 # Topology is FIXED (N_PREFILL prefill, N_DECODE decode) and the planner /
 # autoscaler is intentionally NOT launched, so the component membership the

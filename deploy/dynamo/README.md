@@ -1,8 +1,13 @@
 # NVIDIA Dynamo local bring-up (extension campaign)
 
 Local CLI deploy (no Kubernetes), single L40S box. Part of the 3-system
-extension campaign that holds **vLLM 0.16.0 identical** across Dynamo,
+extension campaign that holds **vLLM 0.20.1 identical** across Dynamo,
 Triton+vLLM, and standalone vLLM (see the pin files in `engines/*/image_pin*`).
+
+Pin history: 0.16.0 was the first choice but the box gate found Triton ships
+no 0.16.0 build (it skips from 0.15.1 at 26.02 to 0.17.1 at 26.03). The
+three-way native intersection is **0.20.1** (Dynamo 1.2.0 + Triton 26.05 +
+standalone v0.20.1). Always ground-truth with `pip show vllm` at pull.
 
 The exact pinned image and component commands are encoded in `env.sh` and the
 `serve_*.sh` scripts. Everything runs on the host network so the
@@ -14,26 +19,32 @@ localhost, and so the host `ps`/`/proc` sees the `python -m dynamo.*` processes
 
 | Piece | Value |
 |---|---|
-| Image | `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13` |
-| Dynamo | 1.0.1 (stable) |
-| vLLM | 0.16.0 |
-| NIXL | 0.10.1 |
-| CUDA | 13.0 (matches host driver 580.x) |
+| Dynamo | `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13` (1.2.0 stable) |
+| Triton | `nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3` |
+| Standalone | `vllm/vllm-openai:v0.20.1-cu130` |
+| vLLM | 0.20.1 (identical across all three) |
+| CUDA | 13.x (matches host driver 580.x) |
 | Model | Qwen/Qwen2.5-7B-Instruct, ctx 8192, BF16 |
 
 ## 0. Verify the vLLM version (the whole point of the pin)
 
-The ground truth that all three systems share vLLM 0.16.0:
+The ground truth that all three systems share vLLM 0.20.1 (remote release notes
+were wrong once, so pip show is authoritative). NOTE: vllm-openai's entrypoint is
+the API server, so it needs `--entrypoint pip`:
 
 ```bash
-docker pull nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13
-docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13 pip show vllm | grep Version   # 0.16.0
-# record the digest into engines/dynamo_vllm/image_pin.json:
-docker inspect --format '{{index .RepoDigests 0}}' nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13
+docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 pip show vllm | grep -i '^Version'   # 0.20.1
+docker run --rm nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3 pip show vllm | grep -i '^Version'    # 0.20.1 (gate-critical)
+docker run --rm --entrypoint pip vllm/vllm-openai:v0.20.1-cu130 show vllm | grep -i '^Version'          # 0.20.1
+# record each digest into the matching engines/*/image_pin*.json:
+for img in nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 \
+           nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3 \
+           vllm/vllm-openai:v0.20.1-cu130; do
+  docker inspect --format '{{index .RepoDigests 0}}' "$img"
+done
 ```
 
-Do the same `pip show vllm` for `nvcr.io/nvidia/tritonserver:26.03-vllm-python-py3`
-and `vllm/vllm-openai:v0.16.0-cu130` and fill in all three pin files.
+STOP if any is not exactly 0.20.1.
 
 ## 1. Infrastructure (etcd + NATS)
 
@@ -79,8 +90,8 @@ The component commands in `serve_*.sh` encode the researched Dynamo 1.0.1 CLI
 Confirm the exact flags once:
 
 ```bash
-docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13 python -m dynamo.vllm --help
-docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13 python -m dynamo.frontend --help
+docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 python -m dynamo.vllm --help
+docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 python -m dynamo.frontend --help
 ```
 
 Adjust env var names for etcd/NATS endpoints if `--help` shows different ones.

@@ -1,15 +1,14 @@
 {
-  "image_tag": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13",
+  "image_tag": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13",
   "digest": "",
-  "source_tag": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13",
+  "source_tag": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13",
   "pinned_at": "",
-  "vllm_version": "0.16.0",
-  "nixl_version": "0.10.1",
-  "cuda": "13.0",
-  "dynamo_release": "1.0.1",
-  "role": "Extension campaign: NVIDIA Dynamo disaggregated (and aggregated) vLLM serving.",
-  "_digest_TODO": "Record at pull time on cci-csgpu11; the digest field above must be filled before any production run.",
-  "_digest_capture_cmd": "docker pull nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13 && docker inspect --format '{{index .RepoDigests 0}}' nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13",
-  "_vllm_verify_cmd": "docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1-cuda13 pip show vllm | grep Version  # expect 0.16.0",
-  "_source": "Dynamo release artifacts (docs.nvidia.com/dynamo/dev/resources/release-artifacts); Dynamo 1.0.1 GA 2026-03-16."
+  "vllm_version": "0.20.1",
+  "dynamo_release": "1.2.0",
+  "cuda": "13.x",
+  "role": "Extension campaign: NVIDIA Dynamo disaggregated (and aggregated) vLLM serving. Pin re-derived after the box gate: vLLM 0.16.0 had NO Triton release, so the three-way intersection moved to 0.20.1 (Dynamo 1.2.0 + Triton 26.05 + standalone v0.20.1).",
+  "_digest_TODO": "Record at pull time on cci-csgpu11; fill the digest before any production run.",
+  "_digest_capture_cmd": "docker pull nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 && docker inspect --format '{{index .RepoDigests 0}}' nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13",
+  "_vllm_verify_cmd": "docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 pip show vllm | grep -i '^Version'  # expect 0.20.1; if the cuda13 tag is absent, try plain 1.2.0",
+  "_source": "Dynamo releases: 1.2.0 -> vLLM 0.20.1. CONFIRM on box via pip show (remote Triton research was wrong once; ground-truth all three)."
 }

@@ -942,6 +942,33 @@ Notable n=3 findings already locked (n>=2):
   gate: e' il pezzo che il gate deve validare su hardware reale.
   Backlog minore: `aging_trends.downsample_client` assume la colonna `ttft_s`
   (sempre presente nei CSV reali; guardia da una riga, non blocca).
+- 2026-06-29 ET (sul server): **GATE STEP 0 ESEGUITO -> PIN RI-DERIVATO a 0.20.1.**
+  Il `pip show vllm` reale ha smentito la ricerca remota su Triton: **Triton
+  26.03 = vLLM 0.17.1, NON 0.16.0** (`build.py` r26.03 diceva 0.16.0 -> sbagliato;
+  le note del *container vLLM NVIDIA* invece erano giuste, 26.03=0.17.1). Mappa
+  reale (note container vLLM, affidabili): Triton/vLLM 26.01=0.11.1, 26.02=0.15.1,
+  26.03=0.17.1, **26.04=0.19.0, 26.05=0.20.1**. Dynamo stable: 1.0.1=0.16.0,
+  1.1.1=0.19.0, **1.2.0=0.20.1**. **A 0.16.0 l'intersezione e' VUOTA** (Triton
+  salta 0.15.1->0.17.1). Intersezioni pulite a tre vie native: 0.19.0 (Dynamo
+  1.1.1 + Triton 26.04) oppure 0.20.1 (Dynamo 1.2.0 + Triton 26.05).
+  **DECISIONE (Domenico): pin = 0.20.1**:
+  - Dynamo `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13`
+  - Triton `nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3`
+  - standalone `vllm/vllm-openai:v0.20.1-cu130`
+  Aggiornati: 3 pin file, `deploy/dynamo/env.sh`, `val_vllm.yaml`,
+  `val_dynamo_disagg.yaml`, README. **Validazione DOPO il re-pin** (sullo stack
+  finale). Sul box: ground-truth i tre con `pip show vllm` PRIMA del gate
+  (vllm-openai richiede `--entrypoint pip`); STOP se uno non e' 0.20.1.
+- 2026-06-29 ET (sul server): **FINDING DISCO (blocker pre-campagna).**
+  `docker info` -> DockerRootDir = **/var/lib/docker** su partizione **126G**
+  (era al 98%, da cui il "no space left" malgrado /home abbia 6.3T liberi). Il
+  move del data-root su /home di ADR-002 e' stato PERSO (era gia' nel
+  technical-debt). Pulizia: rimosse le immagini vecchie del preprint (~135GB,
+  campagna n=3 chiusa, digest gia' registrati) -> 70G liberi. **Prima della
+  campagna 3-sistemi: rimettere il data-root su /home** (3 immagini ~75GB + dati
+  + headroom non stanno comodi in 126G). I dati grezzi `runs/` e
+  `runs_n1_baseline/` NON sono stati toccati (gia' sul Mac; non servono per lo
+  spazio del data-root, che e' su /var/lib).
 - 2026-05-20 evening ET: **Five-class taxonomy adopted (committed).**
   Pilot n=1 sanity check after the four-class patch surfaced two
   retrospective reclassifications:

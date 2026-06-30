@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bring up NVIDIA Dynamo in AGGREGATED mode (frontend + a single worker that does
-# both prefill and decode) on one GPU, vLLM 0.16.0. Used as the simpler bring-up
+# both prefill and decode) on one GPU, vLLM 0.20.1. Used as the simpler bring-up
 # to de-risk the stack before the disaggregated path.
 #
 # Prereq: bash deploy/dynamo/infra_up.sh

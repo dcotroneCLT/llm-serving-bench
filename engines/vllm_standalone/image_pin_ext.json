@@ -1,13 +1,13 @@
 {
-  "image_tag": "vllm/vllm-openai:v0.16.0-cu130",
+  "image_tag": "vllm/vllm-openai:v0.20.1-cu130",
   "digest": "",
-  "source_tag": "vllm/vllm-openai:v0.16.0-cu130",
+  "source_tag": "vllm/vllm-openai:v0.20.1-cu130",
   "pinned_at": "",
-  "vllm_version": "0.16.0",
+  "vllm_version": "0.20.1",
   "cuda": "13.0",
-  "role": "Extension campaign: vLLM standalone, OpenAI-compatible server. Docker Hub upstream (NOT NGC nvcr.io/nvidia/vllm:26.03, which is 0.17.1).",
-  "_digest_TODO": "Record at pull time on cci-csgpu11; the digest field above must be filled before any production run.",
-  "_digest_capture_cmd": "docker pull vllm/vllm-openai:v0.16.0-cu130 && docker inspect --format '{{index .RepoDigests 0}}' vllm/vllm-openai:v0.16.0-cu130",
-  "_vllm_verify_cmd": "docker run --rm --entrypoint pip vllm/vllm-openai:v0.16.0-cu130 show vllm | grep Version  # expect 0.16.0",
-  "_source": "Docker Hub vllm/vllm-openai tags API: tags v0.16.0 and v0.16.0-cu130 both present (multi-arch)."
+  "role": "Extension campaign: vLLM standalone, OpenAI-compatible server. Docker Hub upstream (NOT NGC nvcr.io/nvidia/vllm).",
+  "_digest_TODO": "Record at pull time on cci-csgpu11; fill the digest before any production run.",
+  "_digest_capture_cmd": "docker pull vllm/vllm-openai:v0.20.1-cu130 && docker inspect --format '{{index .RepoDigests 0}}' vllm/vllm-openai:v0.20.1-cu130",
+  "_vllm_verify_cmd": "docker run --rm --entrypoint pip vllm/vllm-openai:v0.20.1-cu130 show vllm | grep -i '^Version'  # --entrypoint pip: the image entrypoint is the api server",
+  "_source": "Docker Hub vllm/vllm-openai; v0.20.1-cu130 expected (v0.16.0-cu130 existed). CONFIRM tag + version on box; if -cu130 absent, try bare v0.20.1."
 }

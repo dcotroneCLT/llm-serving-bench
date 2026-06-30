@@ -1,4 +1,4 @@
-# STEP 1 validation cell: NVIDIA Dynamo disaggregated, vLLM 0.16.0, 2 GPU.
+# STEP 1 validation cell: NVIDIA Dynamo disaggregated, vLLM 0.20.1, 2 GPU.
 # Confirms on real hardware: per-component PID-group monitoring, the engine USS
 # aggregate (agg_dynamo) vs a separate infra aggregate (agg_infra), multi-GPU
 # sampling, the two client features, and the analysis pipeline reading
@@ -15,13 +15,13 @@
 cell_id: val_dynamo_disagg
 short_label: dynamo_disagg_016
 description: |
-  NVIDIA Dynamo 1.0.1 disaggregated (prefill + decode + frontend/KV-router),
-  Qwen2.5-7B-Instruct, vLLM 0.16.0, 2 L40S. STEP 1 validation of the
+  NVIDIA Dynamo 1.2.0 disaggregated (prefill + decode + frontend/KV-router),
+  Qwen2.5-7B-Instruct, vLLM 0.20.1, 2 L40S. STEP 1 validation of the
   multi-process per-component path.
 
 engine:
   image_repo: nvcr.io/nvidia/ai-dynamo/vllm-runtime
-  image_tag: 1.0.1-cuda13
+  image_tag: 1.2.0-cuda13
   digest_pin_file: engines/dynamo_vllm/image_pin.json
   # Engine is started by deploy/dynamo/*.sh, NOT by this cell (attach path).
   # The full unattended lifecycle is the later launch_cell/campaign work.

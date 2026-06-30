@@ -1,4 +1,4 @@
-# STEP 1 validation cell: vLLM standalone, vLLM 0.16.0, single GPU.
+# STEP 1 validation cell: vLLM standalone, vLLM 0.20.1, single GPU.
 # Confirms on real hardware that the single-process monitor/client/manifest/
 # analysis path is byte-compatible after the WS2/WS3/WS4/WS5 changes.
 #
@@ -7,14 +7,14 @@
 # which manages the container directly.
 
 cell_id: val_vllm
-short_label: vllm_standalone_016
+short_label: vllm_standalone_020
 description: |
-  vLLM standalone serving Qwen2.5-7B-Instruct, BF16, vLLM 0.16.0, on one L40S.
+  vLLM standalone serving Qwen2.5-7B-Instruct, BF16, vLLM 0.20.1, on one L40S.
   STEP 1 validation of the single-process path.
 
 engine:
   image_repo: vllm/vllm-openai
-  image_tag: v0.16.0-cu130
+  image_tag: v0.20.1-cu130
   digest_pin_file: engines/vllm_standalone/image_pin_ext.json
   container_name_template: "val_vllm_r{replica}"
   command:
@@ -44,7 +44,7 @@ engine:
 monitors:
   gpu_index_inherits_from_engine: true
   proc:
-    label: vllm_standalone_016
+    label: vllm_standalone_020
     period_s: 5
   gpu:
     period_s: 1

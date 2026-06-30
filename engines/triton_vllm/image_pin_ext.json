@@ -1,13 +1,13 @@
 {
-  "image_tag": "nvcr.io/nvidia/tritonserver:26.03-vllm-python-py3",
+  "image_tag": "nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3",
   "digest": "",
-  "source_tag": "nvcr.io/nvidia/tritonserver:26.03-vllm-python-py3",
+  "source_tag": "nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3",
   "pinned_at": "",
-  "vllm_version": "0.16.0",
-  "triton_release": "26.03",
-  "role": "Extension campaign: Triton Inference Server + vLLM backend. Moves off the preprint's 25.09 to the 0.16.0-aligned stack.",
-  "_digest_TODO": "Record at pull time on cci-csgpu11; the digest field above must be filled before any production run.",
-  "_digest_capture_cmd": "docker pull nvcr.io/nvidia/tritonserver:26.03-vllm-python-py3 && docker inspect --format '{{index .RepoDigests 0}}' nvcr.io/nvidia/tritonserver:26.03-vllm-python-py3",
-  "_vllm_verify_cmd": "docker run --rm nvcr.io/nvidia/tritonserver:26.03-vllm-python-py3 pip show vllm | grep Version  # expect 0.16.0",
-  "_source": "server/build.py @ branch r26.03 version_map \"vllm_version\": \"0.16.0\"; Triton 26.03 release notes container-contents line \"vLLM version 0.16.0\"."
+  "vllm_version": "0.20.1",
+  "triton_release": "26.05",
+  "role": "Extension campaign: Triton + vLLM backend. 26.05 ships vLLM 0.20.1 (26.03 was 0.17.1; 0.16.0 is skipped by Triton entirely -- found via the box gate).",
+  "_digest_TODO": "Record at pull time on cci-csgpu11; fill the digest before any production run.",
+  "_digest_capture_cmd": "docker pull nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3 && docker inspect --format '{{index .RepoDigests 0}}' nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3",
+  "_vllm_verify_cmd": "docker run --rm nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3 pip show vllm | grep -i '^Version'  # expect 0.20.1 -- THIS is the gate-critical check",
+  "_source": "NVIDIA vLLM container release notes: 26.05 -> vLLM 0.20.1 (these notes matched ground truth on 26.03=0.17.1). Triton vLLM backend tracks the vLLM container version. CONFIRM on box via pip show."
 }
