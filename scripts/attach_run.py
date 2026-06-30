@@ -112,7 +112,8 @@ def main() -> None:
 
     gpu_dev0 = lc.gpu_devices_for_cell(cell)[0]
     duration_s = int(args.duration_seconds)
-    started_at_unix = time.time()
+    started_at_unix = time.time()       # wall clock: manifest timestamp only
+    started_mono = time.monotonic()     # monotonic: drives the run-duration decision
     manifest: dict[str, Any] = {
         "run_id": run_id,
         "cell_id": cell_id,
@@ -158,11 +159,11 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    deadline = started_at_unix + duration_s
+    mono_deadline = started_mono + duration_s
     try:
         while not interrupted:
             time.sleep(5)
-            if time.time() >= deadline:
+            if time.monotonic() >= mono_deadline:
                 lc.log("duration elapsed, shutting down")
                 break
             for name, proc in [("monitors", monitors_proc), ("client", client_proc)]:
@@ -180,7 +181,7 @@ def main() -> None:
         ended_at_unix = time.time()
         manifest["ended_at"] = lc.utc_iso()
         manifest["ended_at_unix"] = ended_at_unix
-        manifest["duration_seconds_actual"] = ended_at_unix - started_at_unix
+        manifest["duration_seconds_actual"] = time.monotonic() - started_mono
         manifest["interrupted_early"] = interrupted
         manifest["client_summary"] = client_summary
         # Fold in realized arrival stats if the client wrote them.

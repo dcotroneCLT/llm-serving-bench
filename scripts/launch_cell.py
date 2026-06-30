@@ -974,7 +974,8 @@ def main() -> None:
     pid_daemon = setup_pid_strategy(cell, container_name, pidfile, args.repo_root, log_dir)
 
     # 10. Write the run manifest (started_at).
-    started_at_unix = time.time()
+    started_at_unix = time.time()       # wall clock: manifest timestamp only
+    started_mono = time.monotonic()     # monotonic: drives the run-duration decision
     manifest = {
         "run_id": run_id,
         "campaign_id": args.campaign_id,
@@ -1049,7 +1050,7 @@ def main() -> None:
     log(f"client pid={client_proc.pid}")
 
     # 12. Supervise until duration elapses or any subprocess exits.
-    deadline = started_at_unix + duration_s
+    mono_deadline = started_mono + duration_s
     interrupted = False
 
     def handle_signal(_sig, _frame):
@@ -1064,7 +1065,7 @@ def main() -> None:
     try:
         while not interrupted:
             time.sleep(5)
-            if time.time() >= deadline:
+            if time.monotonic() >= mono_deadline:
                 log("duration elapsed, beginning shutdown")
                 break
             for name, proc in [("monitors", monitors_proc), ("client", client_proc)]:
@@ -1120,7 +1121,7 @@ def main() -> None:
         ended_at_unix = time.time()
         manifest["ended_at"] = utc_iso()
         manifest["ended_at_unix"] = ended_at_unix
-        manifest["duration_seconds_actual"] = ended_at_unix - started_at_unix
+        manifest["duration_seconds_actual"] = time.monotonic() - started_mono
         manifest["interrupted_early"] = interrupted
         manifest["client_forced_kill"] = client_forced_kill
         manifest["client_summary"] = client_summary

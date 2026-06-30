@@ -149,7 +149,8 @@ def main() -> None:
     log_dir = run_dir / "logs"
     log_dir.mkdir(exist_ok=True)
 
-    started_at_unix = time.time()
+    started_at_unix = time.time()       # wall clock: manifest timestamp only
+    started_mono = time.monotonic()     # monotonic: drives the duration decision
     manifest: dict[str, Any] = {
         "run_id": args.run_id,
         "started_at": utc_iso(),
@@ -259,11 +260,11 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGINT, handle)
 
-    deadline = started_at_unix + args.duration_seconds if args.duration_seconds > 0 else None
+    mono_deadline = started_mono + args.duration_seconds if args.duration_seconds > 0 else None
     try:
         while not stop:
             time.sleep(1.0)
-            if deadline is not None and time.time() >= deadline:
+            if mono_deadline is not None and time.monotonic() >= mono_deadline:
                 print("[run_monitors] duration elapsed, shutting down", flush=True)
                 break
             for name, proc, _ in procs:
@@ -281,9 +282,9 @@ def main() -> None:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-        deadline_grace = time.time() + args.grace_period_s
+        grace_deadline_mono = time.monotonic() + args.grace_period_s
         for name, proc, _ in procs:
-            remaining = max(0.0, deadline_grace - time.time())
+            remaining = max(0.0, grace_deadline_mono - time.monotonic())
             try:
                 proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
@@ -296,7 +297,7 @@ def main() -> None:
         ended_at_unix = time.time()
         manifest["ended_at"] = utc_iso()
         manifest["ended_at_unix"] = ended_at_unix
-        manifest["duration_seconds_actual"] = ended_at_unix - started_at_unix
+        manifest["duration_seconds_actual"] = time.monotonic() - started_mono
         manifest["failed"] = failed
         manifest_path.write_text(json.dumps(manifest, indent=2))
         print(f"[run_monitors] done. duration={manifest['duration_seconds_actual']:.1f}s", flush=True)
