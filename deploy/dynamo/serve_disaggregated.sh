@@ -106,38 +106,55 @@ for c in "${WORKER_NAMES[@]}"; do
 done
 
 # --- Frontend (HTTP ingress + in-process KV router; no separate router PID) ---
-# The frontend snapshots the model registry at startup and does NOT pick up a
-# model that finalizes afterward, even minutes later (observed: a frontend
-# started right after the workers log "Registered base model" serves an empty
-# /v1/models for 2+ min, while a plain restart once the workers are fully ready
-# serves immediately). So the reliable readiness signal is to (re)start the
-# frontend and check /v1/models; if empty, restart and retry.
-# Worker readiness lags the "Registered base model" log line: a frontend started
-# in that early window snapshots an empty registry and never recovers, while a
-# frontend started once the workers are fully discoverable serves /v1/models in
-# ~5s (measured). So: SETTLE briefly, then keep a frontend up FRONTEND_POLL_TRIES
-# x 5s per attempt (each attempt gives a fresh frontend enough uninterrupted time
-# to discover), restarting up to FRONTEND_ATTEMPTS times. Generous + env-tunable.
-sleep "${FRONTEND_SETTLE_S:-20}"
-echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT (settle=${FRONTEND_SETTLE_S:-20}s attempts=${FRONTEND_ATTEMPTS:-8} poll_tries=${FRONTEND_POLL_TRIES:-12})"
-served=0
-for attempt in $(seq 1 "${FRONTEND_ATTEMPTS:-8}"); do
+# Two facts measured on the box:
+#  1. Worker readiness LAGS the "Registered base model" log line by ~1 min; a
+#     frontend started in that early window snapshots an empty registry.
+#  2. A SINGLE long-lived frontend started once the workers are discoverable
+#     serves /v1/models in ~5 s and stays populated -- but CHURNING it (docker
+#     rm -f + immediate re-run every ~minute) never discovers the model (stale
+#     etcd lease / port still in TIME_WAIT on the host network).
+# So: SETTLE past the readiness lag, then start ONE frontend and poll it WITHOUT
+# churn. Only if it never populates do we do a small number of clean restart
+# fallbacks (for the rare stuck-snapshot case). All windows are env-tunable.
+_frontend_start() {
   docker rm -f "$DYN_FRONTEND_NAME" >/dev/null 2>&1 || true
   docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
-    "$DYNAMO_IMAGE" \
-    python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
-  for _ in $(seq 1 "${FRONTEND_POLL_TRIES:-12}"); do
+    "$DYNAMO_IMAGE" python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
+}
+_frontend_poll() {  # $1 = number of 5 s polls
+  local _
+  for _ in $(seq 1 "$1"); do
     if curl -sf "http://localhost:${FRONTEND_HTTP_PORT}/v1/models" 2>/dev/null | grep -q '"id"'; then
-      served=1; break
+      return 0
     fi
     sleep 5
   done
-  [ "$served" = 1 ] && { echo "[dynamo] model is served (frontend attempt $attempt)"; break; }
-  echo "[dynamo] /v1/models still empty after ~$(( ${FRONTEND_POLL_TRIES:-12} * 5 ))s; restarting frontend (attempt $attempt)..."
-done
+  return 1
+}
+
+POLL_TRIES="${FRONTEND_POLL_TRIES:-48}"      # 48 x 5 s = 4 min of uninterrupted polling
+RESTART_FALLBACKS="${FRONTEND_RESTART_FALLBACKS:-2}"
+echo "[dynamo] settling ${FRONTEND_SETTLE_S:-60}s for worker readiness before the frontend ..."
+sleep "${FRONTEND_SETTLE_S:-60}"
+echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT (single long-lived; poll ~$(( POLL_TRIES * 5 ))s, ${RESTART_FALLBACKS} restart fallbacks)"
+served=0
+_frontend_start
+if _frontend_poll "$POLL_TRIES"; then served=1; fi
 if [ "$served" != 1 ]; then
-  echo "[dynamo] FATAL: model not served after frontend restarts; workers did not register. " \
-       "Check 'docker logs dyn_prefill_1 / dyn_decode_1'. Not recording identity; aborting." >&2
+  for fb in $(seq 1 "$RESTART_FALLBACKS"); do
+    echo "[dynamo] /v1/models still empty; clean restart fallback $fb ..."
+    _frontend_start
+    if _frontend_poll "$POLL_TRIES"; then served=1; break; fi
+  done
+fi
+[ "$served" = 1 ] && echo "[dynamo] model is served"
+if [ "$served" != 1 ]; then
+  echo "[dynamo] FATAL: model not served; workers registered but /v1/models stayed empty." >&2
+  echo "[dynamo] --- diagnostics ---" >&2
+  docker ps -a | grep -E 'dyn_frontend|dyn_prefill|dyn_decode' >&2 || true
+  echo "[dynamo] frontend log:" >&2; docker logs "$DYN_FRONTEND_NAME" --tail 25 >&2 2>&1 || true
+  echo "[dynamo] last /v1/models:" >&2; curl -s "http://localhost:${FRONTEND_HTTP_PORT}/v1/models" >&2 2>&1 || true
+  echo "" >&2
   exit 1
 fi
 
