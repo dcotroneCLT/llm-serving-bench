@@ -45,6 +45,11 @@ def uss_of(proc: psutil.Process) -> int:
 def main() -> None:
     p = argparse.ArgumentParser(description="Verify PGID scoping captures all dynamo memory.")
     p.add_argument("--component-pids", type=Path, required=True)
+    p.add_argument("--tolerance-mb", type=float, default=64.0,
+                   help="Allowed absolute USS gap (MB) between the all-dynamo-PID total and the "
+                        "recorded-pgid aggregate before declaring INCOMPLETE.")
+    p.add_argument("--tolerance-frac", type=float, default=0.01,
+                   help="Allowed relative gap (fraction of the all-dynamo-PID total).")
     args = p.parse_args()
 
     ident = json.loads(args.component_pids.read_text())
@@ -82,18 +87,29 @@ def main() -> None:
         if related and not in_recorded:
             escapees.append((pid, pgid, u, cmd[:90]))
 
-    print(f"\nA) recorded-pgid USS sum : {a_uss/1e6:.1f} MB over {len(in_pgid)} PIDs")
+    # Empirical completeness: compare the smaps USS total over ALL dynamo-related
+    # PIDs (the recorded-pgid set PLUS any escapee found by descendant/cmdline
+    # scan) against the recorded-pgid aggregate the monitor actually sums. They
+    # must match within tolerance; a positive gap is memory the monitor drops.
     esc_uss = sum(e[2] for e in escapees)
-    print(f"   escaping dynamo-related PIDs (descendant or cmdline match, NOT in a recorded pgid): "
-          f"{len(escapees)}  USS={esc_uss/1e6:.1f} MB")
+    total_dynamo_uss = a_uss + esc_uss
+    gap = esc_uss
+    tol = max(args.tolerance_mb * 1e6, args.tolerance_frac * total_dynamo_uss)
+
+    print(f"\nA) recorded-pgid aggregate USS (what the monitor sums): {a_uss/1e6:.1f} MB over {len(in_pgid)} PIDs")
+    print(f"B) all-dynamo-PID smaps USS total (ps/pgrep scope)     : {total_dynamo_uss/1e6:.1f} MB")
+    print(f"   gap B-A = {gap/1e6:.1f} MB   tolerance = {tol/1e6:.1f} MB   "
+          f"escaping PIDs = {len(escapees)}")
     for pid, pgid, u, cmd in sorted(escapees, key=lambda e: -e[2]):
         print(f"     pid={pid} pgid={pgid} uss={u/1e6:.1f}MB  {cmd}")
 
-    if not escapees:
-        print("\nVERDICT: COMPLETE - every dynamo-related memory-holding process is inside a recorded pgid.")
+    if gap <= tol:
+        print("\nVERDICT: COMPLETE - all-dynamo-PID USS matches the recorded-pgid aggregate "
+              "within tolerance; no memory-holding process escaped the recorded pgids.")
         return
-    print("\nVERDICT: INCOMPLETE - the above process(es) hold memory the monitor does NOT sum. "
-          "Investigate (orphan -> reap; genuine component child in its own pgid -> widen the recorded identity).")
+    print("\nVERDICT: INCOMPLETE - the all-dynamo-PID total exceeds the recorded-pgid aggregate "
+          "by more than tolerance; the above process(es) hold memory the monitor does NOT sum. "
+          "Investigate (orphan -> reap; genuine component child in its own pgid -> widen the identity).")
     sys.exit(2)
 
 

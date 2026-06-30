@@ -86,12 +86,23 @@ done
 # before starting the frontend. ~5 min cap covers cold model load.
 echo "[dynamo] waiting for workers to register the model (model load ~1-3 min)..."
 for c in "${WORKER_NAMES[@]}"; do
+  registered=0
   for _ in $(seq 1 60); do
     if docker logs "$c" 2>&1 | grep -q "Registered base model"; then
-      echo "[dynamo]   $c registered"; break
+      echo "[dynamo]   $c registered"; registered=1; break
+    fi
+    # Fail fast (and bound the wait) if the worker container has already exited:
+    # a bad model / startup crash would otherwise stall here for the full timeout.
+    if [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || echo false)" != "true" ]; then
+      echo "[dynamo] FATAL: worker $c exited before registering the model; check 'docker logs $c'." >&2
+      exit 1
     fi
     sleep 5
   done
+  if [ "$registered" != 1 ]; then
+    echo "[dynamo] FATAL: worker $c did not register within the timeout; check 'docker logs $c'." >&2
+    exit 1
+  fi
 done
 
 # --- Frontend (HTTP ingress + in-process KV router; no separate router PID) ---

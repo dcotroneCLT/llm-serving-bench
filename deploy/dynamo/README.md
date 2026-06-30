@@ -188,3 +188,30 @@ Drive monitors + client + manifest against the running frontend with
 `scripts/attach_run.py` (it does NOT manage the engine lifecycle — that is the
 later launch_cell/campaign work). See `scripts/attach_run.py --help` and the
 `campaigns/extension/cells/val_*.yaml` cells.
+
+## Re-pass gate (BATCH 1 + PHASE A): one command
+
+`repass_gate2.sh` is the consolidated box-validation gate. It brings the
+disaggregated stack up, drives a ~1500 s VALIDATION run (not a soak), runs the
+multi-process validator and the empirical scoping check, proves the fail-loud
+failure path, and confirms the disk check resolves the real docker data-root. It
+cleans up (serve_down + infra_down + reaper) on exit, success or failure.
+
+```bash
+conda activate wosar
+bash deploy/dynamo/repass_gate2.sh        # ~30 min; prints a PASS/FAIL summary
+# overrides: DURATION_S=900 RUNS_ROOT=~/wosar/runs bash deploy/dynamo/repass_gate2.sh
+```
+
+It ends with a single summary; the gate is green only when OVERALL is PASS:
+
+| check | meaning |
+|---|---|
+| `pip_pin` | vLLM 0.20.1 on all three images |
+| `bringup` | disaggregated stack served the model |
+| `validator` | `validate_extension_run.py` -> GATE: PASS |
+| `no_orphans` | no tick had a stray outside the recorded pgids |
+| `n_pids_unexpected_0` | explicit: max `n_pids_unexpected` over engine components is 0 |
+| `verify_scoping` | smaps USS of all dynamo PIDs matches the recorded-pgid aggregate within tolerance (COMPLETE) |
+| `fail_loud_negative` | bring-up against a bogus model EXITS NON-ZERO (does not proceed) |
+| `disk_root` | the disk check resolves `DockerRootDir`, not `/var/lib` |
