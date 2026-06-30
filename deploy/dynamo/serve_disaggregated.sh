@@ -19,7 +19,7 @@
 # python -m dynamo.vllm --help` and `python -m dynamo.frontend --help`, then
 # freeze (a) the flags here and (b) the realized `ps` cmdlines into the cell
 # yaml component regexes (campaigns/extension/cells/val_dynamo_disagg.yaml).
-set -uo pipefail
+set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
 COMMON_ENV=(
@@ -117,7 +117,11 @@ for attempt in $(seq 1 6); do
   [ "$served" = 1 ] && { echo "[dynamo] model is served (frontend attempt $attempt)"; break; }
   echo "[dynamo] /v1/models still empty; restarting frontend (attempt $attempt)..."
 done
-[ "$served" = 1 ] || echo "[dynamo] WARNING: model not served after frontend restarts; check worker logs."
+if [ "$served" != 1 ]; then
+  echo "[dynamo] FATAL: model not served after frontend restarts; workers did not register. " \
+       "Check 'docker logs dyn_prefill_1 / dyn_decode_1'. Not recording identity; aborting." >&2
+  exit 1
+fi
 
 # Record each component's process-group identity so the monitor scopes to EXACTLY
 # these PGIDs (not a host-wide cmdline regex). One --component per label, with all

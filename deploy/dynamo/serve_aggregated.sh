@@ -5,7 +5,7 @@
 #
 # Prereq: bash deploy/dynamo/infra_up.sh
 # Usage:  bash deploy/dynamo/serve_aggregated.sh
-set -uo pipefail
+set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
 COMMON_ENV=(
@@ -56,7 +56,10 @@ for attempt in $(seq 1 6); do
   [ "$served" = 1 ] && { echo "[dynamo] model is served (frontend attempt $attempt)"; break; }
   echo "[dynamo] /v1/models still empty; restarting frontend (attempt $attempt)..."
 done
-[ "$served" = 1 ] || echo "[dynamo] WARNING: model not served after frontend restarts; check worker logs."
+if [ "$served" != 1 ]; then
+  echo "[dynamo] FATAL: model not served after frontend restarts; check 'docker logs $DYN_AGG_WORKER_NAME'." >&2
+  exit 1
+fi
 
 echo "[dynamo] launched: 1 worker + frontend."
 echo "[dynamo] readiness: curl -sf http://localhost:${FRONTEND_HTTP_PORT}/v1/models"

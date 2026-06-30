@@ -4,7 +4,7 @@
 # the "infra" aggregate, kept OUT of the engine USS aggregate.
 #
 # Usage: bash deploy/dynamo/infra_up.sh
-set -uo pipefail
+set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
 docker rm -f "$ETCD_NAME" "$NATS_NAME" >/dev/null 2>&1 || true

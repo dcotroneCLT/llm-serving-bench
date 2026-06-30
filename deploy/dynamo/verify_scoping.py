@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 import psutil
@@ -93,6 +94,7 @@ def main() -> None:
         return
     print("\nVERDICT: INCOMPLETE - the above process(es) hold memory the monitor does NOT sum. "
           "Investigate (orphan -> reap; genuine component child in its own pgid -> widen the recorded identity).")
+    sys.exit(2)
 
 
 if __name__ == "__main__":

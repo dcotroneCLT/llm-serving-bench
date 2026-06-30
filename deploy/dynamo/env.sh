@@ -4,7 +4,7 @@
 # Source this from the serve_*.sh scripts: `source "$(dirname "$0")/env.sh"`.
 # Single box, local CLI deploy (no Kubernetes). Pinned vLLM 0.20.1 stack.
 
-set -uo pipefail
+set -euo pipefail
 
 # --- Pinned image (vLLM 0.20.1; see engines/dynamo_vllm/image_pin.json) ---
 # Pin re-derived after the box gate: 0.16.0 had no Triton release, so the
