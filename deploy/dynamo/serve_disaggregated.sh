@@ -112,24 +112,28 @@ done
 # /v1/models for 2+ min, while a plain restart once the workers are fully ready
 # serves immediately). So the reliable readiness signal is to (re)start the
 # frontend and check /v1/models; if empty, restart and retry.
-# FRONTEND_ATTEMPTS restarts, each polling /v1/models FRONTEND_POLL_TRIES x 5s
-# before giving the frontend up and restarting it. Both are env-tunable so the
-# window can be matched to the measured discovery time without code changes.
-echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT (attempts=${FRONTEND_ATTEMPTS:-6} poll_tries=${FRONTEND_POLL_TRIES:-6})"
+# Worker readiness lags the "Registered base model" log line: a frontend started
+# in that early window snapshots an empty registry and never recovers, while a
+# frontend started once the workers are fully discoverable serves /v1/models in
+# ~5s (measured). So: SETTLE briefly, then keep a frontend up FRONTEND_POLL_TRIES
+# x 5s per attempt (each attempt gives a fresh frontend enough uninterrupted time
+# to discover), restarting up to FRONTEND_ATTEMPTS times. Generous + env-tunable.
+sleep "${FRONTEND_SETTLE_S:-20}"
+echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT (settle=${FRONTEND_SETTLE_S:-20}s attempts=${FRONTEND_ATTEMPTS:-8} poll_tries=${FRONTEND_POLL_TRIES:-12})"
 served=0
-for attempt in $(seq 1 "${FRONTEND_ATTEMPTS:-6}"); do
+for attempt in $(seq 1 "${FRONTEND_ATTEMPTS:-8}"); do
   docker rm -f "$DYN_FRONTEND_NAME" >/dev/null 2>&1 || true
   docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
     "$DYNAMO_IMAGE" \
     python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
-  for _ in $(seq 1 "${FRONTEND_POLL_TRIES:-6}"); do
+  for _ in $(seq 1 "${FRONTEND_POLL_TRIES:-12}"); do
     if curl -sf "http://localhost:${FRONTEND_HTTP_PORT}/v1/models" 2>/dev/null | grep -q '"id"'; then
       served=1; break
     fi
     sleep 5
   done
   [ "$served" = 1 ] && { echo "[dynamo] model is served (frontend attempt $attempt)"; break; }
-  echo "[dynamo] /v1/models still empty; restarting frontend (attempt $attempt)..."
+  echo "[dynamo] /v1/models still empty after ~$(( ${FRONTEND_POLL_TRIES:-12} * 5 ))s; restarting frontend (attempt $attempt)..."
 done
 if [ "$served" != 1 ]; then
   echo "[dynamo] FATAL: model not served after frontend restarts; workers did not register. " \
