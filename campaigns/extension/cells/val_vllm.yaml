@@ -14,7 +14,7 @@ description: |
 
 engine:
   image_repo: vllm/vllm-openai
-  image_tag: v0.20.1-cu130
+  image_tag: v0.20.1-cu129
   digest_pin_file: engines/vllm_standalone/image_pin_ext.json
   container_name_template: "val_vllm_r{replica}"
   command:

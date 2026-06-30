@@ -56,7 +56,7 @@ final word.)
 |---|---|---|
 | Dynamo | `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13` | 0.20.1 |
 | Triton | `nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3` | 0.20.1 |
-| Standalone | `vllm/vllm-openai:v0.20.1-cu130` | 0.20.1 |
+| Standalone | `vllm/vllm-openai:v0.20.1-cu129` | 0.20.1 |
 
 Digests are recorded in `engines/{dynamo_vllm,triton_vllm,vllm_standalone}/image_pin*.json`
 at pull time (`docker inspect --format '{{index .RepoDigests 0}}'`).
@@ -90,5 +90,8 @@ Clean intersections: **0.19.0** (Dynamo 1.1.1 + Triton 26.04) and **0.20.1**
    cannot run "Triton" without Triton's image) and is mitigated by holding the
    vLLM orchestration layer identical. It is strictly better than the preprint's
    vLLM version-drift confound; do not paper over it, declare it.
-3. **CUDA vs host driver.** The `-cuda13` / `cu130` images require the host
-   driver to support CUDA 13.x (cci-csgpu11: 580.159.03 → OK).
+3. **CUDA vs host driver.** Dynamo/Triton are CUDA 13.x; the standalone
+   `vllm/vllm-openai:v0.20.1-cu129` is CUDA 12.9 (upstream 0.20.1 ships no
+   `-cu130`). Both run on the host driver 580.159.03 (supports CUDA 13.x, and
+   12.9 backward-compat). The CUDA delta is part of the per-image substrate
+   caveat (#2); vLLM 0.20.1 is identical across all three.

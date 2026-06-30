@@ -26,9 +26,9 @@ localhost, and so the host `ps`/`/proc` sees the `python -m dynamo.*` processes
 |---|---|
 | Dynamo | `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13` (1.2.0 stable) |
 | Triton | `nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3` |
-| Standalone | `vllm/vllm-openai:v0.20.1-cu130` |
+| Standalone | `vllm/vllm-openai:v0.20.1-cu129` |
 | vLLM | 0.20.1 (identical across all three) |
-| CUDA | 13.x (matches host driver 580.x) |
+| CUDA | Dynamo/Triton 13.x; standalone 12.9 (cu129). Both OK on driver 580.x |
 | Model | Qwen/Qwen2.5-7B-Instruct, ctx 8192, BF16 |
 
 ## 0. Verify the vLLM version (the whole point of the pin)
@@ -40,11 +40,11 @@ the API server, so it needs `--entrypoint pip`:
 ```bash
 docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 pip show vllm | grep -i '^Version'   # 0.20.1
 docker run --rm nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3 pip show vllm | grep -i '^Version'    # 0.20.1 (gate-critical)
-docker run --rm --entrypoint pip vllm/vllm-openai:v0.20.1-cu130 show vllm | grep -i '^Version'          # 0.20.1
+docker run --rm --entrypoint pip vllm/vllm-openai:v0.20.1-cu129 show vllm | grep -i '^Version'          # 0.20.1
 # record each digest into the matching engines/*/image_pin*.json:
 for img in nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 \
            nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3 \
-           vllm/vllm-openai:v0.20.1-cu130; do
+           vllm/vllm-openai:v0.20.1-cu129; do
   docker inspect --format '{{index .RepoDigests 0}}' "$img"
 done
 ```

@@ -1,13 +1,13 @@
 {
-  "image_tag": "vllm/vllm-openai:v0.20.1-cu130",
+  "image_tag": "vllm/vllm-openai:v0.20.1-cu129",
   "digest": "",
-  "source_tag": "vllm/vllm-openai:v0.20.1-cu130",
+  "source_tag": "vllm/vllm-openai:v0.20.1-cu129",
   "pinned_at": "",
   "vllm_version": "0.20.1",
-  "cuda": "13.0",
-  "role": "Extension campaign: vLLM standalone, OpenAI-compatible server. Docker Hub upstream (NOT NGC nvcr.io/nvidia/vllm).",
+  "cuda": "12.9",
+  "role": "Extension campaign: vLLM standalone, OpenAI-compatible server. Docker Hub upstream (NOT NGC nvcr.io/nvidia/vllm). vLLM 0.20.1 identical to the other two; CUDA differs (12.9 here vs 13.x for Triton/Dynamo) -- upstream 0.20.1 ships -cu129, not -cu130. Substrate difference is the declared TTV caveat; runs fine on driver 580.",
   "_digest_TODO": "Record at pull time on cci-csgpu11; fill the digest before any production run.",
-  "_digest_capture_cmd": "docker pull vllm/vllm-openai:v0.20.1-cu130 && docker inspect --format '{{index .RepoDigests 0}}' vllm/vllm-openai:v0.20.1-cu130",
-  "_vllm_verify_cmd": "docker run --rm --entrypoint pip vllm/vllm-openai:v0.20.1-cu130 show vllm | grep -i '^Version'  # --entrypoint pip: the image entrypoint is the api server",
-  "_source": "Docker Hub vllm/vllm-openai; v0.20.1-cu130 expected (v0.16.0-cu130 existed). CONFIRM tag + version on box; if -cu130 absent, try bare v0.20.1."
+  "_digest_capture_cmd": "docker pull vllm/vllm-openai:v0.20.1-cu129 && docker inspect --format '{{index .RepoDigests 0}}' vllm/vllm-openai:v0.20.1-cu129",
+  "_vllm_verify_cmd": "docker run --rm --entrypoint pip vllm/vllm-openai:v0.20.1-cu129 show vllm | grep -i '^Version'  # --entrypoint pip: the image entrypoint is the api server",
+  "_source": "Docker Hub vllm/vllm-openai tags API: for 0.20.1 the CUDA variants are -cu129 (no -cu130). Confirmed on box."
 }
