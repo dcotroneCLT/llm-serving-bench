@@ -20,7 +20,7 @@ Confirm that the host is in the expected state.
 ```bash
 nvidia-smi
 lsb_release -a
-df -h /var/lib
+df -h "$(docker info -f '{{.DockerRootDir}}')"   # the REAL docker data-root, not /var/lib
 free -g
 uname -r
 ```
@@ -28,7 +28,9 @@ uname -r
 What to look for:
 - `nvidia-smi` lists 4 L40S GPUs, all idle (0 MiB used), no processes running.
 - `lsb_release` reports Ubuntu 22.04 or 24.04 LTS.
-- `/var/lib` partition has at least 100 GB free (Docker stores images here).
+- The **docker data-root** filesystem (`docker info -f '{{.DockerRootDir}}'`, which
+  on this box was moved to `/home`, NOT `/var/lib`) has at least 100 GB free
+  (Docker stores images and container layers there).
 - `free -g` confirms ~256 GB total RAM.
 - Kernel 5.15 or newer.
 

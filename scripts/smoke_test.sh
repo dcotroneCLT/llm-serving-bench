@@ -31,7 +31,7 @@ CELL_YAML="${1:?usage: smoke_test.sh <cell_yaml> [replica]}"
 REPLICA="${2:-99}"
 
 # ---- Thresholds (tune here, used below) ----
-MIN_VAR_LIB_GB=30          # min free on /var/lib (docker data root)
+MIN_DOCKER_ROOT_GB=30      # min free on the docker data-root (DockerRootDir)
 MIN_HOME_GB=5              # min free on /home (run dirs, CSVs)
 MIN_RSS_MB=100             # alive samples must report >= 100 MB rss
 MAX_DEAD_PCT=20            # > 20% dead samples is a HARD fail
@@ -60,12 +60,14 @@ echo "[smoke] smoke dir: $SMOKE_DIR"
 
 # ---- Check 1: pre-flight disk space ----
 echo "[smoke] check 1: disk space"
-VAR_LIB_FREE_GB=$(df --output=avail -BG /var/lib | tail -1 | tr -d 'G ')
+DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)
+[ -z "$DOCKER_ROOT" ] && DOCKER_ROOT=/var/lib/docker
+DOCKER_ROOT_FREE_GB=$(df --output=avail -BG "$DOCKER_ROOT" | tail -1 | tr -d 'G ')
 HOME_FREE_GB=$(df --output=avail -BG /home | tail -1 | tr -d 'G ')
-echo "[smoke]   /var/lib free: ${VAR_LIB_FREE_GB} GB (need >= ${MIN_VAR_LIB_GB})"
+echo "[smoke]   docker data-root ($DOCKER_ROOT) free: ${DOCKER_ROOT_FREE_GB} GB (need >= ${MIN_DOCKER_ROOT_GB})"
 echo "[smoke]   /home    free: ${HOME_FREE_GB} GB (need >= ${MIN_HOME_GB})"
-if [ "$VAR_LIB_FREE_GB" -lt "$MIN_VAR_LIB_GB" ]; then
-  echo "[smoke] HARD FAIL: /var/lib free space < ${MIN_VAR_LIB_GB} GB."
+if [ "$DOCKER_ROOT_FREE_GB" -lt "$MIN_DOCKER_ROOT_GB" ]; then
+  echo "[smoke] HARD FAIL: docker data-root ($DOCKER_ROOT) free space < ${MIN_DOCKER_ROOT_GB} GB."
   echo "[smoke] Docker images + container layers may not fit. Free space or resize before continuing."
   exit 1
 fi
@@ -315,7 +317,7 @@ fi
 # Final disk check after the run (catches runs that left a lot of debris)
 echo ""
 echo "[smoke] check 7: disk free after run"
-df -h /var/lib /home | tail -2
+df -h "$DOCKER_ROOT" /home | tail -2
 
 echo ""
 echo "[smoke] ============================================================"

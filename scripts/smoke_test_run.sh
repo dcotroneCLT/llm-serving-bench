@@ -151,14 +151,17 @@ check_a() {
     echo ""
     echo "${BOLD}=== Section A: pre-flight (system clean) ===${RESET}"
 
-    # A.1 disk space
-    local var_lib_gb home_gb
-    var_lib_gb=$(df --output=avail -BG /var/lib | tail -1 | tr -d 'G ')
+    # A.1 disk space. Check the REAL docker data-root (moved to /home on this box),
+    # not /var/lib.
+    local docker_root docker_root_gb home_gb
+    docker_root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)
+    [ -z "$docker_root" ] && docker_root=/var/lib/docker
+    docker_root_gb=$(df --output=avail -BG "$docker_root" | tail -1 | tr -d 'G ')
     home_gb=$(df --output=avail -BG /home | tail -1 | tr -d 'G ')
-    if [ "$var_lib_gb" -lt 30 ]; then
-        record FAIL "A.disk.var_lib" "free=${var_lib_gb}GB < 30GB (Docker layer storage)"
+    if [ "$docker_root_gb" -lt 30 ]; then
+        record FAIL "A.disk.docker_root" "free=${docker_root_gb}GB < 30GB at ${docker_root} (Docker layer storage)"
     else
-        record PASS "A.disk.var_lib" "free=${var_lib_gb}GB"
+        record PASS "A.disk.docker_root" "free=${docker_root_gb}GB at ${docker_root}"
     fi
     if [ "$home_gb" -lt 5 ]; then
         record FAIL "A.disk.home" "free=${home_gb}GB < 5GB (run dir + CSVs)"

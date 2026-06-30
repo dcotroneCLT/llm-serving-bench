@@ -27,8 +27,8 @@
 #
 # Tunable thresholds (env vars override):
 #   HEALTH_MIN_RUNS_ROOT_GB=5     runs_root free, hard fail if below
-#   HEALTH_MIN_VAR_LIB_GB=10      host /var/lib free, hard fail if below
-#   HEALTH_WARN_VAR_LIB_GB=20     host /var/lib free, early warn if below
+#   HEALTH_MIN_DOCKER_ROOT_GB=10  docker data-root free, hard fail if below
+#   HEALTH_WARN_DOCKER_ROOT_GB=20 docker data-root free, early warn if below
 #   HEALTH_MIN_ALIVE_PCT=95       proc_alive threshold, fail if below
 #   HEALTH_MIN_RSS_MB=100         per-cell RSS floor, fail if below (wrong PID)
 #   HEALTH_MIN_VRAM_MIB=1000      per-cell VRAM floor, fail if below
@@ -55,8 +55,9 @@ fi
 
 # ---------- Thresholds ----------
 HEALTH_MIN_RUNS_ROOT_GB="${HEALTH_MIN_RUNS_ROOT_GB:-${HEALTH_MIN_HOME_GB:-5}}"
-HEALTH_MIN_VAR_LIB_GB="${HEALTH_MIN_VAR_LIB_GB:-10}"
-HEALTH_WARN_VAR_LIB_GB="${HEALTH_WARN_VAR_LIB_GB:-20}"
+# Old HEALTH_*_VAR_LIB_GB names are still honoured as a fallback default.
+HEALTH_MIN_DOCKER_ROOT_GB="${HEALTH_MIN_DOCKER_ROOT_GB:-${HEALTH_MIN_VAR_LIB_GB:-10}}"
+HEALTH_WARN_DOCKER_ROOT_GB="${HEALTH_WARN_DOCKER_ROOT_GB:-${HEALTH_WARN_VAR_LIB_GB:-20}}"
 HEALTH_MIN_ALIVE_PCT="${HEALTH_MIN_ALIVE_PCT:-95}"
 HEALTH_MIN_RSS_MB="${HEALTH_MIN_RSS_MB:-100}"
 HEALTH_MIN_VRAM_MIB="${HEALTH_MIN_VRAM_MIB:-1000}"
@@ -381,9 +382,12 @@ echo ""
 
 echo "${BOLD}== Section A: campaign-wide ==${RESET}"
 
-# A.1 disk space
+# A.1 disk space. The docker data-root is NOT necessarily /var/lib: on this box
+# it was moved to /home, so check the REAL DockerRootDir (`docker info`).
 RUNS_ROOT_GB=$(disk_free_gb "$RUNS_ROOT")
-VAR_LIB_GB=$(disk_free_gb /var/lib)
+DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)
+[ -z "$DOCKER_ROOT" ] && DOCKER_ROOT=/var/lib/docker
+DOCKER_ROOT_GB=$(disk_free_gb "$DOCKER_ROOT")
 if ! is_int "$RUNS_ROOT_GB"; then
     record WARN "A.disk.runs_root" "could not read free space for $RUNS_ROOT"
 elif [ "$RUNS_ROOT_GB" -lt "$HEALTH_MIN_RUNS_ROOT_GB" ]; then
@@ -391,9 +395,9 @@ elif [ "$RUNS_ROOT_GB" -lt "$HEALTH_MIN_RUNS_ROOT_GB" ]; then
 else
     record PASS "A.disk.runs_root" "free=${RUNS_ROOT_GB}GB at $RUNS_ROOT"
 fi
-if ! is_int "$VAR_LIB_GB"; then
-    record WARN "A.disk.var_lib" "could not read free space for /var/lib"
-elif [ "$VAR_LIB_GB" -lt "$HEALTH_WARN_VAR_LIB_GB" ]; then
+if ! is_int "$DOCKER_ROOT_GB"; then
+    record WARN "A.disk.docker_root" "could not read free space for $DOCKER_ROOT"
+elif [ "$DOCKER_ROOT_GB" -lt "$HEALTH_WARN_DOCKER_ROOT_GB" ]; then
     # Below WARN line — append a one-line docker storage snapshot and a
     # mitigation hint so the message is self-explanatory. docker system df
     # is read-only and returns in <100ms; safe to call here.
@@ -401,13 +405,13 @@ elif [ "$VAR_LIB_GB" -lt "$HEALTH_WARN_VAR_LIB_GB" ]; then
         | awk '/^Images/ {printf "Images=%s reclaimable=%s", $4, $5; exit}')
     [ -z "$docker_df_line" ] && docker_df_line="docker df unavailable"
     mit_hint="mitigation: docker system prune -f (safe during live runs; log via scripts/log_mitigation.sh)"
-    if [ "$VAR_LIB_GB" -lt "$HEALTH_MIN_VAR_LIB_GB" ]; then
-        record FAIL "A.disk.var_lib" "free=${VAR_LIB_GB}GB < ${HEALTH_MIN_VAR_LIB_GB}GB | ${docker_df_line} | ${mit_hint}"
+    if [ "$DOCKER_ROOT_GB" -lt "$HEALTH_MIN_DOCKER_ROOT_GB" ]; then
+        record FAIL "A.disk.docker_root" "free=${DOCKER_ROOT_GB}GB < ${HEALTH_MIN_DOCKER_ROOT_GB}GB at $DOCKER_ROOT | ${docker_df_line} | ${mit_hint}"
     else
-        record WARN "A.disk.var_lib" "free=${VAR_LIB_GB}GB < ${HEALTH_WARN_VAR_LIB_GB}GB (early signal) | ${docker_df_line} | ${mit_hint}"
+        record WARN "A.disk.docker_root" "free=${DOCKER_ROOT_GB}GB < ${HEALTH_WARN_DOCKER_ROOT_GB}GB at $DOCKER_ROOT (early signal) | ${docker_df_line} | ${mit_hint}"
     fi
 else
-    record PASS "A.disk.var_lib" "free=${VAR_LIB_GB}GB"
+    record PASS "A.disk.docker_root" "free=${DOCKER_ROOT_GB}GB at $DOCKER_ROOT"
 fi
 
 # A.2 state file presence and parseable
