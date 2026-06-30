@@ -125,11 +125,14 @@ def die(msg: str, rc: int = 1) -> None:
     sys.exit(rc)
 
 
-def free_gb(path: Path) -> float:
+def free_gb(path: Path) -> Optional[float]:
+    """Free GiB at `path`, or None if it cannot be stat'd. NEVER returns inf:
+    fabricating 'infinite free space' on error would make a disk gate pass when
+    it must fail."""
     try:
         return shutil.disk_usage(str(path)).free / (1024 ** 3)
     except OSError:
-        return float("inf")
+        return None
 
 
 def docker_root_dir() -> Optional[Path]:
@@ -147,11 +150,14 @@ def docker_root_dir() -> Optional[Path]:
 def require_free_space(paths: list[Optional[Path]], min_gb: float, label: str = "run") -> None:
     """SC-2 #1: pre-run free-space GATE across the distinct filesystems behind
     `paths` (runs-root for CSVs, docker data-root for images/container logs).
-    Refuses to start if any is below min_gb."""
+    Refuses to start if any is below min_gb. A None path (e.g. the docker
+    data-root could not be determined) or a path that cannot be stat'd is a HARD
+    FAIL, not a skip: an unknown filesystem is exactly when we must not proceed."""
     seen: set = set()
     for p in paths:
         if p is None:
-            continue
+            die(f"free-space gate: a filesystem to check is unknown (docker data-root "
+                f"undetermined?) -- refusing to start {label}. Check `docker info`.", rc=7)
         try:
             key = os.stat(str(p)).st_dev
         except OSError:
@@ -160,6 +166,8 @@ def require_free_space(paths: list[Optional[Path]], min_gb: float, label: str = 
             continue
         seen.add(key)
         g = free_gb(p)
+        if g is None:
+            die(f"free-space gate: cannot stat {p} -- refusing to start {label}.", rc=7)
         log(f"free-space gate: {p} has {g:.1f} GB free")
         if g < min_gb:
             die(f"free-space gate: {p} has {g:.1f} GB < {min_gb} GB required to start {label}. "
