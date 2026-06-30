@@ -1,8 +1,8 @@
 {
   "image_tag": "vllm/vllm-openai:v0.20.1-cu129",
-  "digest": "",
+  "digest": "sha256:78e4a2c7d3fb7a84956bb2a2e6a537a241b64e5d1eea2d52f941f3a54ffc34f4",
   "source_tag": "vllm/vllm-openai:v0.20.1-cu129",
-  "pinned_at": "",
+  "pinned_at": "2026-06-29",
   "vllm_version": "0.20.1",
   "cuda": "12.9",
   "role": "Extension campaign: vLLM standalone, OpenAI-compatible server. Docker Hub upstream (NOT NGC nvcr.io/nvidia/vllm). vLLM 0.20.1 identical to the other two; CUDA differs (12.9 here vs 13.x for Triton/Dynamo) -- upstream 0.20.1 ships -cu129, not -cu130. Substrate difference is the declared TTV caveat; runs fine on driver 580.",

@@ -1,8 +1,8 @@
 {
   "image_tag": "nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3",
-  "digest": "",
+  "digest": "sha256:abf5043755e335fcb7b825d38caa18ea478179c5894e9b080d91143a5df37e67",
   "source_tag": "nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3",
-  "pinned_at": "",
+  "pinned_at": "2026-06-29",
   "vllm_version": "0.20.1",
   "triton_release": "26.05",
   "role": "Extension campaign: Triton + vLLM backend. 26.05 ships vLLM 0.20.1 (26.03 was 0.17.1; 0.16.0 is skipped by Triton entirely -- found via the box gate).",

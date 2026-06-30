@@ -1,8 +1,8 @@
 {
   "image_tag": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13",
-  "digest": "",
+  "digest": "sha256:f83912690fb5982f8d35cd79ab43c5941c0eaf84af980b07b7e27e7b98787171",
   "source_tag": "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13",
-  "pinned_at": "",
+  "pinned_at": "2026-06-29",
   "vllm_version": "0.20.1",
   "dynamo_release": "1.2.0",
   "cuda": "13.x",
