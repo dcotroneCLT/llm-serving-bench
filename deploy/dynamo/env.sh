@@ -39,6 +39,24 @@ AGG_GPU="${AGG_GPU:-0}"
 N_PREFILL="${N_PREFILL:-1}"
 N_DECODE="${N_DECODE:-1}"
 
+# --- NIXL KV-transfer side channel. Every worker is on the host network, so each
+#     must bind a DISTINCT side-channel port for the prefill<->decode handshake;
+#     otherwise the second worker dies with "Address already in use" on the
+#     default 5600. Ports are assigned base, base+1, ... across prefill then
+#     decode workers (5600 prefill_1, 5601 decode_1 for the 1+1 topology). ---
+NIXL_SIDE_CHANNEL_BASE_PORT="${NIXL_SIDE_CHANNEL_BASE_PORT:-5600}"
+
+# --- Workers run as root (uid 0:0). The shared HF cache is root-owned (written by
+#     the root-running standalone arm), and the Dynamo image's default uid 1000
+#     cannot traverse/write it. Running as root matches the cache ownership, so no
+#     chown/sudo is needed. The frontend does not touch the cache. ---
+WORKER_USER="${WORKER_USER:-0:0}"
+
+# --- vLLM disaggregated KV transfer connector (NIXL). Must be passed EXPLICITLY:
+#     in this image --connector is deprecated and the mode no longer defaults to
+#     nixl, so a prefill worker without it exits 1. Same value on both workers. ---
+KV_TRANSFER_CONFIG='{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+
 # --- Infra container images (etcd + NATS). Pin to the versions Dynamo 1.0.1
 #     documents; bump only deliberately. ---
 ETCD_IMAGE="${ETCD_IMAGE:-quay.io/coreos/etcd:v3.5.21}"

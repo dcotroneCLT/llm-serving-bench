@@ -62,19 +62,49 @@ docker ps | grep -E 'dyn_etcd|dyn_nats'
 
 ```bash
 bash deploy/dynamo/serve_aggregated.sh
-curl -sf http://localhost:8400/health && echo OK
+curl -s http://localhost:8400/v1/models   # must list the model, not {"data":[]}
 ```
 
 ## 2b. Disaggregated (2 GPU) — the campaign topology
 
 ```bash
 N_PREFILL=1 N_DECODE=1 PREFILL_GPU=0 DECODE_GPU=1 bash deploy/dynamo/serve_disaggregated.sh
-curl -sf http://localhost:8400/health && echo OK
+curl -s http://localhost:8400/v1/models   # must list the model
+# end-to-end smoke (HTTP 200 + a completion):
+curl -sS http://localhost:8400/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"Reply with one word: hello"}],"max_tokens":16}'
 ```
 
 Fixed topology, planner/autoscaler intentionally not launched, so the component
 set is constant for the whole run (a moving worker set would inject fake leak
 steps into the aggregate).
+
+**Use `/v1/models` (not `/health`) as the readiness check.** `/health` reports
+`healthy` even when no model is registered; only a non-empty `/v1/models` means
+the stack can actually serve.
+
+### Bring-up requirements baked into `serve_disaggregated.sh` (gate-2 findings)
+
+All real-hardware issues, found by the STEP 1 gate before any 48h run:
+
+- **etcd peer URLs** must be the literal `127.0.0.1` with an explicit
+  `--initial-cluster` (see `infra_up.sh`): etcd rewrites a `localhost` advertise
+  URL to the host IP but leaves `--initial-cluster` verbatim, so it exits 1.
+- **`--user 0:0`** on the workers: the shared HF cache is root-owned (written by
+  the root standalone arm); the image's default uid 1000 cannot write it.
+- **`--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'`**
+  on both workers: `--connector` is deprecated and the mode no longer defaults to
+  nixl, so a prefill worker without it exits 1.
+- **distinct `VLLM_NIXL_SIDE_CHANNEL_PORT` per worker** (5600, 5601, ...): all
+  workers share the host network and otherwise clash on the default 5600
+  ("Address already in use" in the NIXL handshake listener).
+- **start order**: workers first, frontend last (the script waits for each worker
+  to log "Registered base model", then for `/v1/models`). A frontend started
+  before registration serves an empty `/v1/models` and 404s every request.
+
+Known benign warning: `'EngineCoreProc' object has no attribute
+get_kv_cache_group_metadata` — a Dynamo-1.2.0/vLLM-0.20.1 API drift that falls
+back to `cache_config.block_size`; the worker still registers and serves.
 
 ## 3. Freeze the component regexes against the REAL process tree
 
