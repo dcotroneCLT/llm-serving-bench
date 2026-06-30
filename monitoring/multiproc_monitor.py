@@ -31,8 +31,8 @@ Component spec (JSON, --components-file):
     "components": [
       {"label": "dynamo_frontend", "pattern": "dynamo\\.frontend", "group": "engine",
        "note": "ingress + KV-router (router is in-process in the frontend, not a separate PID)"},
-      {"label": "dynamo_prefill",  "pattern": "dynamo\\.vllm", "require": "--is-prefill-worker", "group": "engine", "expected_count": 1},
-      {"label": "dynamo_decode",   "pattern": "dynamo\\.vllm", "exclude": "--is-prefill-worker", "group": "engine", "expected_count": 1},
+      {"label": "dynamo_prefill",  "pattern": "dynamo\\.vllm", "require": "--disaggregation-mode prefill", "group": "engine", "expected_count": 1},
+      {"label": "dynamo_decode",   "pattern": "dynamo\\.vllm", "require": "--disaggregation-mode decode", "group": "engine", "expected_count": 1},
       {"label": "etcd",            "pattern": "(^|/)etcd($|\\s)", "group": "infra"},
       {"label": "nats",            "pattern": "nats-server", "group": "infra"}
     ]

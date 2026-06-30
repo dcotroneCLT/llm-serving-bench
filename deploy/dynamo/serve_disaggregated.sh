@@ -40,7 +40,10 @@ docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}"
   "$DYNAMO_IMAGE" \
   python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT"
 
-# --- Prefill workers (GPU PREFILL_GPU); marked with --is-prefill-worker ---
+# --- Prefill workers (GPU PREFILL_GPU); --disaggregation-mode=prefill ---
+# (The legacy --is-prefill-worker flag is DEPRECATED in this image; the explicit
+# --disaggregation-mode is the supported form and gives the monitor a positive
+# cmdline token to match per component.)
 for i in $(seq 1 "$N_PREFILL"); do
   echo "[dynamo] prefill #$i on gpu $PREFILL_GPU"
   docker run -d --name "${DYN_PREFILL_PREFIX}_${i}" --network host \
@@ -49,10 +52,13 @@ for i in $(seq 1 "$N_PREFILL"); do
     python -m dynamo.vllm \
       --model "$MODEL" --max-model-len "$MAX_MODEL_LEN" \
       --gpu-memory-utilization "$GPU_MEM_UTIL" \
-      --is-prefill-worker
+      --disaggregation-mode prefill
 done
 
-# --- Decode workers (GPU DECODE_GPU); default vLLM behavior, NO prefill flag ---
+# --- Decode workers (GPU DECODE_GPU); --disaggregation-mode=decode ---
+# Must be set EXPLICITLY: the mode defaults to 'agg' (aggregated prefill+decode),
+# so a worker with no flag is NOT a decode-only worker and the disaggregated
+# topology would silently collapse to aggregated.
 for i in $(seq 1 "$N_DECODE"); do
   echo "[dynamo] decode #$i on gpu $DECODE_GPU"
   docker run -d --name "${DYN_DECODE_PREFIX}_${i}" --network host \
@@ -60,7 +66,8 @@ for i in $(seq 1 "$N_DECODE"); do
     "$DYNAMO_IMAGE" \
     python -m dynamo.vllm \
       --model "$MODEL" --max-model-len "$MAX_MODEL_LEN" \
-      --gpu-memory-utilization "$GPU_MEM_UTIL"
+      --gpu-memory-utilization "$GPU_MEM_UTIL" \
+      --disaggregation-mode decode
 done
 
 echo "[dynamo] launched: frontend + ${N_PREFILL} prefill + ${N_DECODE} decode (planner/autoscaler NOT started)."

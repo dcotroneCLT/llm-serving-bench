@@ -53,12 +53,12 @@ monitors:
         note: "ingress + in-process KV-router (router is NOT a separate PID)"
       - label: dynamo_prefill
         pattern: "dynamo\\.vllm"
-        require: "--is-prefill-worker"
+        require: "--disaggregation-mode prefill"
         group: engine
         expected_count: 1
       - label: dynamo_decode
         pattern: "dynamo\\.vllm"
-        exclude: "--is-prefill-worker"
+        require: "--disaggregation-mode decode"
         group: engine
         expected_count: 1
       - label: etcd

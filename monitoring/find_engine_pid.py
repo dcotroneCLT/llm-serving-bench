@@ -81,10 +81,10 @@ def cmdline_matches(
     multi-process component monitor.
 
     A cmdline matches when it matches `pattern`, AND (if given) matches
-    `require`, AND (if given) does NOT match `exclude`. `exclude` is what makes
-    the decode-vs-prefill split correct: decode = matches 'dynamo.vllm' but
-    NOT '--is-prefill-worker', so a naive positive-only regex would otherwise
-    pull prefill workers into the decode group.
+    `require`, AND (if given) does NOT match `exclude`. The Dynamo prefill/decode
+    split uses positive `require` on each worker's `--disaggregation-mode`
+    (prefill vs decode), so the two groups stay disjoint without relying on
+    `exclude`; `exclude` remains available for negative-match cases.
     """
     if not pattern.search(cmdline):
         return False

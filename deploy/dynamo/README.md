@@ -86,16 +86,21 @@ ps -eo pid,cmd | grep -E 'dynamo.frontend|dynamo.vllm' | grep -v grep
 
 Confirm the cmdlines and freeze the `pattern` / `require` / `exclude` regexes in
 `campaigns/extension/cells/val_dynamo_disagg.yaml` under `monitors.components`
-so they match reality (decode = `dynamo.vllm` AND NOT `--is-prefill-worker`).
+so they match reality (prefill = `dynamo.vllm --disaggregation-mode prefill`,
+decode = `dynamo.vllm --disaggregation-mode decode`).
 
 ## 4. First-bring-up flag check
 
-The component commands in `serve_*.sh` encode the researched Dynamo 1.0.1 CLI
-(`python -m dynamo.frontend`, `python -m dynamo.vllm [--is-prefill-worker]`).
-Confirm the exact flags once:
+The component commands in `serve_*.sh` use the explicit `--disaggregation-mode
+{prefill,decode}` form (`python -m dynamo.frontend`, `python -m dynamo.vllm
+--disaggregation-mode prefill|decode`). The legacy `--is-prefill-worker` flag
+is deprecated in this image, and a worker with no mode flag defaults to `agg`
+(aggregated), which would silently collapse the disaggregated topology.
+Confirm the exact flags once. NOTE: `dynamo.vllm --help` initializes the device,
+so it needs a GPU attached or it crashes with "Failed to infer device type":
 
 ```bash
-docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 python -m dynamo.vllm --help
+docker run --rm --gpus '"device=0"' nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 python -m dynamo.vllm --help
 docker run --rm nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13 python -m dynamo.frontend --help
 ```
 
