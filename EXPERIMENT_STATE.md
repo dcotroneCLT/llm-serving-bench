@@ -4,7 +4,51 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-06-07 (ET).
+Last updated: 2026-06-29 (ET).
+
+---
+
+## ⏸️ RESUME HERE (2026-06-29 evening) — STEP 1 gate in progress
+
+**Where we are:** STEP 1 code is complete (client features WS3/WS4, calibration
+WS5, per-component monitor WS2, Dynamo bring-up WS1, attach_run, gate checker;
+standing constraints SC-1 pin + SC-2 disk in code). On the box (cci-csgpu11) the
+setup is done:
+- **Pin LOCKED at vLLM 0.20.1**, ground-truthed by `pip show` on all three and
+  digests frozen in `engines/*/image_pin*.json`:
+  Dynamo `vllm-runtime:1.2.0-cuda13`, Triton `tritonserver:26.05-vllm-python-py3`,
+  standalone `vllm/vllm-openai:v0.20.1-cu129`. (0.16.0 was abandoned: Triton has
+  no 0.16.0 build. See `docs/extension_pin_constraint.md`.)
+- **Docker data-root moved to /home** (`/home/dcotrone/docker-data`), nvidia
+  runtime preserved. NOTE: Docker 29 uses the containerd image store at
+  `/var/lib/containerd` (126G LV); the old orphaned `/var/lib/docker` was deleted
+  to reclaim ~120G. Images (~72G) now fit on the 126G LV with margin; container
+  logs are capped (`--log-opt`); run CSVs go to /home.
+- **sudoers** `/etc/sudoers.d/wosar_proc_monitor` now also allows
+  `multiproc_monitor.py` (absolute path), verified without cached creds.
+
+**WAITING ON:** gate run 1 (vLLM standalone) launched in tmux `gate1`, logging to
+`~/wosar/gate1.log` (~24 min, unattended). It runs attach_run on
+`campaigns/extension/cells/val_vllm.yaml` then `analysis/validate_extension_run.py`
+on `~/wosar/runs/ext_attach_val_vllm_r01`.
+
+**NEXT (resume):**
+1. Read `~/wosar/gate1.log` -> the "GATE CHECKER" section. Expect `GATE: PASS`:
+   `[3]` shared_prefix ~0.80 + bursty CoV >> 1; `[4]` aging_trends emits
+   proc.uss_bytes. (`[1]/[2]` skipped: single-process.) This is the
+   single-process byte-compat confirmation.
+2. Then **gate run 2 — Dynamo disaggregated**: `bash deploy/dynamo/infra_up.sh`
+   + `serve_disaggregated.sh`; confirm `python -m dynamo.* --help` flags; FREEZE
+   the component regexes in `val_dynamo_disagg.yaml` against the real
+   `ps -eo pid,cmd | grep dynamo`; attach_run; gate checker (all 5 points).
+3. Gate PASS (both runs) => only THEN the serial campaign + Dynamo lifecycle
+   refactor (campaign.py/launch_cell), per the de-risk discipline.
+   Remaining SC-2 items to land WITH that refactor: #2 mid-run disk watchdog,
+   #4 gzip rotated CSV (+ gz-aware readers).
+
+Reminders: env `conda activate wosar`; always pass `--repo-root
+/home/dcotrone/wosar/llm-serving-bench` (absolute) so the sudo'd monitor path
+matches the sudoers rule.
 
 ---
 
@@ -1007,7 +1051,7 @@ Notable n=3 findings already locked (n>=2):
   **DECISIONE (Domenico): pin = 0.20.1**:
   - Dynamo `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0-cuda13`
   - Triton `nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3`
-  - standalone `vllm/vllm-openai:v0.20.1-cu130`
+  - standalone `vllm/vllm-openai:v0.20.1-cu129`
   Aggiornati: 3 pin file, `deploy/dynamo/env.sh`, `val_vllm.yaml`,
   `val_dynamo_disagg.yaml`, README. **Validazione DOPO il re-pin** (sullo stack
   finale). Sul box: ground-truth i tre con `pip show vllm` PRIMA del gate
