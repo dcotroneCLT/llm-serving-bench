@@ -45,12 +45,15 @@ trap cleanup EXIT
 echo "[repass] repo=$REPO run_dir=$RUN_DIR duration=${DURATION_S}s"
 
 # ----- step 0: vLLM pin guard (all three images must ship 0.20.1) -----
+# Accept a build/local-version suffix (triton ships 0.20.1+<sha>.nvNN, standalone
+# 0.20.1+cu129); the base version is what the pin fixes.
+is_2001() { case "$1" in 0.20.1|0.20.1+*) return 0 ;; *) return 1 ;; esac; }
 pin_ok=1
 v_dyn=$(docker run --rm "$DYNAMO_IMG" pip show vllm 2>/dev/null | awk -F': ' '/^Version/{print $2}')
 v_tri=$(docker run --rm "$TRITON_IMG" pip show vllm 2>/dev/null | awk -F': ' '/^Version/{print $2}')
 v_vllm=$(docker run --rm --entrypoint pip "$VLLM_IMG" show vllm 2>/dev/null | awk -F': ' '/^Version/{print $2}')
 echo "[repass] vllm: dynamo=$v_dyn triton=$v_tri standalone=$v_vllm"
-[ "$v_dyn" = "0.20.1" ] && [ "$v_tri" = "0.20.1" ] && [ "$v_vllm" = "0.20.1" ] || pin_ok=0
+is_2001 "$v_dyn" && is_2001 "$v_tri" && is_2001 "$v_vllm" || pin_ok=0
 mark "pip_pin" "$([ $pin_ok = 1 ] && echo PASS || echo FAIL)"
 
 # ----- step 1: bring up the disaggregated stack -----

@@ -112,14 +112,17 @@ done
 # /v1/models for 2+ min, while a plain restart once the workers are fully ready
 # serves immediately). So the reliable readiness signal is to (re)start the
 # frontend and check /v1/models; if empty, restart and retry.
-echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT"
+# FRONTEND_ATTEMPTS restarts, each polling /v1/models FRONTEND_POLL_TRIES x 5s
+# before giving the frontend up and restarting it. Both are env-tunable so the
+# window can be matched to the measured discovery time without code changes.
+echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT (attempts=${FRONTEND_ATTEMPTS:-6} poll_tries=${FRONTEND_POLL_TRIES:-6})"
 served=0
-for attempt in $(seq 1 6); do
+for attempt in $(seq 1 "${FRONTEND_ATTEMPTS:-6}"); do
   docker rm -f "$DYN_FRONTEND_NAME" >/dev/null 2>&1 || true
   docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
     "$DYNAMO_IMAGE" \
     python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
-  for _ in $(seq 1 6); do   # ~30s per attempt
+  for _ in $(seq 1 "${FRONTEND_POLL_TRIES:-6}"); do
     if curl -sf "http://localhost:${FRONTEND_HTTP_PORT}/v1/models" 2>/dev/null | grep -q '"id"'; then
       served=1; break
     fi
