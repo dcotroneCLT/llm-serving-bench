@@ -150,6 +150,19 @@ def check(run_dir: Path) -> int:
         log(f"[HARD] manifest.json missing")
         return HARD_FAIL
     manifest = json.loads(manifest_path.read_text())
+
+    # 0. This validator is for SINGLE-PROCESS runs only. A multi-process run
+    # (e.g. Dynamo) has many proc-like CSVs; find_proc_csvs would lump them into
+    # one RSS series and report a meaningless trend. Refuse and redirect.
+    monitors = manifest.get("monitors")
+    has_components = isinstance(monitors, dict) and bool(monitors.get("components"))
+    proc_prefix = manifest.get("proc_prefix", "")
+    if has_components or (isinstance(proc_prefix, str) and proc_prefix.startswith("agg_")):
+        log("[HARD] multi-process run (monitors.components / proc_prefix=agg_*) is not "
+            "supported by validation_check.py; use: "
+            "python3 analysis/validate_extension_run.py --run-dir <run_dir>")
+        return HARD_FAIL
+
     log(f"run_id          : {manifest.get('run_id', '?')}")
     log(f"cell_id         : {manifest.get('cell_id', '?')}")
     log(f"replica         : {manifest.get('replica', '?')}")

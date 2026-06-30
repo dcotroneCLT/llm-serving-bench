@@ -129,7 +129,17 @@ DO NOT use `campaign.py` for 48h DoW until BATCH 2 is done and gate 2 re-passed.
   median, then SUM the additive columns (vram_used_bytes, power_draw_w, ecc) and
   MEAN the intensive ones (util, temp, clocks); source label stays `gpu.*`. Was:
   read only the first `gpu*_000000.csv` -> half the Dynamo GPU signal dropped.
-- #4 validation_check refuse multi-process: TODO (next).
+- **#4 validation_check refuse multi-process DONE.** `validation_check.py` now
+  hard-fails at step 0 if the manifest has `monitors.components` or
+  `proc_prefix` starts with `agg_`, redirecting to `validate_extension_run.py`
+  (was: lumped all proc-like CSVs into one meaningless RSS series). Single-process
+  runs are unaffected.
+
+**BATCH 1 CODE-COMPLETE (2026-06-30), not yet box-re-passed.** Commits: `a042b64`
+(#1 PGID scoping), `e069848` (#2 reaper), `03afbbf` (#3 multi-GPU), plus #4. Each
+has a local synthetic test (PASS). NEXT: on the box, re-pass gate 2 with hardened
+scoping -- attach with `--component-pids`, confirm `no_orphans` PASS, and run the
+one-time `verify_scoping.py` (VERDICT: COMPLETE) -- then proceed to BATCH 2.
 
 Reminders: env `conda activate wosar`; always pass `--repo-root
 /home/dcotrone/wosar/llm-serving-bench` (absolute) so the sudo'd monitor path
