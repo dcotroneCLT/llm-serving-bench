@@ -123,12 +123,15 @@ DO NOT use `campaign.py` for 48h DoW until BATCH 2 is done and gate 2 re-passed.
   path (engine brought up by hand). Synthetic test confirms: orphan with matching
   run-id+script killed; decoy with the run-id but a foreign script spared; decoy
   with our script but a different run-id spared.
-- **#3 aging_trends multi-GPU DONE.** `load_gpu_downsampled` discovers ALL `gpuN`
-  prefixes. One device -> byte-identical to the old path (verified with
-  `DataFrame.equals`). Multiple devices (Dynamo = 2 GPU) -> per-device per-bin
-  median, then SUM the additive columns (vram_used_bytes, power_draw_w, ecc) and
-  MEAN the intensive ones (util, temp, clocks); source label stays `gpu.*`. Was:
-  read only the first `gpu*_000000.csv` -> half the Dynamo GPU signal dropped.
+- **#3 aging_trends multi-GPU DONE (PER-DEVICE).** `load_gpu_series` discovers ALL
+  `gpuN` prefixes. One device -> `[("gpu", ds)]`, byte-identical to the old path
+  (verified with `DataFrame.equals`). Multiple devices (Dynamo = 2 GPU) ->
+  PER-DEVICE series `gpu0.*`, `gpu1.*` (NOT collapsed: prefill=GPU0 / decode=GPU1
+  have different memory dynamics, and summing VRAM would mask a single-GPU leak),
+  plus a secondary `gpu_total.*` carrying only the summed additive columns
+  (vram_used_bytes, power_draw_w) as a convenience. Was: read only the first
+  `gpu*_000000.csv` -> half the Dynamo GPU signal dropped. (Superseded the first
+  collapse implementation after Domenico's review: localization > aggregation.)
 - **#4 validation_check refuse multi-process DONE.** `validation_check.py` now
   hard-fails at step 0 if the manifest has `monitors.components` or
   `proc_prefix` starts with `agg_`, redirecting to `validate_extension_run.py`

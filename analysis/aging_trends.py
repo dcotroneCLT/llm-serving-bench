@@ -251,9 +251,9 @@ def downsample_client(df: pd.DataFrame, window_seconds: int = 60) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
-# GPU columns that are ADDITIVE across devices (a total over the GPUs in use);
-# everything else (utilisation %, temperature, clocks) is intensive and averaged.
-ADDITIVE_GPU_COLS = {"vram_used_bytes", "power_draw_w", "ecc_db_volatile", "ecc_sb_volatile"}
+# GPU columns that are ADDITIVE across devices, used only for the secondary
+# `gpu_total.*` convenience series. Per-device dynamics live in the gpuN.* series.
+ADDITIVE_GPU_COLS = ("vram_used_bytes", "power_draw_w")
 
 
 def discover_gpu_prefixes(run_dir: Path) -> list[str]:
@@ -268,7 +268,7 @@ def discover_gpu_prefixes(run_dir: Path) -> list[str]:
 
 def _downsample_one_gpu(df: pd.DataFrame, warmup_s: float, window_seconds: int) -> pd.DataFrame:
     """Per-device per-bin median, indexed by the ABSOLUTE minute bin so devices
-    align when combined."""
+    align when summed for the gpu_total series."""
     df = filter_warmup(df, "ts_unix", warmup_s)
     df = df.dropna(subset=["ts_unix"]).copy()
     df["_bin"] = (df["ts_unix"] // window_seconds).astype(np.int64)
@@ -276,44 +276,45 @@ def _downsample_one_gpu(df: pd.DataFrame, warmup_s: float, window_seconds: int) 
     return df.groupby("_bin")[numeric].median()
 
 
-def load_gpu_downsampled(run_dir: Path, warmup_s: float, window_seconds: int) -> Optional[pd.DataFrame]:
-    """Load + downsample the GPU monitor CSVs.
+def load_gpu_series(run_dir: Path, warmup_s: float, window_seconds: int) -> list[tuple[str, pd.DataFrame]]:
+    """Return [(source_label, downsampled_frame)] for the GPU monitor CSVs.
 
-    Single device: byte-identical to the prior path (load_csvs -> filter_warmup ->
-    downsample_to_minutes). Multiple devices (e.g. Dynamo on 2 GPUs): combine the
-    per-device per-bin frames -> SUM the additive columns (vram, power, ecc),
-    MEAN the intensive ones (util, temp, clocks). For one device sum==mean==the
-    value, so this reduces exactly to the single-device output.
+    Aging localizes PER DEVICE: on Dynamo disaggregated, prefill (GPU0) and decode
+    (GPU1) have different memory dynamics, and summing VRAM into one series would
+    MASK a leak on a single GPU. So:
+      - single device  -> [("gpu", ds)], byte-identical to the prior path;
+      - multiple devices -> [("gpu0", ds0), ("gpu1", ds1), ...] (per-device) PLUS
+        a secondary ("gpu_total", ds) carrying only the SUMMED additive columns
+        (vram_used_bytes, power_draw_w) as a convenience total.
     """
     prefixes = discover_gpu_prefixes(run_dir)
     if not prefixes:
-        return None
+        return []
     if len(prefixes) == 1:
         gpu = load_csvs(run_dir, prefixes[0])
         if gpu is None:
-            return None
+            return []
         gpu = filter_warmup(gpu, "ts_unix", warmup_s)
-        return downsample_to_minutes(gpu, "ts_unix", window_seconds)
+        return [("gpu", downsample_to_minutes(gpu, "ts_unix", window_seconds))]
 
-    per_gpu = []
+    series: list[tuple[str, pd.DataFrame]] = []
+    per_gpu_bins = []
     for pfx in prefixes:
         g = load_csvs(run_dir, pfx)
-        if g is not None and not g.empty:
-            per_gpu.append(_downsample_one_gpu(g, warmup_s, window_seconds))
-    if not per_gpu:
-        return None
-    stacked = pd.concat(per_gpu)  # rows keyed by absolute _bin, one per device per bin
-    cols = list(per_gpu[0].columns)
-    add_cols = [c for c in cols if c in ADDITIVE_GPU_COLS]
-    mean_cols = [c for c in cols if c not in ADDITIVE_GPU_COLS]
-    parts = []
-    if add_cols:
-        parts.append(stacked.groupby(level=0)[add_cols].sum())
-    if mean_cols:
-        parts.append(stacked.groupby(level=0)[mean_cols].mean())
-    combined = pd.concat(parts, axis=1)[cols]
-    combined["_t_hours"] = (combined.index - combined.index.min()) * (window_seconds / 3600.0)
-    return combined.reset_index(drop=True)
+        if g is None or g.empty:
+            continue
+        gw = filter_warmup(g, "ts_unix", warmup_s)
+        series.append((pfx, downsample_to_minutes(gw, "ts_unix", window_seconds)))
+        per_gpu_bins.append(_downsample_one_gpu(g, warmup_s, window_seconds))
+    # Secondary summed-VRAM/power total (additive only), aligned on absolute bins.
+    if per_gpu_bins:
+        stacked = pd.concat(per_gpu_bins)
+        add_cols = [c for c in ADDITIVE_GPU_COLS if c in stacked.columns]
+        if add_cols:
+            tot = stacked.groupby(level=0)[add_cols].sum()
+            tot["_t_hours"] = (tot.index - tot.index.min()) * (window_seconds / 3600.0)
+            series.append(("gpu_total", tot.reset_index(drop=True)))
+    return series
 
 
 def bh_fdr(pvalues: list[float], alpha: float = 0.10) -> list[float]:
@@ -368,13 +369,12 @@ def main() -> None:
     print(f"Loading run from {run_dir} ...", file=progress)
 
     gpu_prefixes = discover_gpu_prefixes(run_dir)
-    gpu_ds = load_gpu_downsampled(run_dir, warmup_s, args.downsample_seconds)
-    if gpu_ds is None:
+    gpu_series = load_gpu_series(run_dir, warmup_s, args.downsample_seconds)
+    if not gpu_series:
         print("  [warn] no gpu CSVs found", file=sys.stderr)
     else:
-        agg = "" if len(gpu_prefixes) <= 1 else (
-            f" (aggregated over {len(gpu_prefixes)} GPUs: sum vram/power/ecc, mean util/temp/clocks)")
-        print(f"  gpu: {len(gpu_prefixes)} device(s) -> {len(gpu_ds)} per-window samples{agg}", file=progress)
+        srcs = ", ".join(f"{s}({len(ds)})" for s, ds in gpu_series)
+        print(f"  gpu: {len(gpu_prefixes)} device(s) -> per-device series [{srcs}]", file=progress)
 
     proc_prefix = discover_proc_prefix(run_dir, manifest)
     if proc_prefix:
@@ -410,12 +410,12 @@ def main() -> None:
     # Each catalog entry carries the value series and its aligned real
     # elapsed-hours axis (the per-frame _t_hours column from downsampling).
     catalog = []
-    if gpu_ds is not None:
+    for source, gpu_ds in gpu_series:
         for col in ["vram_used_bytes", "gpu_util_percent", "mem_util_percent",
                     "temperature_c", "power_draw_w", "sm_clock_mhz", "mem_clock_mhz",
                     "ecc_db_volatile", "ecc_sb_volatile"]:
             if col in gpu_ds.columns:
-                catalog.append(("gpu", col, gpu_ds[col], gpu_ds["_t_hours"]))
+                catalog.append((source, col, gpu_ds[col], gpu_ds["_t_hours"]))
     if proc_ds is not None:
         for col in ["rss_bytes", "vms_bytes", "uss_bytes", "pss_bytes",
                     "num_threads", "num_fds", "cpu_percent",
