@@ -4,11 +4,54 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-06-30 (ET, evening).
+Last updated: 2026-07-05 (ET).
 
 ---
 
-## ⏸️ RESUME HERE (2026-06-30 evening) — re-pass gate blocked on Dynamo bring-up
+## ⏸️ RESUME HERE (2026-07-05) — repass gate GREEN, PHASE B unblocked
+
+**Gate result (2026-07-05, box, wosar env):** `deploy/dynamo/repass_gate2.sh`
+OVERALL: PASS -- all eight checks green (pip_pin, bringup, validator incl.
+no_orphans, n_pids_unexpected_0 over 72 engine CSVs, verify_scoping,
+fail_loud_negative, disk_root). Evidence highlights: verify_scoping VERDICT
+COMPLETE with gap B-A = 0.0 MB (recorded-pgid aggregate == all-dynamo smaps
+USS over 9 PIDs); 301/301 membership-complete ticks, agg==sum(components) on
+200/200 complete ticks; both GPUs sampled; client 1460 requests (85 dropped,
+acceptable for a 25-min validation cell), shared_prefix 0.74, bursty CoV 4.93;
+aging_trends end-to-end OK (36 indicator rows).
+
+**The 2026-06-30 bring-up blocker is CLOSED.** Root cause (localized with the
+committed diagnostic `deploy/dynamo/diag_registry.sh`, 4 deterministic runs):
+the frontend container was started WITHOUT the workers' HF-cache identity (no
+`--user 0:0`, no shared root-owned HF cache mount). The discovery watcher saw
+the model card in etcd (all 9 dynamo keys present; etcd, namespace and worker
+registration were never the problem) but failed to materialize the hf://
+artifacts: `hub::from_hf(...): Failed to create cache directory
+/root/.cache/huggingface/hub: Permission denied` -> model discarded ->
+`/v1/models` empty. The decode `get_kv_cache_group_metadata` AttributeError is
+exonerated (benign fallback; registration persists in etcd). The apparent
+flakiness was two divergent frontend start paths, not timing.
+
+**Fix (committed):** single `start_frontend()` helper in `deploy/dynamo/env.sh`
+(`--user 0:0` + COMMON_ENV + COMMON_MOUNT, same identity as the workers), used
+by `serve_disaggregated.sh` (incl. restart fallbacks), `serve_aggregated.sh`
+(same latent bug) and `diag_registry.sh`; no duplicated frontend `docker run`
+remains under `deploy/dynamo/`. Gate hardenings: env preflight (fail fast
+outside the wosar env) and non-vacuous `n_pids_unexpected_0` (zero CSVs
+scanned = FAIL). Box HEAD at gate time: 4b741dd.
+
+**NEXT STEP (resume here): BATCH 2 PHASE B**, in the locked order:
+(2) typed Dynamo lifecycle in `launch_cell` (bring-up/readiness/teardown,
+reusing the PGID identity file) -> (4) reaper wired into `launch_cell` +
+atomic/locked ledger -> (3) serialize `campaign.py` -> (5) mid-run disk
+watchdog. Point 8 (gzip) stays DEFERRED to the long test's measured
+disk-growth curve. After PHASE B: the long test on the production path, then
+per-cell calibration (30%/85% of a conservative ceiling) and the 48h DoW
+campaign (~57 runs, strictly serial).
+
+---
+
+## RESUME (2026-06-30 evening, historical — blocker closed 2026-07-05) — re-pass gate blocked on Dynamo bring-up
 
 **Where we are.** BATCH 1 (data integrity) is committed + box-validated in part;
 BATCH 2 PHASE A (fail-loud) is committed with per-commit unittest (all green

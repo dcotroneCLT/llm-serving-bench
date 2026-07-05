@@ -23,14 +23,26 @@ engine:
   image_repo: nvcr.io/nvidia/ai-dynamo/vllm-runtime
   image_tag: 1.2.0-cuda13
   digest_pin_file: engines/dynamo_vllm/image_pin.json
-  # Engine is started by deploy/dynamo/*.sh, NOT by this cell (attach path).
-  # The full unattended lifecycle is the later launch_cell/campaign work.
+  # Lifecycle: launch_cell owns the full unattended bring-up/readiness/identity/
+  # teardown of the multi-container stack via deploy/dynamo/*.sh (PHASE B item 2).
+  # attach_run ignores lifecycle/topology and still drives a hand-started stack.
+  lifecycle: dynamo_disagg
+  topology:
+    n_prefill: 1
+    n_decode: 1
+    prefill_gpu: 0
+    decode_gpu: 1
+  # gpu_devices is derived from the topology by DynamoDisaggLifecycle; kept here
+  # for the attach path / documentation (must equal [prefill_gpu, decode_gpu]).
   gpu_devices: [0, 1]
   readyz:
+    # /health is the liveness check; launch_cell ALSO re-verifies /v1/models
+    # lists the model. timeout_s is the bring-up budget for serve_disaggregated.sh
+    # (cold model load + readiness settle + poll).
     url: "http://localhost:8400/health"
     timeout_s: 900
   pid_strategy:
-    type: external   # not managed here; monitoring is by component cmdline
+    type: external   # not managed here; monitoring is by recorded component PGIDs
 
 monitors:
   proc:

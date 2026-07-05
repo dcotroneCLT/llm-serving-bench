@@ -81,7 +81,7 @@ import yaml  # type: ignore
 
 
 _ABORT_CLEANUP_ENABLED = False
-_ABORT_CONTAINER_NAME: Optional[str] = None
+_ABORT_CONTAINER_NAMES: list[str] = []
 _ABORT_LOG_DIR: Optional[Path] = None
 
 
@@ -93,10 +93,16 @@ def log(msg: str) -> None:
     print(f"[launch_cell] {utc_iso()} {msg}", flush=True)
 
 
-def enable_abort_cleanup(container_name: str, log_dir: Path) -> None:
-    global _ABORT_CLEANUP_ENABLED, _ABORT_CONTAINER_NAME, _ABORT_LOG_DIR
+def enable_abort_cleanup(container_names, log_dir: Path) -> None:
+    """Register the container(s) to force-remove (with a best-effort log dump)
+    if the launcher aborts before its normal teardown runs. Accepts a single
+    name or a list: multi-container stacks (e.g. Dynamo disaggregated) must have
+    their WHOLE stack torn down on abort, not just one container."""
+    global _ABORT_CLEANUP_ENABLED, _ABORT_CONTAINER_NAMES, _ABORT_LOG_DIR
+    if isinstance(container_names, str):
+        container_names = [container_names]
     _ABORT_CLEANUP_ENABLED = True
-    _ABORT_CONTAINER_NAME = container_name
+    _ABORT_CONTAINER_NAMES = list(container_names)
     _ABORT_LOG_DIR = log_dir
 
 
@@ -106,17 +112,21 @@ def disable_abort_cleanup() -> None:
 
 
 def cleanup_after_abort() -> None:
-    if not _ABORT_CLEANUP_ENABLED or not _ABORT_CONTAINER_NAME or not _ABORT_LOG_DIR:
+    if not _ABORT_CLEANUP_ENABLED or not _ABORT_CONTAINER_NAMES or not _ABORT_LOG_DIR:
         return
-    try:
-        _ABORT_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        save_docker_logs(_ABORT_CONTAINER_NAME, _ABORT_LOG_DIR / "docker_abort.log")
-    except Exception:
-        pass
-    try:
-        subprocess.run(["docker", "rm", "-f", _ABORT_CONTAINER_NAME], check=False, capture_output=True, timeout=60)
-    except Exception:
-        pass
+    single = len(_ABORT_CONTAINER_NAMES) == 1
+    for name in _ABORT_CONTAINER_NAMES:
+        try:
+            _ABORT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            # Single-container runs keep the historical docker_abort.log name.
+            log_name = "docker_abort.log" if single else f"docker_abort_{name}.log"
+            save_docker_logs(name, _ABORT_LOG_DIR / log_name)
+        except Exception:
+            pass
+        try:
+            subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True, timeout=60)
+        except Exception:
+            pass
 
 
 def die(msg: str, rc: int = 1) -> None:
@@ -401,6 +411,34 @@ def wait_for_readyz(url: str, timeout_s: int, container_name: str) -> None:
             die(f"container {container_name} exited during startup", rc=2)
         time.sleep(2)
     die(f"readyz did not come up in {timeout_s}s for {url}", rc=2)
+
+
+def verify_models_listed(models_url: str, model_name: str, timeout_s: int) -> None:
+    """Re-verify that an OpenAI-compatible frontend actually LISTS the model on
+    /v1/models before we proceed. /health can report 200 while /v1/models is
+    empty (the Dynamo registry root cause we closed); the bring-up script already
+    gates on this, so this is a cheap independent confirmation, not the primary
+    wait."""
+    log(f"verifying {model_name} listed on {models_url} (up to {timeout_s}s)")
+    deadline = time.monotonic() + timeout_s
+    last_err = "no response"
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(models_url, timeout=5) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                if 200 <= resp.status < 300:
+                    try:
+                        ids = [m.get("id") for m in json.loads(body).get("data", [])]
+                    except (json.JSONDecodeError, AttributeError):
+                        ids = []
+                    if model_name in ids:
+                        log(f"/v1/models lists {model_name}")
+                        return
+                    last_err = f"model not in {ids}"
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+            last_err = str(e)
+        time.sleep(3)
+    die(f"/v1/models did not list {model_name} within {timeout_s}s ({last_err})", rc=2)
 
 
 # ---------------------------------------------------------------------------
@@ -839,6 +877,390 @@ def stop_subprocess(proc: subprocess.Popen, name: str, grace_s: float = 30.0) ->
 
 
 # ---------------------------------------------------------------------------
+# Engine lifecycle abstraction
+# ---------------------------------------------------------------------------
+#
+# A cell's engine is brought up, made ready, identified (PID/PGID), and torn
+# down through one of these lifecycles, selected by engine.lifecycle in the cell
+# yaml. The shared steps (image pin, monitors, client, supervision loop,
+# manifest finalize) live in main(); only the lifecycle-specific steps are
+# encapsulated here so main() is engine-agnostic.
+#
+#   single_container  -- EXACTLY the historical behavior: one docker run, one
+#                        container PID, one GPU. Manifests are byte-identical to
+#                        pre-refactor runs (the standalone/Triton path must not
+#                        change in any way).
+#   dynamo_disagg     -- multi-container Dynamo disaggregated stack, brought up
+#                        via the COMMITTED deploy/dynamo/*.sh scripts (the single
+#                        source of truth for how containers start; no docker run
+#                        logic is duplicated in Python).
+
+
+class EngineLifecycle:
+    """Interface main() drives. Implementations own the engine-specific steps."""
+
+    kind = "base"
+
+    def __init__(self, cell: dict, args, run_dir: Path, log_dir: Path,
+                 pin: dict, image_full: str) -> None:
+        self.cell = cell
+        self.args = args
+        self.run_dir = run_dir
+        self.log_dir = log_dir
+        self.pin = pin
+        self.image_full = image_full
+
+    # -- bring-up: start engine(s), wait ready, GPU sanity, capture baselines,
+    #    register abort cleanup. die() on any failure.
+    def bring_up(self) -> None:
+        raise NotImplementedError
+
+    # -- resolve monitoring identity: (pidfile, pid_daemon). Either may be None
+    #    (a components-scoped cell has no single pidfile / daemon).
+    def resolve_pid_identity(self) -> tuple[Optional[Path], Optional[subprocess.Popen]]:
+        raise NotImplementedError
+
+    # -- GPU whose host_info() goes into the manifest (the "primary" device).
+    def primary_gpu(self) -> int:
+        raise NotImplementedError
+
+    # -- manifest sections inserted between "image" and "monitors" (key order
+    #    matters: single_container must reproduce {"container", "engine"}).
+    def manifest_sections(self) -> dict:
+        raise NotImplementedError
+
+    # -- manifest baseline section inserted after "warmup_discard_s".
+    def manifest_baseline_sections(self) -> dict:
+        raise NotImplementedError
+
+    # -- teardown: save docker logs then remove container(s). Records the log
+    #    path(s) internally; finalize_manifest() writes them LAST so the manifest
+    #    key order is preserved. Must not raise out of the finally block.
+    def teardown(self) -> None:
+        raise NotImplementedError
+
+    # -- post-teardown VRAM quiescence wait on the relevant GPU(s).
+    def wait_quiescence(self) -> None:
+        raise NotImplementedError
+
+    # -- add the docker-log-path key(s) to the manifest, called LAST.
+    def finalize_manifest(self, manifest: dict) -> None:
+        raise NotImplementedError
+
+
+class SingleContainerLifecycle(EngineLifecycle):
+    """The historical single-container path, verbatim. Manifest byte-identical."""
+
+    kind = "single_container"
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        self.container_name = self.cell["engine"]["container_name_template"]
+        self.gpu_device = self.cell["engine"]["gpu_device"]
+        self.baseline_mib = 0
+        self.container_pid = 0
+        self.docker_cmd: list[str] = []
+
+    def bring_up(self) -> None:
+        # 3. Tear down any stale container with the same name.
+        teardown_container(self.container_name, self.log_dir / "docker_stale_before_teardown.log")
+
+        # 4. Capture pre-run VRAM baseline on the cell's GPU.
+        self.baseline_mib = vram_used_mib(self.gpu_device) or 0
+        log(f"pre-run VRAM baseline on gpu {self.gpu_device}: {self.baseline_mib} MiB")
+
+        # 5. Start container.
+        self.docker_cmd = build_docker_run_cmd(self.cell, self.container_name)
+        log("docker run cmd: " + " ".join(self.docker_cmd))
+        result = subprocess.run(self.docker_cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            die(f"docker run failed rc={result.returncode}\nstderr: {result.stderr}")
+        enable_abort_cleanup(self.container_name, self.log_dir)
+        time.sleep(2)  # let docker assign host PID
+
+        # 6. Persist docker inspect snapshot for provenance.
+        inspect = docker_inspect(self.container_name)
+        (self.run_dir / "docker_inspect.json").write_text(json.dumps(inspect, indent=2))
+        self.container_pid = inspect.get("State", {}).get("Pid", 0)
+        if not self.container_pid:
+            die("container has no PID after docker run")
+
+        # 7. Wait for readiness.
+        readyz = self.cell["engine"]["readyz"]
+        wait_for_readyz(readyz["url"], int(readyz["timeout_s"]), self.container_name)
+
+        # 8. GPU sanity gate.
+        gpu_sanity_check(self.container_pid, self.gpu_device)
+
+    def resolve_pid_identity(self) -> tuple[Optional[Path], Optional[subprocess.Popen]]:
+        pidfile = self.run_dir / "engine.pid"
+        if pidfile.exists():
+            pidfile.unlink()
+        pid_daemon = setup_pid_strategy(
+            self.cell, self.container_name, pidfile, self.args.repo_root, self.log_dir
+        )
+        return pidfile, pid_daemon
+
+    def primary_gpu(self) -> int:
+        return self.gpu_device
+
+    def manifest_sections(self) -> dict:
+        return {
+            "container": {
+                "name": self.container_name,
+                "host_pid": self.container_pid,
+                "docker_run_cmd": self.docker_cmd,
+            },
+            "engine": self.cell["engine"],
+        }
+
+    def manifest_baseline_sections(self) -> dict:
+        return {"vram_baseline_mib_pre_run": self.baseline_mib}
+
+    def teardown(self) -> None:
+        save_docker_logs(self.container_name, self.log_dir / "docker.log")
+        log(f"removing container {self.container_name}")
+        subprocess.run(["docker", "rm", "-f", self.container_name],
+                       check=False, capture_output=True, timeout=60)
+
+    def wait_quiescence(self) -> None:
+        cooldown = int(self.cell.get("post_run_cooldown_s", 600))
+        wait_vram_quiescence(self.gpu_device, self.baseline_mib, tolerance_mib=200, max_wait_s=cooldown)
+
+    def finalize_manifest(self, manifest: dict) -> None:
+        manifest["docker_log_path"] = str(self.log_dir / "docker.log")
+
+
+class DynamoDisaggLifecycle(EngineLifecycle):
+    """Multi-container Dynamo disaggregated stack via deploy/dynamo/*.sh.
+
+    The shell scripts are the SINGLE source of truth for how containers start
+    (--user, HF cache mount, NIXL ports, frontend cache identity, ...). This
+    class only orchestrates them, inherits their fail-hard exit codes, and reads
+    the PGID identity file record_component_pids.py writes at the end of
+    serve_disaggregated.sh. No docker run logic is duplicated here -- that
+    duplication is exactly what caused the registry bug we just closed.
+    """
+
+    kind = "dynamo_disagg"
+
+    # Container names, matching the env.sh defaults (deploy/dynamo/env.sh). The
+    # launcher does not override them, so the defaults hold.
+    FRONTEND = "dyn_frontend"
+    PREFILL_PREFIX = "dyn_prefill"
+    DECODE_PREFIX = "dyn_decode"
+    ETCD = "dyn_etcd"
+    NATS = "dyn_nats"
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        eng = self.cell["engine"]
+        topo = eng.get("topology", {})
+        self.n_prefill = int(topo.get("n_prefill", 1))
+        self.n_decode = int(topo.get("n_decode", 1))
+        self.prefill_gpu = int(topo.get("prefill_gpu", 0))
+        self.decode_gpu = int(topo.get("decode_gpu", 1))
+        # The two GPUs the workers hold; the monitor samples both.
+        self.gpus = [self.prefill_gpu, self.decode_gpu]
+        eng["gpu_devices"] = list(self.gpus)
+        # Identity file the bring-up records and we merge from (same default as
+        # attach_run / env.sh COMPONENT_PIDS_FILE).
+        self.component_pids = Path(self.args.component_pids)
+        # Bring-up budget for the serve script (model load + settle + poll).
+        self.bringup_timeout_s = int(eng.get("readyz", {}).get("timeout_s", 1800))
+        # /v1/models readiness re-verify target.
+        overrides = self.cell["workload"]["client_config_overrides"]
+        self.model_name = overrides["model"]
+        base_url = overrides.get("base_url", "http://localhost:8400").rstrip("/")
+        self.models_url = f"{base_url}/v1/models"
+        self.baselines: dict[int, int] = {}
+        self.serve_invocations: list[dict] = []
+        self._log_paths: dict[str, str] = {}
+        self._identity: dict = {}
+
+    def _worker_names(self) -> tuple[list[str], list[str]]:
+        prefill = [f"{self.PREFILL_PREFIX}_{i}" for i in range(1, self.n_prefill + 1)]
+        decode = [f"{self.DECODE_PREFIX}_{i}" for i in range(1, self.n_decode + 1)]
+        return prefill, decode
+
+    def stack_containers(self) -> list[str]:
+        prefill, decode = self._worker_names()
+        return [self.FRONTEND, *prefill, *decode, self.ETCD, self.NATS]
+
+    def _script_env(self) -> dict:
+        env = os.environ.copy()
+        env.update({
+            "N_PREFILL": str(self.n_prefill),
+            "N_DECODE": str(self.n_decode),
+            "PREFILL_GPU": str(self.prefill_gpu),
+            "DECODE_GPU": str(self.decode_gpu),
+            # Keep the served model in lockstep with the client's model.
+            "MODEL": str(self.model_name),
+            # record_component_pids.py must write where we later read the identity.
+            "WOSAR_COMPONENT_PIDS": str(self.component_pids),
+        })
+        # Any extra env the cell declares for the scripts.
+        for k, v in self.cell["engine"].get("env", {}).items():
+            env[k] = str(v)
+        return env
+
+    def _run_script(self, script: Path, env: dict, log_name: str,
+                    timeout_s: Optional[int] = None) -> None:
+        """Run a deploy/dynamo/*.sh script fail-hard: capture its output into
+        run_dir/logs/, and die() with the log path on non-zero exit."""
+        out_path = self.log_dir / f"{log_name}.log"
+        # Record the invocation (argv + the extra env we set) for provenance.
+        extra_env = {k: v for k, v in env.items() if k in (
+            "N_PREFILL", "N_DECODE", "PREFILL_GPU", "DECODE_GPU", "MODEL",
+            "WOSAR_COMPONENT_PIDS") or k in self.cell["engine"].get("env", {})}
+        argv = ["bash", str(script)]
+        self.serve_invocations.append({"script": script.name, "argv": argv, "env": extra_env})
+        log(f"running {script.name} (log -> {out_path})")
+        with out_path.open("wb") as f:
+            try:
+                result = subprocess.run(argv, env=env, stdout=f, stderr=subprocess.STDOUT,
+                                        timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                die(f"{script.name} timed out after {timeout_s}s; see {out_path}", rc=2)
+        if result.returncode != 0:
+            die(f"{script.name} failed rc={result.returncode}; see {out_path}", rc=2)
+
+    def _gpu_sanity_per_worker(self) -> None:
+        """Adapt gpu_sanity_check to disaggregation: each worker container's host
+        PID must appear on its ASSIGNED GPU (prefill_gpu / decode_gpu)."""
+        prefill, decode = self._worker_names()
+        for name in prefill:
+            pid = get_container_pid(name)
+            if pid is None:
+                die(f"gpu sanity: prefill worker {name} has no container PID", rc=3)
+            gpu_sanity_check(pid, self.prefill_gpu)
+        for name in decode:
+            pid = get_container_pid(name)
+            if pid is None:
+                die(f"gpu sanity: decode worker {name} has no container PID", rc=3)
+            gpu_sanity_check(pid, self.decode_gpu)
+
+    def bring_up(self) -> None:
+        deploy = self.args.repo_root / "deploy" / "dynamo"
+        # Baselines on BOTH GPUs before anything starts.
+        for g in self.gpus:
+            self.baselines[g] = vram_used_mib(g) or 0
+            log(f"pre-run VRAM baseline on gpu {g}: {self.baselines[g]} MiB")
+
+        env = self._script_env()
+        # Register whole-stack abort cleanup BEFORE the first container starts, so
+        # an abort during bring-up tears the entire stack down (not one name).
+        enable_abort_cleanup(self.stack_containers(), self.log_dir)
+
+        self._run_script(deploy / "infra_up.sh", env, "infra_up", timeout_s=180)
+        # serve_disaggregated.sh blocks until /v1/models is served or exits
+        # non-zero (fail-hard); it also writes the PGID identity file at the end.
+        self._run_script(deploy / "serve_disaggregated.sh", env, "serve_disaggregated",
+                         timeout_s=self.bringup_timeout_s)
+
+        # Independent re-verify that the model is actually listed.
+        verify_models_listed(self.models_url, self.model_name, timeout_s=120)
+
+        # GPU sanity: each worker on its assigned device.
+        self._gpu_sanity_per_worker()
+
+        # Provenance: per-container docker inspect snapshot of the whole stack.
+        stack_inspect = {}
+        for name in self.stack_containers():
+            try:
+                stack_inspect[name] = docker_inspect(name)
+            except Exception as e:  # pragma: no cover - best effort
+                stack_inspect[name] = {"inspect_error": str(e)}
+        (self.run_dir / "docker_inspect.json").write_text(json.dumps(stack_inspect, indent=2))
+
+    def resolve_pid_identity(self) -> tuple[Optional[Path], Optional[subprocess.Popen]]:
+        # Multi-process: scope the monitor to the PGIDs the bring-up recorded.
+        # merge_component_identity mutates cell["monitors"]["components"] in place
+        # and is fail-hard on a missing component or expected_count mismatch.
+        merge_component_identity(self.cell, self.component_pids)
+        self._identity = json.loads(self.component_pids.read_text()).get("components", {})
+        return None, None
+
+    def primary_gpu(self) -> int:
+        return self.prefill_gpu
+
+    def manifest_sections(self) -> dict:
+        prefill, decode = self._worker_names()
+        return {
+            "lifecycle": self.kind,
+            "engine": self.cell["engine"],
+            "topology": {
+                "n_prefill": self.n_prefill,
+                "n_decode": self.n_decode,
+                "prefill_gpu": self.prefill_gpu,
+                "decode_gpu": self.decode_gpu,
+            },
+            "gpu_devices": list(self.gpus),
+            "containers": {
+                "frontend": self.FRONTEND,
+                "prefill": prefill,
+                "decode": decode,
+                "etcd": self.ETCD,
+                "nats": self.NATS,
+            },
+            # Per-component containers + merged PGIDs, as the monitor will scope.
+            "components": self._identity,
+            "serve_invocations": self.serve_invocations,
+        }
+
+    def manifest_baseline_sections(self) -> dict:
+        return {"vram_baselines_mib_pre_run": {str(g): v for g, v in self.baselines.items()}}
+
+    def teardown(self) -> None:
+        deploy = self.args.repo_root / "deploy" / "dynamo"
+        env = self._script_env()
+        # Save logs for EVERY stack container BEFORE tearing anything down.
+        for name in self.stack_containers():
+            p = self.log_dir / f"docker_{name}.log"
+            save_docker_logs(name, p)
+            self._log_paths[name] = str(p)
+        # serve_down (engine) then infra_down (etcd + nats).
+        for script in ("serve_down.sh", "infra_down.sh"):
+            try:
+                subprocess.run(["bash", str(deploy / script)], env=env,
+                               check=False, capture_output=True, timeout=120)
+            except subprocess.SubprocessError as e:
+                log(f"WARNING: {script} during teardown failed: {e}")
+        # Verify no dyn_* container remains; force-remove any straggler.
+        try:
+            r = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"],
+                               capture_output=True, text=True, timeout=30)
+            remaining = [n for n in r.stdout.split() if n.startswith("dyn_")]
+            if remaining:
+                log(f"WARNING: dyn_* containers remained after teardown: {remaining}; force-removing")
+                subprocess.run(["docker", "rm", "-f", *remaining],
+                               check=False, capture_output=True, timeout=60)
+        except subprocess.SubprocessError as e:
+            log(f"WARNING: could not verify dyn_* teardown: {e}")
+
+    def wait_quiescence(self) -> None:
+        cooldown = int(self.cell.get("post_run_cooldown_s", 600))
+        for g in self.gpus:
+            wait_vram_quiescence(g, self.baselines.get(g, 0), tolerance_mib=200, max_wait_s=cooldown)
+
+    def finalize_manifest(self, manifest: dict) -> None:
+        manifest["docker_log_paths"] = self._log_paths
+
+
+def make_lifecycle(cell: dict, args, run_dir: Path, log_dir: Path,
+                   pin: dict, image_full: str) -> EngineLifecycle:
+    """Select the lifecycle from engine.lifecycle (default single_container)."""
+    kind = cell["engine"].get("lifecycle", "single_container")
+    impls = {
+        "single_container": SingleContainerLifecycle,
+        "dynamo_disagg": DynamoDisaggLifecycle,
+    }
+    if kind not in impls:
+        die(f"unknown engine.lifecycle: {kind!r} (expected one of {sorted(impls)})")
+    return impls[kind](cell, args, run_dir, log_dir, pin, image_full)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -852,6 +1274,15 @@ def main() -> None:
     p.add_argument("--hf-cache-host", type=Path, required=True)
     p.add_argument("--campaign-id", type=str, default="wosar2026")
     p.add_argument("--attempt", type=int, default=1, help="Attempt number for provenance.")
+    p.add_argument(
+        "--component-pids",
+        type=Path,
+        default=Path(os.environ.get("WOSAR_COMPONENT_PIDS",
+                                    str(Path.home() / "wosar" / "dynamo_component_pids.json"))),
+        help="Multi-process lifecycles (dynamo_disagg): identity file the bring-up "
+             "writes (deploy/dynamo/record_component_pids.py). The monitor is scoped "
+             "to its recorded PGIDs. Ignored by single_container cells.",
+    )
     p.add_argument(
         "--gpu-device-override",
         type=int,
@@ -935,45 +1366,21 @@ def main() -> None:
     (run_dir / "image_digest.txt").write_text(pin["digest"] + "\n")
     log(f"image: {image_full}  digest: {pin['digest']}")
 
-    # 3. Container name (already substituted via render_in_obj above).
-    container_name = cell["engine"]["container_name_template"]
-    teardown_container(container_name, log_dir / "docker_stale_before_teardown.log")
+    # 3. Select the engine lifecycle (single_container default / dynamo_disagg)
+    #    and bring the engine up through it: teardown-stale, start, readiness,
+    #    GPU sanity, and VRAM baseline(s) are all lifecycle-specific.
+    lifecycle = make_lifecycle(cell, args, run_dir, log_dir, pin, image_full)
+    log(f"engine lifecycle: {lifecycle.kind}")
+    lifecycle.bring_up()
 
-    # 4. Capture pre-run VRAM baseline on the cell's GPU.
-    gpu_device = cell["engine"]["gpu_device"]
-    baseline_mib = vram_used_mib(gpu_device) or 0
-    log(f"pre-run VRAM baseline on gpu {gpu_device}: {baseline_mib} MiB")
+    # 4. Resolve monitoring identity: a single pidfile + optional daemon
+    #    (single_container), or a components-scoped merge (dynamo_disagg -> None).
+    pidfile, pid_daemon = lifecycle.resolve_pid_identity()
 
-    # 5. Start container.
-    docker_cmd = build_docker_run_cmd(cell, container_name)
-    log("docker run cmd: " + " ".join(docker_cmd))
-    result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=120)
-    if result.returncode != 0:
-        die(f"docker run failed rc={result.returncode}\nstderr: {result.stderr}")
-    enable_abort_cleanup(container_name, log_dir)
-    time.sleep(2)  # let docker assign host PID
-
-    # 6. Persist docker inspect snapshot for provenance.
-    inspect = docker_inspect(container_name)
-    (run_dir / "docker_inspect.json").write_text(json.dumps(inspect, indent=2))
-    container_pid = inspect.get("State", {}).get("Pid", 0)
-    if not container_pid:
-        die("container has no PID after docker run")
-
-    # 7. Wait for readiness.
-    readyz = cell["engine"]["readyz"]
-    wait_for_readyz(readyz["url"], int(readyz["timeout_s"]), container_name)
-
-    # 8. GPU sanity gate.
-    gpu_sanity_check(container_pid, gpu_device)
-
-    # 9. Resolve engine worker PID.
-    pidfile = run_dir / "engine.pid"
-    if pidfile.exists():
-        pidfile.unlink()
-    pid_daemon = setup_pid_strategy(cell, container_name, pidfile, args.repo_root, log_dir)
-
-    # 10. Write the run manifest (started_at).
+    # 5. Write the run manifest (started_at). The lifecycle contributes the
+    #    engine/container sections and the VRAM-baseline section; the shared
+    #    head/tail keys keep their order so single_container manifests stay
+    #    byte-identical to pre-refactor runs.
     started_at_unix = time.time()       # wall clock: manifest timestamp only
     started_mono = time.monotonic()     # monotonic: drives the run-duration decision
     manifest = {
@@ -984,7 +1391,7 @@ def main() -> None:
         "attempt": args.attempt,
         "started_at": utc_iso(),
         "started_at_unix": started_at_unix,
-        "host": host_info(gpu_device),
+        "host": host_info(lifecycle.primary_gpu()),
         "git_sha": git_sha(args.repo_root),
         "image": {
             "tag": image_full,
@@ -992,23 +1399,20 @@ def main() -> None:
             "source_tag": pin.get("source_tag"),
             "pinned_at": pin.get("pinned_at"),
         },
-        "container": {
-            "name": container_name,
-            "host_pid": container_pid,
-            "docker_run_cmd": docker_cmd,
-        },
-        "engine": cell["engine"],
+    }
+    manifest.update(lifecycle.manifest_sections())
+    manifest.update({
         "monitors": cell["monitors"],
         "proc_prefix": proc_prefix_for_cell(cell),
         "workload": cell["workload"],
         "duration_s": cell["duration_s"],
         "warmup_discard_s": cell["warmup_discard_s"],
-        "vram_baseline_mib_pre_run": baseline_mib,
-    }
+    })
+    manifest.update(lifecycle.manifest_baseline_sections())
     manifest_path = run_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
 
-    # 11. Spawn monitors and client.
+    # 6. Spawn monitors and client.
     duration_s = int(cell["duration_s"])
     monitors_proc = spawn_monitors(
         args.repo_root, run_dir, cell, pidfile, duration_s, log_dir, args.runs_root, run_id
@@ -1108,16 +1512,17 @@ def main() -> None:
         stop_subprocess(monitors_proc, "monitors", grace_s=60.0)
         if pid_daemon is not None:
             stop_subprocess(pid_daemon, "pid_daemon")
-        save_docker_logs(container_name, log_dir / "docker.log")
-        log(f"removing container {container_name}")
-        subprocess.run(["docker", "rm", "-f", container_name], check=False, capture_output=True, timeout=60)
+        # 14. Teardown the engine (save docker logs, remove container(s)). For
+        #     dynamo_disagg this covers the whole stack (serve_down + infra_down
+        #     + a dyn_* sweep); for single_container it is one docker rm -f.
+        lifecycle.teardown()
         disable_abort_cleanup()
 
-        # 14. Wait for VRAM quiescence on the cell's GPU.
-        cooldown = int(cell.get("post_run_cooldown_s", 600))
-        wait_vram_quiescence(gpu_device, baseline_mib, tolerance_mib=200, max_wait_s=cooldown)
+        # 15. Wait for VRAM quiescence on the cell's GPU(s).
+        lifecycle.wait_quiescence()
 
-        # 15. Finalize manifest.
+        # 16. Finalize manifest. lifecycle.finalize_manifest adds the docker-log
+        #     path key(s) LAST so single_container key order is unchanged.
         ended_at_unix = time.time()
         manifest["ended_at"] = utc_iso()
         manifest["ended_at_unix"] = ended_at_unix
@@ -1125,7 +1530,7 @@ def main() -> None:
         manifest["interrupted_early"] = interrupted
         manifest["client_forced_kill"] = client_forced_kill
         manifest["client_summary"] = client_summary
-        manifest["docker_log_path"] = str(log_dir / "docker.log")
+        lifecycle.finalize_manifest(manifest)
         manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
         log(f"done. duration={manifest['duration_seconds_actual']:.0f}s interrupted={interrupted}")
 

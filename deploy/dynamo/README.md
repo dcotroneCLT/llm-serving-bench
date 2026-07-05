@@ -249,12 +249,44 @@ bash deploy/dynamo/serve_down.sh     # engine components
 bash deploy/dynamo/infra_down.sh     # etcd + nats
 ```
 
-## Validation run (STEP 1 gate)
+## Two ways to drive a run: `launch_cell` (unattended) vs `attach_run` (hand-started)
 
-Drive monitors + client + manifest against the running frontend with
-`scripts/attach_run.py` (it does NOT manage the engine lifecycle — that is the
-later launch_cell/campaign work). See `scripts/attach_run.py --help` and the
-`campaigns/extension/cells/val_*.yaml` cells.
+There are two entry points, and which one to use depends on who owns the engine
+lifecycle:
+
+- **`scripts/launch_cell.py` — full unattended lifecycle (campaign runs).** As of
+  PHASE B item 2, `launch_cell` owns the whole Dynamo disaggregated stack:
+  bring-up, readiness, component identity, and teardown, exactly as it does for
+  single-container cells. Selected by `engine.lifecycle: dynamo_disagg` in the
+  cell yaml (default `single_container`), with the topology under
+  `engine.topology` (`n_prefill`, `n_decode`, `prefill_gpu`, `decode_gpu`). It
+  runs `infra_up.sh` then `serve_disaggregated.sh` with those as env vars,
+  **inheriting the scripts' fail-hard exit codes** (a non-zero exit aborts the
+  run with the script output captured under `run_dir/logs/`); it re-verifies
+  `/v1/models` lists the model, merges the recorded component PGID identity
+  (`record_component_pids.py`), captures a VRAM baseline on BOTH GPUs, GPU-sanity
+  -checks each worker against its assigned device, and on teardown saves logs for
+  every stack container then runs `serve_down.sh` + `infra_down.sh` and sweeps
+  any leftover `dyn_*`. The shell scripts remain the SINGLE source of truth for
+  how containers start — `launch_cell` does not duplicate any `docker run`.
+
+  ```bash
+  python3 scripts/launch_cell.py \
+      --cell-yaml campaigns/extension/cells/val_dynamo_disagg.yaml \
+      --replica 1 --runs-root ~/wosar/runs --repo-root ~/wosar/llm-serving-bench \
+      --hf-cache-host ~/wosar/hf_cache --campaign-id extension
+  # identity file default: $WOSAR_COMPONENT_PIDS or ~/wosar/dynamo_component_pids.json
+  ```
+
+- **`scripts/attach_run.py` — hand-started stack (STEP 1 validation).** You bring
+  the engine up by hand (`infra_up.sh` + `serve_disaggregated.sh`) and attach the
+  monitors + client + manifest to the running frontend; `attach_run` does NOT
+  manage the engine lifecycle. It ignores `engine.lifecycle`/`engine.topology`
+  and keeps working unchanged. See `scripts/attach_run.py --help` and the
+  `campaigns/extension/cells/val_*.yaml` cells.
+
+Single-container cells (standalone vLLM, Triton) are unaffected: their
+`launch_cell` path and manifests are byte-identical to before.
 
 ## Re-pass gate (BATCH 1 + PHASE A): one command
 
