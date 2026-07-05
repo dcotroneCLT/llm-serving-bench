@@ -74,6 +74,11 @@ from typing import Any, Optional
 
 import yaml  # type: ignore
 
+# reaper is a sibling module; make it importable whether launch_cell runs as a
+# script, is imported by attach_run, or is loaded by the test harness.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import reaper  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -1366,6 +1371,14 @@ def main() -> None:
     (run_dir / "image_digest.txt").write_text(pin["digest"] + "\n")
     log(f"image: {image_full}  digest: {pin['digest']}")
 
+    # Pre-run orphan reaper: kill leftover monitor/client children of a prior run
+    # (run-id + script-name verified, PID-reuse-safe) BEFORE the engine stack
+    # starts, so a stale sudo'd proc monitor is gone before the new one runs.
+    # Engine containers are NOT in reaper scope (the bring-up docker rm -f's stale
+    # names); the reaper handles host-side processes only.
+    for line in reaper.reap_orphans(args.runs_root, current_run_id=run_id):
+        log(line)
+
     # 3. Select the engine lifecycle (single_container default / dynamo_disagg)
     #    and bring the engine up through it: teardown-stale, start, readiness,
     #    GPU sanity, and VRAM baseline(s) are all lifecycle-specific.
@@ -1453,6 +1466,12 @@ def main() -> None:
     client_proc = spawn_client(args.repo_root, run_dir, client_config, duration_s, log_dir)
     log(f"client pid={client_proc.pid}")
 
+    # Record this run's children so a future run's pre-run reaper can clean them
+    # up if this launcher dies without running its finally block.
+    for line in reaper.record_children(args.runs_root, run_dir, run_id,
+                                       monitors_proc.pid, client_proc.pid):
+        log(line)
+
     # 12. Supervise until duration elapses or any subprocess exits.
     mono_deadline = started_mono + duration_s
     interrupted = False
@@ -1517,6 +1536,12 @@ def main() -> None:
         #     + a dyn_* sweep); for single_container it is one docker rm -f.
         lifecycle.teardown()
         disable_abort_cleanup()
+
+        # Deregister from the reaper ledger now that this run's children are
+        # stopped: a cleanly-finished run (or one interrupted but torn down here)
+        # must not linger as a reap candidate for the next launch.
+        for line in reaper.deregister_run(args.runs_root, run_id):
+            log(line)
 
         # 15. Wait for VRAM quiescence on the cell's GPU(s).
         lifecycle.wait_quiescence()

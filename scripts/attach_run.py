@@ -178,6 +178,10 @@ def main() -> None:
         lc.log(f"client summary: total={client_summary['total']} ok={client_summary['ok']} "
                f"statuses={client_summary['status_counts']}")
         lc.stop_subprocess(monitors_proc, "monitors", grace_s=60.0)
+        # Deregister from the reaper ledger: this run's children are stopped, so
+        # it must not linger as a reap candidate for the next launch.
+        for line in reaper.deregister_run(args.runs_root, run_id):
+            lc.log(line)
         ended_at_unix = time.time()
         manifest["ended_at"] = lc.utc_iso()
         manifest["ended_at_unix"] = ended_at_unix
