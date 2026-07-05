@@ -63,6 +63,17 @@ if N_PREFILL=1 N_DECODE=1 PREFILL_GPU=0 DECODE_GPU=1 bash "$HERE/serve_disaggreg
   echo "[repass] identity file ($PIDS_FILE):"; cat "$PIDS_FILE" || true
 else
   mark "bringup" "FAIL"
+  # A failed bring-up must never be evidence-free: dump the dyn_* container logs
+  # and the etcd dynamo key list BEFORE the EXIT trap tears the containers down.
+  # (Diagnostic only -- does NOT change any gate check semantics.)
+  bf="$RUN_DIR/bringup_failure_evidence"
+  mkdir -p "$bf"
+  for c in dyn_frontend dyn_prefill_1 dyn_decode_1; do
+    docker logs "$c" > "$bf/${c}.log" 2>&1 || true
+  done
+  docker exec -e ETCDCTL_API=3 dyn_etcd etcdctl get "" --prefix --keys-only 2>/dev/null \
+    | grep -i dynamo > "$bf/etcd_dynamo_keys.txt" 2>&1 || true
+  echo "[repass] bringup FAILED; evidence captured -> $bf"
 fi
 
 # ----- step 2-4: only if the stack came up -----

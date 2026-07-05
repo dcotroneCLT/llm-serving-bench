@@ -105,6 +105,19 @@ for c in "${WORKER_NAMES[@]}"; do
   fi
 done
 
+# Diagnostic hook: FRONTEND_START=manual brings up ONLY the workers (registered
+# above) and returns, leaving the frontend for the caller to start at a
+# controlled time. Used by diag_registry.sh to separate worker registration from
+# frontend discovery. In this mode we deliberately do NOT run the frontend
+# start/poll/restart-fallback logic below, and we do NOT write the component
+# PGID identity file (it needs the frontend); the caller owns both.
+FRONTEND_START="${FRONTEND_START:-auto}"
+if [ "$FRONTEND_START" = "manual" ]; then
+  echo "[dynamo] FRONTEND_START=manual: workers registered; NOT starting the frontend."
+  echo "[dynamo] worker containers: ${WORKER_NAMES[*]}"
+  exit 0
+fi
+
 # --- Frontend (HTTP ingress + in-process KV router; no separate router PID) ---
 # Two facts measured on the box:
 #  1. Worker readiness LAGS the "Registered base model" log line by ~1 min; a

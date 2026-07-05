@@ -110,6 +110,45 @@ Known benign warning: `'EngineCoreProc' object has no attribute
 get_kv_cache_group_metadata` — a Dynamo-1.2.0/vLLM-0.20.1 API drift that falls
 back to `cache_config.block_size`; the worker still registers and serves.
 
+## Registry flakiness diagnosis
+
+Occasionally on `repass_gate2.sh` the disaggregated stack fails to serve:
+workers log `Registered base model`, the single long-lived frontend stays Up
+with HTTP 200 on `/health`, yet `/v1/models` stays `{"data":[]}` for 4+ minutes
+and through the frontend restart fallbacks — while an identical single-frontend
+probe in the same session serves `/v1/models` in ~5 s. The fault is one of two
+branches, and `diag_registry.sh` localizes which:
+
+```bash
+conda activate wosar
+bash deploy/dynamo/diag_registry.sh          # ~6 min window, then auto-cleanup
+WINDOW_S=600 bash deploy/dynamo/diag_registry.sh   # longer window
+```
+
+It brings up infra + **workers only** (via `serve_disaggregated.sh
+FRONTEND_START=manual`, so the script's own frontend fallback logic is out of
+the way), starts **exactly one** frontend itself at a controlled time with **no
+churn**, and polls both etcd (`dynamo` key count) and `/v1/models` every 10 s.
+On exit it captures evidence **before** cleanup into
+`~/wosar/diag_registry/<ts>/` (full etcd key dump with values, full frontend /
+prefill / decode logs, and a decode-log summary of `get_kv_cache_group_metadata`
+and any de-registration / lease-expiry lines), then cleans up like the gate
+(serve_down + infra_down + reaper + `docker rm -f dyn_*`). Exit code is 0 only on
+`REGISTRY_OK`, 2 otherwise. Decision tree from the one-line `VERDICT`:
+
+| VERDICT | signal | branch |
+|---|---|---|
+| `REGISTRY_OK` | `/v1/models` listed the model within the window | not flaky this run |
+| `FRONTEND_DISCOVERY_SUSPECT` | etcd `dynamo` keys stayed >0 for ≥60 s while `/v1/models` stayed empty | frontend never reads the registration into `/v1/models` → look at frontend discovery / the etcd→frontend watch |
+| `WORKER_REGISTRATION_SUSPECT` | etcd `dynamo` keys were 0 the whole window, or registered then dropped back to 0 | registration never persisted or the worker's lease expired → look at worker registration / lease keep-alive |
+
+(A drop-to-zero outranks "keys present but not discovered", so a run that
+registers then loses its keys reports `WORKER_REGISTRATION_SUSPECT`.)
+
+A failed `repass_gate2.sh` bring-up is never evidence-free: on `bringup FAIL` the
+gate dumps the `dyn_*` container logs and the etcd `dynamo` key list into
+`$RUN_DIR/bringup_failure_evidence/` before cleanup.
+
 ## 3. Component identity = recorded PGIDs (NOT a host-wide regex)
 
 The per-component monitor sums EXACTLY the processes the bring-up recorded, not

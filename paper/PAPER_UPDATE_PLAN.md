@@ -9,12 +9,14 @@ This document is the **operational source of truth** for paper
 writing. Pair it with `EXPERIMENT_STATE.md` (data and analysis state)
 and `docs/WOSAR_2026.pdf` (the n=1 preprint, structural reference).
 
-> **SUPERSEDED IN PART, 2026-06-07.** The original plan below assumed a
-> single camera-ready built on n=3. That premise has changed: we now
-> split into a **workshop paper (single-run, replica r02)** and a
-> **journal extension (full n=3 + meta-analysis)**. Read the section
-> "## 2026-06-07: two-paper split" at the BOTTOM of this file first; it
-> overrides the single-camera-ready framing wherever they conflict.
+> **READ THIS FIRST (updated 2026-06-12).** The workshop paper is DONE and on
+> arXiv (**arXiv:2606.11916**, "Characterizing Software Aging in GPU-Based LLM
+> Serving Systems"), under WoSAR 2026 review (notif 10 Aug). So the
+> section-by-section "what to rewrite" plan further below is now **HISTORICAL**
+> (kept only for traceability). The **CURRENT source of truth** is the bottom
+> section **"## 2026-06-12: EXPERIMENTAL PLAN — DoW"** (the extension campaign
+> that feeds the journal). Data/decisions of the published paper:
+> `paper/n3_analysis/N3_RESULTS.md`. Operational hand-off: `EXPERIMENT_STATE.md`.
 
 ---
 
@@ -687,15 +689,65 @@ step allocations? stepness is the instrument to measure triggerability.
 
 ---
 
-## 2026-06-10: journal extension is built on the NVIDIA-extension campaign
+## 2026-06-12: EXPERIMENTAL PLAN — extension campaign (DoW). CURRENT source of truth.
 
-The journal paper (n=3 + meta-analysis) will be fed by the NEW campaign
-planned for the NVIDIA grant, not only by the existing 36h data. New axes vs
-the workshop: NVIDIA Dynamo (successor to Triton) alongside Triton/standalone;
-hardware generality L40S->A100; 48h x 3 replicas (replaces single-run);
-7-day exploratory runs for late-onset; and the stress-workload probe with the
-reliability->security angle. Full design + run matrix + GPU-hours in
-`proposals/nvidia/proposal_context.md`. Experiments start locally on the L40S
-server first (Dynamo installed locally), then scale to A100 via the grant.
-The journal's meta-analytic layer (DL-RE + Stouffer + per-cell FDR, intro
-already frozen) applies to this campaign's replicated runs.
+Supersedes the earlier "48h x 3 platform x hardware x model factorial" sketch.
+The journal extension and the NVIDIA-grant work are built on this campaign. The
+local L40S arm runs first (de-risking); the L40S->A100 hardware axis and the
+Nemotron model come with the grant. The journal's meta-analytic layer (DL-RE +
+Stouffer + per-cell FDR; intro already frozen) applies to the replicated runs.
+
+Pipeline: the `aging_trends.py` proc/gpu discovery bug (TODO #9) is FIXED
+(now uses `aging_io.discover_proc_prefix` + dynamic gpu-prefix discovery).
+
+DESIGN — one screening DoW run identically on three serving systems:
+- Systems: NVIDIA Dynamo (disaggregated, 2 GPU/run), Triton+vLLM (1 GPU),
+  vLLM standalone (1 GPU). Common engine = vLLM; pin the SAME vLLM version
+  across the three to avoid the preliminary's version-drift confound.
+- Workload DoW: 5 factors x 2 levels — rate, prompt-length, output-length,
+  prefix-repeat, burstiness. 16-run Resolution V (I=ABCDE: all main effects +
+  all 2-factor interactions estimable, unconfounded) + 3 center points = 19
+  runs/system. 48h window each. Rate = fraction-of-ceiling with a short
+  per-run calibration.
+- Levels (Qwen, ctx 8192; CONFIRMED 2026-06-29): rate 30% / 85% ceiling;
+  prompt ~512 / ~6000 tok; output ~64 / ~1024 tok; prefix-repeat 0% / 80%;
+  burstiness Poisson / bursty. Center point = mid values.
+- Responses per run (deep): USS slope/hour (primary); slope/million-requests
+  (separates time- vs load-driven); stepness; AND per-component memory
+  (router / prefill / decode / KV-transfer) for localization on Dynamo.
+- Model: Qwen for the local arm. Nemotron + the L40S->A100 hardware axis are
+  on the grant/A100 arm (adding both to the local DoW would ~double GPU-h
+  beyond the 2-month window).
+
+WHY THIS SHAPE: one cannot decide a priori whether aging is time- or
+load-driven, so we lead with a stressful workload DoW and put rate among the
+factors; slope/hour vs slope/request then decides it from the data. Screening
+(Res V) ranks which workload stress dominates and per-component monitoring
+finds where; then finer characterization on the 2-3 dominant factors + a 7-day
+confirmation on the worst stressor. (This replaces the earlier "nominal base
+vs probe" framing, per Domenico: in aging practice you stress to surface and
+localize, then DoE the workload parameters to rank them.)
+
+BUDGET / TIME: ~3,650 GPU-h on local 4x L40S (Dynamo 19x48x2 + Triton 19x48 +
+vLLM 19x48) + calibrations; fits the ~2-month / ~5,760 GPU-h server window with
+margin.
+
+PHASING (~8 weeks): wk1-2 setup/de-risk (Dynamo bring-up aggregated +
+disaggregated; MONITORING decision = map the component PIDs to track; two new
+client features = prefix-repeat injection + burst arrival mode; harness
+validation with 2 short runs; calibration tooling). wk3-7 the three DoW
+campaigns (Dynamo first). wk7-8 deep analysis + dominant factors + 7-day runs
+on the worst stressor.
+
+LOCKED: 48h window; Res V 16+3CP; rate = fraction-of-ceiling; 3 systems; Qwen
+local / Nemotron+A100 on the grant; "stress-workload" terminology (never
+"adversarial"); security framed as a resource-exhaustion implication with
+responsible disclosure; factor levels (CONFIRMED 2026-06-29, above).
+
+NEXT (CONFIRMED 2026-06-29): STEP 1 = Dynamo bring-up (aggregated +
+disaggregated) + MONITORING decision (map component PIDs: router / prefill /
+decode / KV-transfer) + two client features (prefix-repeat injection, burst
+arrival mode) + harness validation (2 short runs) + per-run rate-calibration
+tooling. Nothing in the DoW runs starts before STEP 1 is done.
+STEP 0 (Domenico, in parallel): 48h validation run of one known cell on the
+L40S server to confirm harness + fixed pipeline at the 48h horizon.

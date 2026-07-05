@@ -4,11 +4,56 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-06-29 (ET).
+Last updated: 2026-06-30 (ET, evening).
 
 ---
 
-## ⏸️ RESUME HERE (2026-06-29 evening) — STEP 1 gate in progress
+## ⏸️ RESUME HERE (2026-06-30 evening) — re-pass gate blocked on Dynamo bring-up
+
+**Where we are.** BATCH 1 (data integrity) is committed + box-validated in part;
+BATCH 2 PHASE A (fail-loud) is committed with per-commit unittest (all green
+locally). The consolidated box gate `deploy/dynamo/repass_gate2.sh` was built and
+run on cci-csgpu11. It is the gate to BATCH 2 PHASE B. Current gate result:
+
+  pip_pin PASS, fail_loud_negative PASS, disk_root PASS (DockerRootDir=
+  /home/dcotrone/docker-data), **bringup FAIL** -> validator/no_orphans/
+  n_pids_unexpected_0/verify_scoping all SKIP (blocked by bringup).
+
+**THE BLOCKER (open):** on the gate run the disaggregated stack does not serve.
+Workers come up and log "Registered base model" (prefill + decode), a SINGLE
+long-lived frontend stays Up and healthy (HTTP 200), yet `/v1/models` stays
+`{"data":[]}` for 4+ min and through 2 clean restart fallbacks. This is NOT the
+old churn/timing story: an identical single-frontend PROBE in the same session
+served `/v1/models` in ~5 s at the same worker-age offset, while the gate run
+with the same code did not -> the bring-up is FLAKY at the Dynamo registry level.
+Prime suspect: the decode EngineCore logs `AttributeError: 'EngineCoreProc'
+object has no attribute 'get_kv_cache_group_metadata'` (we had treated it as a
+benign fallback; it may sometimes leave the model registration incomplete).
+
+**NEXT STEP (resume here):** run the etcd diagnostic to localize it (it is in the
+chat; re-paste if lost). It brings up infra+workers, starts ONE frontend, and
+prints, every 10 s, the count of `dynamo` keys in etcd vs `/v1/models`:
+  - etcd dynamo keys > 0 but /v1/models empty -> frontend discovery bug (how/when
+    we start it, or namespace); fix the frontend path.
+  - etcd dynamo keys 0 / dropping -> worker registration not persisting (lease /
+    EngineCore); fix worker-side, look at the decode log for de-registration.
+Command core:
+  `docker exec -e ETCDCTL_API=3 dyn_etcd etcdctl get "" --prefix --keys-only | grep -i dynamo`
+Do NOT start PHASE B until `repass_gate2.sh` reports OVERALL: PASS.
+
+**Commits today (all pushed, HEAD e139a63):** BATCH 1 a042b64/e069848/03afbbf/
+90c7091/3d12c9c; PHASE A 63df560(#1 fail-loud) 20cc2c5(#7 calibration) bce116c(#6
+disk-root) 1da191f(#5 hardening) 8e2f776(#9 monotonic); gate 87308c7 + fixes
+3837280/6fe8351/e139a63. Tests in `tests/test_phase_a_*.py` (unittest; pytest not
+in the env -- run `python3 -m unittest discover -s tests`).
+
+PHASE B order when unblocked: 2 (typed Dynamo lifecycle in launch_cell) -> 4
+(reaper in launch_cell) -> 3 (serialize campaign.py) -> 5 (mid-run disk watchdog).
+Point 8 (gzip) DEFERRED to after the long test's measured disk-growth curve.
+
+---
+
+## RESUME (2026-06-29 evening) — STEP 1 gate (historical, both gates PASSED)
 
 **Where we are:** STEP 1 code is complete (client features WS3/WS4, calibration
 WS5, per-component monitor WS2, Dynamo bring-up WS1, attach_run, gate checker;
