@@ -44,7 +44,21 @@ trap cleanup EXIT
 
 echo "[repass] repo=$REPO run_dir=$RUN_DIR duration=${DURATION_S}s"
 
-# ----- step 0: vLLM pin guard (all three images must ship 0.20.1) -----
+# ----- step 0: env preflight (fail fast with ONE clear error) -----
+# attach_run.py / validate_extension_run.py / verify_scoping.py all need yaml +
+# psutil, which only the wosar conda env has. A run from the base env otherwise
+# produces confusing cascading downstream failures instead of one clear message,
+# so check the interpreter up front and, if it can't import them, mark EVERY
+# check FAIL and exit immediately.
+if ! python3 -c "import yaml, psutil" 2>/dev/null; then
+  echo "[repass] FATAL: python3 cannot import yaml+psutil -- activate the wosar conda env (conda activate wosar)." >&2
+  for k in pip_pin bringup validator no_orphans n_pids_unexpected_0 verify_scoping fail_loud_negative disk_root; do
+    mark "$k" "FAIL"
+  done
+  exit 1
+fi
+
+# ----- step 0b: vLLM pin guard (all three images must ship 0.20.1) -----
 # Accept a build/local-version suffix (triton ships 0.20.1+<sha>.nvNN, standalone
 # 0.20.1+cu129); the base version is what the pin fixes.
 is_2001() { case "$1" in 0.20.1|0.20.1+*) return 0 ;; *) return 1 ;; esac; }
@@ -91,22 +105,31 @@ if [ "${RESULT[bringup]}" = "PASS" ]; then
   grep -q "GATE: PASS" "$val_log" && mark "validator" "PASS" || mark "validator" "FAIL"
   if grep -E "PASS +no_orphans" "$val_log" >/dev/null; then mark "no_orphans" "PASS"; else mark "no_orphans" "FAIL"; fi
 
-  # explicit n_pids_unexpected over the engine components
-  npu=$(python3 - "$RUN_DIR" <<'PY'
+  # explicit n_pids_unexpected over the engine components. Also count the CSVs
+  # actually scanned: zero files means NO data (e.g. attach_run crashed and wrote
+  # none), which must NOT pass vacuously -- no data is not evidence of absence.
+  read npu_files npu <<<"$(python3 - "$RUN_DIR" <<'PY'
 import csv, glob, sys
 from pathlib import Path
-run = Path(sys.argv[1]); worst = 0
+run = Path(sys.argv[1]); worst = 0; nfiles = 0
 for label in ("dynamo_frontend", "dynamo_prefill", "dynamo_decode"):
     for f in glob.glob(str(run / f"{label}_*.csv")):
+        nfiles += 1
         for r in csv.DictReader(open(f)):
             v = r.get("n_pids_unexpected")
             if v not in (None, ""):
                 worst = max(worst, int(v))
-print(worst)
+print(f"{nfiles} {worst}")
 PY
-)
-  echo "[repass] max n_pids_unexpected on engine components = $npu"
-  [ "$npu" = "0" ] && mark "n_pids_unexpected_0" "PASS" || mark "n_pids_unexpected_0" "FAIL"
+)"
+  echo "[repass] engine-component CSVs scanned=${npu_files:-0}, max n_pids_unexpected=${npu:-?}"
+  if [ "${npu_files:-0}" -eq 0 ] 2>/dev/null; then
+    mark "n_pids_unexpected_0" "FAIL"   # no CSVs scanned -> no data, not evidence of absence
+  elif [ "$npu" = "0" ]; then
+    mark "n_pids_unexpected_0" "PASS"
+  else
+    mark "n_pids_unexpected_0" "FAIL"
+  fi
 
   # step 4: empirical scoping completeness (smaps total vs recorded-pgid aggregate).
   # Use the absolute interpreter path so sudo's sanitized PATH still finds the
