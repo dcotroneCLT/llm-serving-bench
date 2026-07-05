@@ -49,6 +49,13 @@ start. Entries written by older code (no launcher fields) are treated as
 launcher-dead (reapable). As a second line of defense, reap also recovers runs
 from run_dir/child_pids.json (written before the ledger upsert) so a launcher that
 died between the client spawn and the ledger write still gets its client reaped.
+
+Atomic serial-run guard: acquire_run_slot() takes a non-blocking exclusive flock
+on <runs_root>/.run_slot.lock, held for the whole run, so two launchers starting
+from an empty ledger cannot both proceed (the ledger check alone is not atomic
+across reap->bring-up->record). While that slot is held, reap_host_wide() can
+safely sweep ANY OUR_SCRIPTS process referencing this runs-root as an orphan --
+catching a hard crash between the client spawn and the ledger upsert.
 """
 
 from __future__ import annotations
@@ -70,6 +77,7 @@ except ImportError as e:  # pragma: no cover
 
 LEDGER_NAME = ".active_children.json"
 LOCK_NAME = LEDGER_NAME + ".lock"
+RUN_SLOT_LOCK_NAME = ".run_slot.lock"
 
 # Only ever touch processes whose cmdline names one of these (defence in depth on
 # top of the run-id match): our launcher children and their monitor descendants.
@@ -163,6 +171,61 @@ def ledger_run_ids(runs_root) -> list[str]:
 
 def _lock_path(runs_root: Path) -> Path:
     return runs_root / LOCK_NAME
+
+
+def acquire_run_slot(runs_root):
+    """Atomic serial-run guard (R3-1). Take a NON-BLOCKING exclusive flock on
+    <runs_root>/.run_slot.lock and return the open file object on success, or None
+    if another launcher already holds it. The caller MUST keep the returned object
+    for the whole run (flock is released when the fd is closed or the process
+    dies, so a stale lock file is harmless). This closes the reap->bring-up->record
+    gap that R2-2's ledger check alone cannot make atomic: two launchers starting
+    from an empty ledger cannot both hold the slot."""
+    runs_root = Path(runs_root)
+    runs_root.mkdir(parents=True, exist_ok=True)
+    f = open(runs_root / RUN_SLOT_LOCK_NAME, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        f.close()
+        return None
+    return f
+
+
+def reap_host_wide(runs_root, current_run_id: Optional[str] = None) -> tuple[list[str], list[int]]:
+    """Host-wide fallback sweep -- SAFE ONLY while the caller holds the run-slot
+    lock (R3-2). With the exclusive slot held, no other legitimate launcher is
+    running on this runs-root, so ANY live process that both (a) matches one of
+    OUR_SCRIPTS and (b) references this runs-root in its cmdline, and is not part
+    of the current run, is an orphan the ledger may have missed -- e.g. a
+    SIGKILL/OOM of a prior launcher between its client spawn and its ledger upsert
+    (client_pid=None in the ledger). Matching the LIVE cmdline is PID-reuse-safe;
+    the kill is verified (R1-4). Returns (log_lines, unkillable_pids); a non-empty
+    unkillable list means the caller must refuse to start."""
+    runs_root = Path(runs_root)
+    root_str = str(runs_root)
+    out: list[str] = []
+    unkillable: list[int] = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cl = " ".join(proc.info.get("cmdline") or [])
+        except Exception:
+            continue
+        if not cl or root_str not in cl:
+            continue
+        if not any(s in cl for s in OUR_SCRIPTS):
+            continue
+        if current_run_id and current_run_id in cl:
+            continue  # belongs to the current run (defensive; none spawned pre-run)
+        pid = proc.info["pid"]
+        if _kill_pgid(pid):
+            out.append(f"[reaper] host-wide killed orphan pid={pid}: {cl[:80]}")
+        else:
+            unkillable.append(pid)
+            out.append(f"[reaper] FATAL: host-wide could NOT kill orphan pid={pid}: {cl[:80]}")
+    if not out:
+        out.append("[reaper] host-wide sweep: no orphan referencing this runs-root")
+    return out, unkillable
 
 
 def _read_ledger(ledger: Path) -> tuple[list[dict], Optional[str]]:

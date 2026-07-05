@@ -174,6 +174,8 @@ class LaunchCellWiring(unittest.TestCase):
         cc.write_text("request_timeout_s: 1\n")
 
         reaper_mock = mock.MagicMock()
+        reaper_mock.acquire_run_slot.return_value = object()  # holds the run-slot lock
+        reaper_mock.reap_host_wide.return_value = ([], [])    # (lines, unkillable)
         reaper_mock.reap_orphans.side_effect = lambda *a, **k: (events.append("reap"), [])[1]
         reaper_mock.ledger_run_ids.return_value = ledger_stuck or []
 

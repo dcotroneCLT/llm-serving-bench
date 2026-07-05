@@ -148,6 +148,7 @@ class CsvRotatingWriter:
         self._file = None
         self._writer: Optional[csv.DictWriter] = None
         self._opened_at = 0.0
+        self._closed = False
 
     def _open_new(self) -> None:
         if self._file is not None:
@@ -162,6 +163,11 @@ class CsvRotatingWriter:
         self._seq += 1
 
     def write(self, row: dict[str, Any]) -> None:
+        # Fail loud on a write after close: silently reopening a new file (the old
+        # behavior, since _file is None) would scatter late rows and mask the
+        # ordering bug R3-4 fixes. A correctly drained shutdown never hits this.
+        if self._closed:
+            raise RuntimeError("CsvRotatingWriter.write() after close()")
         now = time.monotonic()
         if self._file is None or (now - self._opened_at) >= self.rotation_seconds:
             self._open_new()
@@ -169,6 +175,8 @@ class CsvRotatingWriter:
         self._writer.writerow(row)
 
     def close(self) -> None:
+        # Idempotent (R3-4: closed exactly once even if called again).
+        self._closed = True
         if self._file is not None:
             self._file.flush()
             os.fsync(self._file.fileno())
@@ -186,6 +194,30 @@ def _delta(mono_a, mono_b, wall_a, wall_b):
     if wall_a is not None and wall_b is not None:
         return max(0.0, wall_b - wall_a)
     return None
+
+
+async def drain_and_grace(tasks, drain_s: float, cancel_grace_s: float) -> None:
+    """Drain in-flight request tasks before the writer is closed (R3-4).
+
+    Await them up to drain_s; on timeout, cancel the stragglers and then await
+    them a further cancel_grace_s so their except/finally blocks (which flush a
+    final error row) run BEFORE the caller closes the CSV writer -- otherwise a
+    hung-endpoint ending undercounts failures or writes after close. Never raises
+    (return_exceptions swallows the CancelledError the cancelled tasks re-raise)."""
+    if not tasks:
+        return
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=drain_s)
+        return
+    except asyncio.TimeoutError:
+        for t in list(tasks):
+            if not t.done():
+                t.cancel()
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True),
+                                   timeout=cancel_grace_s)
+        except asyncio.TimeoutError:
+            pass  # a truly stuck task cannot be awaited further; proceed to close
 
 
 def fill_derived_latencies(r: RequestResult) -> None:
@@ -475,14 +507,10 @@ class BenchmarkEngine:
                     self._persist_state()
                     last_state_persist = time.monotonic()
 
-            # Drain in-flight tasks with a generous grace period
-            if self._tasks:
-                try:
-                    await asyncio.wait_for(asyncio.gather(*self._tasks, return_exceptions=True), timeout=60.0)
-                except asyncio.TimeoutError:
-                    for t in self._tasks:
-                        if not t.done():
-                            t.cancel()
+            # Drain in-flight tasks, then close the writer EXACTLY once. On a drain
+            # timeout, cancelled tasks are awaited a short grace so their final
+            # error rows are flushed BEFORE close (R3-4), not lost or written after.
+            await drain_and_grace(self._tasks, drain_s=60.0, cancel_grace_s=5.0)
             self._persist_state()
             self.writer.close()
 

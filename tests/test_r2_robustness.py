@@ -115,31 +115,19 @@ class MembershipTick(unittest.TestCase):
             lines.append(f"{i},dynamo,{mc},{npu}")
         (run_dir / "agg_dynamo_000.csv").write_text("\n".join(lines) + "\n")
 
-    def test_latest_complete_tick_ok(self):
+    def test_returns_latest_row(self):
+        # R3-3 contract: returns the raw latest row dict (strict/fresh judgment is
+        # the caller's job, tested in test_r3_robustness).
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            self._write_agg(d, [("True", 0), ("True", 0)])
-            self.assertEqual(lc.read_latest_membership_tick(d, "agg_dynamo"), (True, 0))
-
-    def test_incomplete_and_unexpected_detected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            d = Path(tmp)
-            self._write_agg(d, [("True", 0), ("False", 0)])
-            self.assertEqual(lc.read_latest_membership_tick(d, "agg_dynamo"), (False, 0))
-            self._write_agg(d, [("True", 3)])
-            self.assertEqual(lc.read_latest_membership_tick(d, "agg_dynamo"), (True, 3))
+            self._write_agg(d, [("True", 0), ("False", 2)])
+            row = lc.read_latest_membership_tick(d, "agg_dynamo")
+            self.assertEqual(row["membership_complete"], "False")
+            self.assertEqual(row["n_pids_unexpected"], "2")
 
     def test_no_file_is_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(lc.read_latest_membership_tick(Path(tmp), "agg_dynamo"))
-
-    def test_partial_last_row_tolerated(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            d = Path(tmp)
-            # A partial last line during rotation (membership_complete missing).
-            (d / "agg_dynamo_000.csv").write_text(
-                "ts_unix,group,membership_complete,n_pids_unexpected\n1,dynamo,True,0\n2,dynamo,")
-            self.assertIsNone(lc.read_latest_membership_tick(d, "agg_dynamo"))
 
 
 class DynamoHealthMembership(unittest.TestCase):
@@ -149,25 +137,28 @@ class DynamoHealthMembership(unittest.TestCase):
     def test_membership_incomplete_is_violation(self):
         with tempfile.TemporaryDirectory() as tmp:
             lf = self._lf(tmp)
+            row = {"ts_unix": "1", "membership_complete": "False", "n_pids_unexpected": "0"}
             with mock.patch.object(lc, "container_running", return_value=True), \
                  mock.patch.object(lf, "_models_listed_quick", return_value=True), \
-                 mock.patch.object(lc, "read_latest_membership_tick", return_value=(False, 0)):
-                self.assertIn("membership incomplete", lf.health_check())
+                 mock.patch.object(lc, "read_latest_membership_tick", return_value=row):
+                self.assertIn("not affirmatively complete", lf.health_check())
 
     def test_n_pids_unexpected_is_violation(self):
         with tempfile.TemporaryDirectory() as tmp:
             lf = self._lf(tmp)
+            row = {"ts_unix": "1", "membership_complete": "True", "n_pids_unexpected": "2"}
             with mock.patch.object(lc, "container_running", return_value=True), \
                  mock.patch.object(lf, "_models_listed_quick", return_value=True), \
-                 mock.patch.object(lc, "read_latest_membership_tick", return_value=(True, 2)):
+                 mock.patch.object(lc, "read_latest_membership_tick", return_value=row):
                 self.assertIn("n_pids_unexpected", lf.health_check())
 
     def test_healthy_when_tick_clean(self):
         with tempfile.TemporaryDirectory() as tmp:
             lf = self._lf(tmp)
+            row = {"ts_unix": "1", "membership_complete": "True", "n_pids_unexpected": "0"}
             with mock.patch.object(lc, "container_running", return_value=True), \
                  mock.patch.object(lf, "_models_listed_quick", return_value=True), \
-                 mock.patch.object(lc, "read_latest_membership_tick", return_value=(True, 0)):
+                 mock.patch.object(lc, "read_latest_membership_tick", return_value=row):
                 self.assertIsNone(lf.health_check())
 
     def test_leader_gone_is_violation(self):

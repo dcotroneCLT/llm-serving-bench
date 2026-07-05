@@ -87,6 +87,14 @@ def main() -> None:
     # the hand-started containers' fs + logs).
     lc.require_free_space([args.runs_root, lc.docker_root_dir()], args.min_free_gb, label=run_id)
 
+    # R3-1: atomic serial-run guard. Hold the run-slot lock for the whole run
+    # (run_slot stays open until this process exits). The ledger check below stays
+    # as defense in depth.
+    run_slot = reaper.acquire_run_slot(args.runs_root)
+    if run_slot is None:
+        lc.die(f"another launcher holds the run-slot lock on {args.runs_root}; the campaign "
+               f"is strictly serial -- refusing to start.", rc=9)
+
     # Pre-run orphan reaper: kill leftover monitor/client children of a prior run
     # (run-id + script-name verified, PID-reuse-safe) so they cannot contaminate
     # this run's load or CSVs. Engine containers are NOT touched here (the engine
@@ -101,6 +109,13 @@ def main() -> None:
         lc.die(f"pre-run reaper refuses to start: prior run(s) {stuck} are still active "
                f"(launcher alive) or have an unkillable orphan -- see the [reaper] lines above. "
                f"Stop/clear them, then retry.", rc=8)
+    # R3-2: host-wide fallback sweep, safe because we hold the run-slot lock.
+    hw_lines, hw_unkillable = reaper.reap_host_wide(args.runs_root, current_run_id=run_id)
+    for line in hw_lines:
+        lc.log(line)
+    if hw_unkillable:
+        lc.die(f"host-wide reaper could not kill orphan process(es) {hw_unkillable} referencing "
+               f"{args.runs_root}; refusing to start.", rc=8)
 
     monitors = cell["monitors"]
     components = monitors.get("components")

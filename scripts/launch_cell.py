@@ -486,6 +486,11 @@ HEALTH_CHECK_EVERY_S = 30
 HEALTH_FAIL_CONSECUTIVE = 3
 ENDPOINT_DEAD_WINDOW_S = 300      # ~5 min rolling window for endpoint-dead detection
 ENDPOINT_DEAD_MIN_ROWS = 5        # need at least this many rows before declaring death
+# R3-3: a monitor that is alive but no longer producing new ticks (wedged) is a
+# dead monitor. If the latest aggregate tick's ts_unix has not ADVANCED for this
+# many seconds (measured on the launcher's MONOTONIC clock, ts_unix used only for
+# ordering), the membership check flags it -- subject to the N-consecutive gate.
+MEMBERSHIP_STALE_S = 120
 
 
 def container_running(name: str) -> bool:
@@ -544,18 +549,17 @@ def client_all_fail_window(client_dir: Path, window_s: int, now_unix: float,
     return None
 
 
-def read_latest_membership_tick(run_dir: Path, agg_prefix: str) -> Optional[tuple[bool, int]]:
-    """Return (membership_complete, n_pids_unexpected) from the most recent tick of
-    the per-component engine aggregate CSV (agg_<group>_*.csv), or None if there
-    is no readable/complete tick yet (tolerated -- a partial last line during
-    rotation must NOT be read as a violation). Same recent-tick pattern as
-    client_all_fail_window."""
+def read_latest_membership_tick(run_dir: Path, agg_prefix: str) -> Optional[dict]:
+    """Return the most recent row (raw string dict) of the per-component engine
+    aggregate CSV (agg_<group>_*.csv), or None if there is no readable row yet.
+    The strictness/freshness decision lives in the caller (R3-3): this helper only
+    surfaces the latest row so the caller can judge membership_complete,
+    n_pids_unexpected presence/parse, and the tick's ts_unix (for ordering)."""
     try:
         files = sorted(run_dir.glob(f"{agg_prefix}_*.csv"),
                        key=lambda p: p.stat().st_mtime, reverse=True)[:2]
     except OSError:
         return None
-    last = None
     for path in files:  # newest first
         try:
             with path.open(newline="") as f:
@@ -563,20 +567,8 @@ def read_latest_membership_tick(run_dir: Path, agg_prefix: str) -> Optional[tupl
         except OSError:
             continue
         if rows:
-            last = rows[-1]
-            break
-    if last is None:
-        return None
-    mc = last.get("membership_complete")
-    if mc in (None, ""):
-        return None  # partial/rotating row -> treat as no data, not a violation
-    complete = str(mc).strip().lower() == "true"
-    npu_raw = (last.get("n_pids_unexpected") or "").strip()
-    try:
-        npu = int(npu_raw) if npu_raw not in ("", "None") else 0
-    except ValueError:
-        npu = 0
-    return complete, npu
+            return rows[-1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1232,6 +1224,10 @@ class DynamoDisaggLifecycle(EngineLifecycle):
         self.engine_group = self.cell["monitors"]["components"].get("engine_group", "engine")
         self.agg_prefix = f"agg_{self.engine_group}"
         self._leader_ctimes: dict[int, float] = {}
+        # R3-3 freshness state: the last tick ts_unix seen (for ordering only) and
+        # the MONOTONIC time it last advanced (for the staleness interval).
+        self._last_tick_ts: Optional[float] = None
+        self._last_tick_advance_mono: Optional[float] = None
 
     def _worker_names(self) -> tuple[list[str], list[str]]:
         prefill = [f"{self.PREFILL_PREFIX}_{i}" for i in range(1, self.n_prefill + 1)]
@@ -1442,16 +1438,56 @@ class DynamoDisaggLifecycle(EngineLifecycle):
             return False
 
     def _membership_violation(self) -> Optional[str]:
-        """R2-3: read the latest engine-aggregate tick; a recorded PGID that died
-        (membership incomplete) or a stray outside the recorded PGIDs
-        (n_pids_unexpected > 0) is a violation the run-level validator would
-        otherwise catch only at the END, wasting the whole window."""
-        tick = read_latest_membership_tick(self.run_dir, self.agg_prefix)
-        if tick is None:
-            return None  # no readable tick yet -> tolerate
-        complete, n_unexpected = tick
-        if not complete:
-            return "membership incomplete on the latest tick (a recorded PGID died?)"
+        """R2-3 + R3-3: read the latest engine-aggregate tick and judge it.
+
+        (a) Freshness: a monitor that is alive but no longer emitting new ticks is
+            a dead monitor. We track whether the tick's ts_unix has ADVANCED
+            (ts_unix used only for ordering) and measure the stall on the launcher's
+            MONOTONIC clock; a stall past MEMBERSHIP_STALE_S is a violation.
+        (b) Strictness: the tick is clean ONLY if membership_complete is
+            affirmatively 'true' AND n_pids_unexpected is present and parseable and
+            zero. A recorded PGID that died (incomplete) or a stray (n>0), or a
+            missing/malformed field, is a violation candidate (subject to the
+            N-consecutive gate in the supervision loop)."""
+        row = read_latest_membership_tick(self.run_dir, self.agg_prefix)
+        now_mono = time.monotonic()
+
+        # -- freshness bookkeeping (ordering by ts_unix, interval by monotonic) --
+        if row is not None:
+            try:
+                ts_val = float(row.get("ts_unix"))
+            except (TypeError, ValueError):
+                ts_val = None
+            if ts_val is not None and (self._last_tick_ts is None or ts_val > self._last_tick_ts):
+                self._last_tick_ts = ts_val
+                self._last_tick_advance_mono = now_mono
+            elif self._last_tick_advance_mono is None:
+                # First row but no usable ts_unix: start the staleness clock now.
+                self._last_tick_advance_mono = now_mono
+        elif self._last_tick_advance_mono is None:
+            # Never seen a tick yet (monitor still warming up) -> tolerate.
+            return None
+
+        if (self._last_tick_advance_mono is not None
+                and now_mono - self._last_tick_advance_mono > MEMBERSHIP_STALE_S):
+            stalled = int(now_mono - self._last_tick_advance_mono)
+            return (f"engine monitor produced no new tick for {stalled}s "
+                    f"(> {MEMBERSHIP_STALE_S}s): wedged monitor?")
+
+        if row is None:
+            return None  # stale clock not tripped and no row -> tolerate
+
+        # -- strictness: clean requires affirmative complete AND present+parseable+0 --
+        mc = str(row.get("membership_complete", "")).strip().lower()
+        if mc != "true":
+            return "membership not affirmatively complete on the latest tick (a recorded PGID died?)"
+        npu_raw = row.get("n_pids_unexpected")
+        if npu_raw is None or str(npu_raw).strip() in ("", "None"):
+            return "n_pids_unexpected missing on the latest tick (malformed monitor row?)"
+        try:
+            n_unexpected = int(str(npu_raw).strip())
+        except ValueError:
+            return f"n_pids_unexpected unparseable on the latest tick: {npu_raw!r}"
         if n_unexpected > 0:
             return f"n_pids_unexpected={n_unexpected} on the latest tick (stray outside recorded PGIDs)"
         return None
@@ -1635,6 +1671,15 @@ def main() -> None:
     # A dropped SSH session sends SIGHUP; route it through the same graceful path.
     signal.signal(signal.SIGHUP, handle_signal)
 
+    # R3-1: atomic serial-run guard. Take the run-slot lock BEFORE the pre-run reap
+    # and HOLD it for the whole run (run_slot stays open until the process exits).
+    # This closes the reap->bring-up->record gap that the ledger check alone cannot
+    # make atomic. The R2-2 ledger check below stays as defense in depth.
+    run_slot = reaper.acquire_run_slot(args.runs_root)
+    if run_slot is None:
+        die(f"another launcher holds the run-slot lock on {args.runs_root}; the campaign "
+            f"is strictly serial -- refusing to start.", rc=9)
+
     # Pre-run orphan reaper: kill leftover monitor/client children of a prior run
     # (run-id + script-name verified, PID-reuse-safe) BEFORE the engine stack
     # starts, so a stale sudo'd proc monitor is gone before the new one runs.
@@ -1650,6 +1695,15 @@ def main() -> None:
         die(f"pre-run reaper refuses to start: prior run(s) {stuck} are still active "
             f"(launcher alive) or have an unkillable orphan -- see the [reaper] lines above. "
             f"Stop/clear them, then retry.", rc=8)
+    # R3-2: host-wide fallback sweep, SAFE because we hold the run-slot lock. Kills
+    # any OUR_SCRIPTS process referencing this runs-root that the ledger missed
+    # (e.g. a hard crash between a prior run's client spawn and its ledger upsert).
+    hw_lines, hw_unkillable = reaper.reap_host_wide(args.runs_root, current_run_id=run_id)
+    for line in hw_lines:
+        log(line)
+    if hw_unkillable:
+        die(f"host-wide reaper could not kill orphan process(es) {hw_unkillable} referencing "
+            f"{args.runs_root}; refusing to start.", rc=8)
 
     # 3. Select the engine lifecycle (single_container default / dynamo_disagg)
     #    and bring the engine up through it: teardown-stale, start, readiness,
