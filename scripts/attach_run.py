@@ -93,13 +93,14 @@ def main() -> None:
     # is brought up by hand on the attach path).
     for line in reaper.reap_orphans(args.runs_root, current_run_id=run_id):
         lc.log(line)
-    # An entry surviving the reap is a live orphan the reaper could not kill;
+    # An entry surviving the reap means either an ACTIVE run (a launcher is still
+    # alive -- accidental concurrent start) or an unkillable orphan. Either way,
     # refuse to start over it (a stray client would load this run's endpoint).
     stuck = reaper.ledger_run_ids(args.runs_root)
     if stuck:
-        lc.die(f"pre-run reaper could not kill recorded orphan(s) from prior run(s) {stuck}; "
-               f"refusing to start on a host with an unkillable orphan (kill it manually, then retry).",
-               rc=8)
+        lc.die(f"pre-run reaper refuses to start: prior run(s) {stuck} are still active "
+               f"(launcher alive) or have an unkillable orphan -- see the [reaper] lines above. "
+               f"Stop/clear them, then retry.", rc=8)
 
     monitors = cell["monitors"]
     components = monitors.get("components")
@@ -160,8 +161,14 @@ def main() -> None:
     )
     lc.log(f"monitors pid={monitors_proc.pid}")
     # Record the monitors immediately (client_pid=None) to close the crash window
-    # between spawn and ledger record; upsert again once the client is up.
-    reaper.record_children(args.runs_root, run_dir, run_id, monitors_proc.pid, None)
+    # between spawn and ledger record; upsert again once the client is up. On a
+    # record failure (R2-1), stop the children we already spawned before dying.
+    try:
+        reaper.record_children(args.runs_root, run_dir, run_id, monitors_proc.pid, None)
+    except Exception as e:  # noqa: BLE001
+        lc.log(f"FATAL: reaper.record_children (monitors) failed: {e!r}; stopping children")
+        lc.stop_subprocess(monitors_proc, "monitors", grace_s=30.0)
+        lc.die("could not record run children after monitors spawn", rc=8)
 
     client_config = lc.materialize_client_config(args.repo_root, run_dir, cell, args.replica)
     manifest["client_config_path"] = str(client_config)
@@ -169,8 +176,15 @@ def main() -> None:
     client_proc = lc.spawn_client(args.repo_root, run_dir, client_config, duration_s, log_dir)
     lc.log(f"client pid={client_proc.pid}")
 
-    # Upsert with the client pid now that it is spawned.
-    reaper.record_children(args.runs_root, run_dir, run_id, monitors_proc.pid, client_proc.pid)
+    # Upsert with the client pid now that it is spawned. On a record failure, stop
+    # the client AND monitors before dying so no live orphan is left unrecorded.
+    try:
+        reaper.record_children(args.runs_root, run_dir, run_id, monitors_proc.pid, client_proc.pid)
+    except Exception as e:  # noqa: BLE001
+        lc.log(f"FATAL: reaper.record_children (client upsert) failed: {e!r}; stopping children")
+        lc.stop_subprocess(client_proc, "client", grace_s=30.0)
+        lc.stop_subprocess(monitors_proc, "monitors", grace_s=30.0)
+        lc.die("could not record run children after client spawn", rc=8)
 
     mono_deadline = started_mono + duration_s
     try:

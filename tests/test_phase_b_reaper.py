@@ -147,7 +147,7 @@ def _single_cell_yaml(tmp: Path) -> Path:
 
 class LaunchCellWiring(unittest.TestCase):
     def _run_main(self, tmp: Path, client_poll, mono_step, duration_s,
-                  ledger_stuck=None, teardown_raises=False):
+                  ledger_stuck=None, teardown_raises=False, record_raises=None):
         events: list[str] = []
         run_dir = tmp / "runs" / "test_e1_r01"
 
@@ -176,8 +176,20 @@ class LaunchCellWiring(unittest.TestCase):
         reaper_mock = mock.MagicMock()
         reaper_mock.reap_orphans.side_effect = lambda *a, **k: (events.append("reap"), [])[1]
         reaper_mock.ledger_run_ids.return_value = ledger_stuck or []
-        reaper_mock.record_children.side_effect = lambda *a, **k: (events.append("record"), [])[1]
+
+        def _record(runs_root, run_dir_, run_id_, monitors_pid, client_pid):
+            events.append("record")
+            # record_raises: "monitors" -> raise on the client_pid=None call;
+            # "client" -> raise on the upsert (client_pid set).
+            if record_raises == "monitors" and client_pid is None:
+                raise OSError("ledger write failed (monitors)")
+            if record_raises == "client" and client_pid is not None:
+                raise OSError("ledger write failed (client upsert)")
+            return []
+        reaper_mock.record_children.side_effect = _record
         reaper_mock.deregister_run.side_effect = lambda *a, **k: (events.append("deregister"), [])[1]
+
+        stops: list[str] = []
 
         args = types.SimpleNamespace(
             cell_yaml=_single_cell_yaml(tmp), replica=1, runs_root=tmp / "runs",
@@ -220,12 +232,12 @@ class LaunchCellWiring(unittest.TestCase):
             m["spawn_client"].side_effect = lambda *a, **k: (events.append("spawn_client"), _FakeProc(222, client_poll))[1]
             m["materialize_client_config"].return_value = cc
             m["summarize_client_csvs"].return_value = {"total": 1, "ok": 1, "status_counts": {}}
-            m["stop_subprocess"].return_value = False
+            m["stop_subprocess"].side_effect = lambda proc, name, **k: (stops.append(name), False)[1]
             try:
                 lc.main()
             except SystemExit as e:
                 exit_code["code"] = e.code
-        return {"events": events, "exit_code": exit_code["code"], "run_dir": run_dir}
+        return {"events": events, "exit_code": exit_code["code"], "run_dir": run_dir, "stops": stops}
 
     def test_clean_teardown_wiring_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -264,6 +276,31 @@ class LaunchCellWiring(unittest.TestCase):
         self.assertEqual(r["exit_code"], 8)
         self.assertIn("reap", r["events"])
         self.assertNotIn("bringup", r["events"])  # died before bring-up
+
+    def test_record_failure_after_client_stops_children_and_exits(self):
+        # R2-1(a): record_children raising after the client spawn must stop the
+        # client AND monitors before dying, so no live orphan is left unrecorded.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1000.0, duration_s=1,
+                               record_raises="client")
+        self.assertEqual(r["exit_code"], 8)
+        self.assertIn("spawn_client", r["events"])
+        # Both children were stopped on the failure path.
+        self.assertIn("client", r["stops"])
+        self.assertIn("monitors", r["stops"])
+        # Died before the supervise/teardown finally: no teardown/deregister.
+        self.assertNotIn("teardown", r["events"])
+        self.assertNotIn("deregister", r["events"])
+
+    def test_record_failure_after_monitors_stops_monitors_and_exits(self):
+        # R2-1(a): record_children raising right after the monitors spawn (before
+        # the client) must stop the monitors and die before spawning the client.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1000.0, duration_s=1,
+                               record_raises="monitors")
+        self.assertEqual(r["exit_code"], 8)
+        self.assertNotIn("spawn_client", r["events"])  # died before client spawn
+        self.assertIn("monitors", r["stops"])
 
     def test_teardown_error_recorded_and_still_finalizes(self):
         # R1-5: a teardown step raising must be recorded, the remaining steps

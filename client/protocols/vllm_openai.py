@@ -66,11 +66,11 @@ class VLLMOpenAIAdapter(ProtocolAdapter):
             if stream:
                 payload["stream_options"] = {"include_usage": True}
                 async with http.stream("POST", url, json=payload, timeout=self.timeout_s) as r:
-                    result.started_at_unix = time.time()
+                    result.stamp("started")
                     result.http_status = r.status_code
                     if r.status_code != 200:
                         result.error_message = f"http {r.status_code}"
-                        result.finished_at_unix = time.time()
+                        result.stamp("finished")
                         return result
                     output_tokens = 0
                     actual_input_tokens = None
@@ -91,19 +91,19 @@ class VLLMOpenAIAdapter(ProtocolAdapter):
                         choices = chunk.get("choices") or []
                         got_text = any((c.get("text") or "") for c in choices)
                         if got_text and result.first_token_at_unix is None:
-                            result.first_token_at_unix = time.time()
+                            result.stamp("first_token")
                         usage = chunk.get("usage")
                         if usage:
                             actual_input_tokens = usage.get("prompt_tokens", actual_input_tokens)
                             output_tokens = usage.get("completion_tokens", output_tokens)
-                    result.finished_at_unix = time.time()
+                    result.stamp("finished")
                     result.actual_input_tokens = actual_input_tokens
                     result.actual_output_tokens = output_tokens
                     result.status = "ok"
             else:
-                result.started_at_unix = time.time()
+                result.stamp("started")
                 r = await http.post(url, json=payload, timeout=self.timeout_s)
-                result.finished_at_unix = time.time()
+                result.stamp("finished")
                 result.http_status = r.status_code
                 if r.status_code != 200:
                     result.error_message = f"http {r.status_code}: {r.text[:200]}"
@@ -116,9 +116,9 @@ class VLLMOpenAIAdapter(ProtocolAdapter):
         except httpx.TimeoutException:
             result.status = "timeout"
             result.error_message = "client timeout"
-            result.finished_at_unix = time.time()
+            result.stamp("finished")
         except httpx.HTTPError as e:
             result.status = "error"
             result.error_message = f"http error: {e}"
-            result.finished_at_unix = time.time()
+            result.stamp("finished")
         return result

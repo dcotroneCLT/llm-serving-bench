@@ -66,11 +66,11 @@ class PyTorchHFAdapter(ProtocolAdapter):
         try:
             if stream:
                 async with http.stream("POST", url, json=payload, timeout=self.timeout_s) as r:
-                    result.started_at_unix = time.time()
+                    result.stamp("started")
                     result.http_status = r.status_code
                     if r.status_code != 200:
                         result.error_message = f"http {r.status_code}"
-                        result.finished_at_unix = time.time()
+                        result.stamp("finished")
                         return result
                     last_usage: dict = {}
                     async for line in r.aiter_lines():
@@ -80,21 +80,21 @@ class PyTorchHFAdapter(ProtocolAdapter):
                         if data == "[DONE]":
                             continue
                         if result.first_token_at_unix is None:
-                            result.first_token_at_unix = time.time()
+                            result.stamp("first_token")
                         try:
                             obj = json.loads(data)
                         except json.JSONDecodeError:
                             continue
                         if "prompt_tokens" in obj or "completion_tokens" in obj:
                             last_usage = obj
-                    result.finished_at_unix = time.time()
+                    result.stamp("finished")
                     result.actual_input_tokens = last_usage.get("prompt_tokens")
                     result.actual_output_tokens = last_usage.get("completion_tokens")
                     result.status = "ok"
             else:
-                result.started_at_unix = time.time()
+                result.stamp("started")
                 r = await http.post(url, json=payload, timeout=self.timeout_s)
-                result.finished_at_unix = time.time()
+                result.stamp("finished")
                 result.http_status = r.status_code
                 if r.status_code != 200:
                     result.error_message = f"http {r.status_code}: {r.text[:200]}"
@@ -106,9 +106,9 @@ class PyTorchHFAdapter(ProtocolAdapter):
         except httpx.TimeoutException:
             result.status = "timeout"
             result.error_message = "client timeout"
-            result.finished_at_unix = time.time()
+            result.stamp("finished")
         except httpx.HTTPError as e:
             result.status = "error"
             result.error_message = f"http error: {e}"
-            result.finished_at_unix = time.time()
+            result.stamp("finished")
         return result

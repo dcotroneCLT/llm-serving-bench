@@ -207,6 +207,9 @@ class ConfirmGone(unittest.TestCase):
 
 
 class RetainUnkillable(unittest.TestCase):
+    # These isolate the R1-4 kill/retain path, so the launcher is treated as DEAD
+    # (record_children stamps the live test process as launcher; R2-2 would
+    # otherwise correctly refuse to reap an "active" run -- covered separately).
     def _seed(self, runs_root):
         reaper.record_children(runs_root, runs_root / "r", "r", 4242, 4243)
 
@@ -214,7 +217,8 @@ class RetainUnkillable(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runs_root = Path(tmp)
             self._seed(runs_root)
-            with mock.patch.object(reaper, "_is_ours", return_value="python run_client.py --run r"), \
+            with mock.patch.object(reaper, "_launcher_alive", return_value=False), \
+                 mock.patch.object(reaper, "_is_ours", return_value="python run_client.py --run r"), \
                  mock.patch.object(reaper, "_kill_pgid", return_value=False):
                 lines = reaper.reap_orphans(runs_root, current_run_id="new")
             self.assertTrue(any("could NOT kill" in ln and "RETAINED" in ln for ln in lines), lines)
@@ -225,7 +229,8 @@ class RetainUnkillable(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runs_root = Path(tmp)
             self._seed(runs_root)
-            with mock.patch.object(reaper, "_is_ours", return_value="python run_client.py --run r"), \
+            with mock.patch.object(reaper, "_launcher_alive", return_value=False), \
+                 mock.patch.object(reaper, "_is_ours", return_value="python run_client.py --run r"), \
                  mock.patch.object(reaper, "_kill_pgid", return_value=True):
                 lines = reaper.reap_orphans(runs_root, current_run_id="new")
             self.assertTrue(any("killed orphan" in ln for ln in lines), lines)

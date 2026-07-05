@@ -176,21 +176,38 @@ class CsvRotatingWriter:
             self._file = None
 
 
+def _delta(mono_a, mono_b, wall_a, wall_b):
+    """Duration between two events, PREFERRING the monotonic anchors (immune to an
+    NTP step mid-request). Falls back to the wall-clock delta only when a
+    monotonic anchor is missing (e.g. error/dropped records that never started).
+    Returns None if neither pair is available."""
+    if mono_a is not None and mono_b is not None:
+        return max(0.0, mono_b - mono_a)
+    if wall_a is not None and wall_b is not None:
+        return max(0.0, wall_b - wall_a)
+    return None
+
+
 def fill_derived_latencies(r: RequestResult) -> None:
     if r.started_at_unix is not None:
-        r.queue_time_s = max(0.0, r.started_at_unix - r.submitted_at_unix)
+        r.queue_time_s = _delta(r.submitted_at_mono, r.started_at_mono,
+                                r.submitted_at_unix, r.started_at_unix)
     if r.first_token_at_unix is not None and r.started_at_unix is not None:
-        r.ttft_s = max(0.0, r.first_token_at_unix - r.started_at_unix)
+        r.ttft_s = _delta(r.started_at_mono, r.first_token_at_mono,
+                          r.started_at_unix, r.first_token_at_unix)
     if r.finished_at_unix is not None and r.started_at_unix is not None:
-        r.e2e_latency_s = max(0.0, r.finished_at_unix - r.started_at_unix)
+        r.e2e_latency_s = _delta(r.started_at_mono, r.finished_at_mono,
+                                 r.started_at_unix, r.finished_at_unix)
     if (
         r.first_token_at_unix is not None
         and r.finished_at_unix is not None
         and r.actual_output_tokens
         and r.actual_output_tokens > 1
     ):
-        gen_time = max(0.0, r.finished_at_unix - r.first_token_at_unix)
-        r.inter_token_latency_mean_s = gen_time / max(1, r.actual_output_tokens - 1)
+        gen_time = _delta(r.first_token_at_mono, r.finished_at_mono,
+                          r.first_token_at_unix, r.finished_at_unix)
+        if gen_time is not None:
+            r.inter_token_latency_mean_s = gen_time / max(1, r.actual_output_tokens - 1)
 
 
 def sample_prompt_length(rng: random.Random, median: int, p95: int, lo: int, hi: int) -> int:
@@ -295,7 +312,8 @@ class BenchmarkEngine:
     def request_stop(self) -> None:
         self._stop.set()
 
-    async def _dispatch_one(self, http: httpx.AsyncClient, req_id: int, submitted_at_unix: float) -> None:
+    async def _dispatch_one(self, http: httpx.AsyncClient, req_id: int,
+                            submitted_at_unix: float, submitted_at_mono: float) -> None:
         target_in_tok = sample_prompt_length(
             self.rng, self.prompt_len["median"], self.prompt_len["p95"],
             self.prompt_len["min"], self.prompt_len["max"],
@@ -324,6 +342,7 @@ class BenchmarkEngine:
                 max_tokens=target_out,
                 stream=stream,
             )
+            result.submitted_at_mono = submitted_at_mono
             result.requested_input_tokens = approx_in
             result.shared_prefix_applied = shared_prefix_applied
             fill_derived_latencies(result)
@@ -335,6 +354,8 @@ class BenchmarkEngine:
                 started_at_unix=None,
                 first_token_at_unix=None,
                 finished_at_unix=time.time(),
+                submitted_at_mono=submitted_at_mono,
+                finished_at_mono=time.monotonic(),
                 status="error",
                 error_message="client task cancelled",
                 requested_input_tokens=approx_in,
@@ -352,6 +373,8 @@ class BenchmarkEngine:
                 started_at_unix=None,
                 first_token_at_unix=None,
                 finished_at_unix=time.time(),
+                submitted_at_mono=submitted_at_mono,
+                finished_at_mono=time.monotonic(),
                 status="error",
                 error_message=f"{type(e).__name__}: {str(e)[:500]}",
                 requested_input_tokens=approx_in,
@@ -364,13 +387,14 @@ class BenchmarkEngine:
         finally:
             self.in_flight -= 1
 
-    def _drop(self, req_id: int, submitted_at_unix: float) -> None:
+    def _drop(self, req_id: int, submitted_at_unix: float, submitted_at_mono: float) -> None:
         result = RequestResult(
             req_id=req_id,
             submitted_at_unix=submitted_at_unix,
             started_at_unix=None,
             first_token_at_unix=None,
             finished_at_unix=time.time(),
+            submitted_at_mono=submitted_at_mono,
             status="dropped",
             error_message="concurrency cap reached",
             streaming=False,
@@ -406,6 +430,7 @@ class BenchmarkEngine:
                 req_id = self.req_id_next
                 self.req_id_next += 1
                 submitted_at_unix = time.time()
+                submitted_at_mono = time.monotonic()  # NTP-immune anchor for queue_time
 
                 # Record the realized interarrival (on the monotonic clock).
                 arr_now = time.monotonic()
@@ -419,10 +444,11 @@ class BenchmarkEngine:
                 arr_prev = arr_last = arr_now
 
                 if self.in_flight >= self.concurrency_cap:
-                    self._drop(req_id, submitted_at_unix)
+                    self._drop(req_id, submitted_at_unix, submitted_at_mono)
                 else:
                     self.in_flight += 1
-                    task = asyncio.create_task(self._dispatch_one(http, req_id, submitted_at_unix))
+                    task = asyncio.create_task(
+                        self._dispatch_one(http, req_id, submitted_at_unix, submitted_at_mono))
                     self._tasks.add(task)
                     task.add_done_callback(self._tasks.discard)
 

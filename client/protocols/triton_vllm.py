@@ -89,11 +89,11 @@ class TritonVLLMAdapter(ProtocolAdapter):
             if stream:
                 url = self.generate_url(stream=True)
                 async with http.stream("POST", url, json=body_payload, timeout=self.timeout_s) as r:
-                    result.started_at_unix = time.time()
+                    result.stamp("started")
                     result.http_status = r.status_code
                     if r.status_code != 200:
                         result.error_message = f"http {r.status_code}"
-                        result.finished_at_unix = time.time()
+                        result.stamp("finished")
                         return result
                     output_chars = 0
                     async for line in r.aiter_lines():
@@ -114,17 +114,17 @@ class TritonVLLMAdapter(ProtocolAdapter):
                         # Anchor TTFT to the first frame with actual text so
                         # framing/heartbeat chunks do not bias the measurement.
                         if text and result.first_token_at_unix is None:
-                            result.first_token_at_unix = time.time()
+                            result.stamp("first_token")
                         output_chars += len(text)
-                    result.finished_at_unix = time.time()
+                    result.stamp("finished")
                     # Char-based estimate, refined later by the orchestrator using the tokenizer.
                     result.extras["output_chars"] = output_chars
                     result.status = "ok"
             else:
                 url = self.generate_url(stream=False)
-                result.started_at_unix = time.time()
+                result.stamp("started")
                 r = await http.post(url, json=body_payload, timeout=self.timeout_s)
-                result.finished_at_unix = time.time()
+                result.stamp("finished")
                 result.http_status = r.status_code
                 if r.status_code != 200:
                     result.error_message = f"http {r.status_code}: {r.text[:200]}"
@@ -136,9 +136,9 @@ class TritonVLLMAdapter(ProtocolAdapter):
         except httpx.TimeoutException:
             result.status = "timeout"
             result.error_message = "client timeout"
-            result.finished_at_unix = time.time()
+            result.stamp("finished")
         except httpx.HTTPError as e:
             result.status = "error"
             result.error_message = f"http error: {e}"
-            result.finished_at_unix = time.time()
+            result.stamp("finished")
         return result

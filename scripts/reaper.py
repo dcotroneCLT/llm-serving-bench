@@ -40,6 +40,15 @@ dropped; the sudo fallback checks its return code and is bounded by a timeout. I
 a live orphan cannot be killed, its ledger entry is RETAINED and a loud line is
 emitted, and the pre-run reap callers (launch_cell, attach_run) refuse to start a
 new run on a host that still carries an unkillable recorded orphan.
+
+Concurrent-start protection (the campaign is strictly serial): each entry records
+the launcher's pid + create_time, and reap_orphans reaps an entry ONLY if that
+launcher is gone (pid dead, or reused with a different create_time). A genuinely
+alive launcher is an active run -- its entry is retained and the caller refuses to
+start. Entries written by older code (no launcher fields) are treated as
+launcher-dead (reapable). As a second line of defense, reap also recovers runs
+from run_dir/child_pids.json (written before the ledger upsert) so a launcher that
+died between the client spawn and the ledger write still gets its client reaped.
 """
 
 from __future__ import annotations
@@ -236,6 +245,41 @@ def _candidate_pids(run_dir: Path, monitors_pid: Optional[int], client_pid: Opti
     return [p for p in pids if not (p in seen or seen.add(p))]
 
 
+def _launcher_identity() -> tuple[int, Optional[float]]:
+    """(pid, create_time) of THIS launcher process. create_time anchors the pid
+    against reuse: a future process reusing the pid will have a different
+    create_time, so a stale entry is not mistaken for a live launcher."""
+    pid = os.getpid()
+    try:
+        ct = psutil.Process(pid).create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        ct = None
+    return pid, ct
+
+
+def _launcher_alive(entry: dict) -> bool:
+    """True iff the launcher recorded in `entry` is genuinely still running (same
+    pid AND same create_time). Entries without the launcher fields (written by
+    older code) are treated as launcher-dead (reapable), preserving prior
+    behavior. An inspectable-but-ambiguous case (AccessDenied) errs on ALIVE so
+    we never reap a live run's children."""
+    lpid = entry.get("launcher_pid")
+    lct = entry.get("launcher_create_time")
+    if lpid is None or lct is None:
+        return False  # old-format entry -> reapable (prior behavior)
+    try:
+        pid = int(lpid)
+    except (TypeError, ValueError):
+        return False
+    try:
+        ct = psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess:
+        return False  # launcher pid gone
+    except psutil.AccessDenied:
+        return True   # exists but not inspectable -> assume alive (do not reap)
+    return abs(ct - float(lct)) < 1.0  # same pid AND create_time -> live launcher
+
+
 def record_children(runs_root: Path, run_dir: Path, run_id: str,
                     monitors_pid: Optional[int], client_pid: Optional[int]) -> list[str]:
     """Write run_dir/child_pids.json and upsert the run into the runs-root ledger.
@@ -246,12 +290,17 @@ def record_children(runs_root: Path, run_dir: Path, run_id: str,
     # run most needs reaping.
     runs_root = Path(runs_root)
     run_dir = Path(run_dir)
+    launcher_pid, launcher_ct = _launcher_identity()
     entry: dict[str, Any] = {
         "run_id": run_id,
         "run_dir": str(run_dir),
         "recorded_at_unix": time.time(),
         "monitors_pid": monitors_pid,
         "client_pid": client_pid,
+        # Concurrent-start protection (R2-2): the reaper only reaps an entry whose
+        # launcher is gone; a live launcher means an active run, not an orphan.
+        "launcher_pid": launcher_pid,
+        "launcher_create_time": launcher_ct,
     }
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "child_pids.json").write_text(json.dumps(entry, indent=2))
@@ -289,12 +338,42 @@ def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[
     """
     runs_root = Path(runs_root)  # forgiving on a str argument
     def _reap(runs: list[dict], out: list[str]) -> list[dict]:
-        if not runs:
+        by_id: dict[str, dict] = {}
+        for r in runs:
+            rid = r.get("run_id", "")
+            if rid:
+                by_id[rid] = r
+        # R2-1(b) second line of defense: recover runs whose ledger upsert never
+        # landed (e.g. record_children raised after the client spawned) from the
+        # run_dir/child_pids.json each run writes BEFORE the ledger upsert. A
+        # finished run's file is harmless -- its pids are dead, so nothing matches.
+        try:
+            child_files = sorted(runs_root.glob("*/child_pids.json"))
+        except OSError:
+            child_files = []
+        for cp in child_files:
+            try:
+                e = json.loads(cp.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            rid = e.get("run_id", "")
+            if rid and rid not in by_id:
+                by_id[rid] = e
+                out.append(f"[reaper] recovered run {rid} from {cp.name} (not in ledger)")
+        if not by_id:
             out.append("[reaper] no recorded runs; nothing to reap")
             return []
+
         retained: list[dict] = []
-        for r in runs:
-            run_id = r.get("run_id", "")
+        for run_id, r in by_id.items():
+            # R2-2: never reap a run whose launcher is genuinely alive -- that is
+            # an active run (an accidental concurrent start), not an orphan. Retain
+            # it so the caller refuses to start over it.
+            if _launcher_alive(r):
+                out.append(f"[reaper] run {run_id}: launcher pid={r.get('launcher_pid')} is ALIVE; "
+                           f"NOT reaping (active run / accidental concurrent start)")
+                retained.append(r)
+                continue
             run_dir = Path(r.get("run_dir", ""))
             killed = 0
             unkillable = 0
@@ -316,8 +395,8 @@ def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[
                 retained.append(r)
             elif killed == 0:
                 out.append(f"[reaper] run {run_id}: no live orphans")
-        # Cleaned runs are dropped; only unkillable-orphan runs remain (the current
-        # run re-adds itself via record_children right after spawning).
+        # Cleaned runs are dropped; active-launcher and unkillable-orphan runs
+        # remain (the current run re-adds itself via record_children after spawn).
         return retained
 
     return _mutate_ledger(runs_root, _reap)

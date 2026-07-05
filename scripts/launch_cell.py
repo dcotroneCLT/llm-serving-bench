@@ -544,6 +544,41 @@ def client_all_fail_window(client_dir: Path, window_s: int, now_unix: float,
     return None
 
 
+def read_latest_membership_tick(run_dir: Path, agg_prefix: str) -> Optional[tuple[bool, int]]:
+    """Return (membership_complete, n_pids_unexpected) from the most recent tick of
+    the per-component engine aggregate CSV (agg_<group>_*.csv), or None if there
+    is no readable/complete tick yet (tolerated -- a partial last line during
+    rotation must NOT be read as a violation). Same recent-tick pattern as
+    client_all_fail_window."""
+    try:
+        files = sorted(run_dir.glob(f"{agg_prefix}_*.csv"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)[:2]
+    except OSError:
+        return None
+    last = None
+    for path in files:  # newest first
+        try:
+            with path.open(newline="") as f:
+                rows = list(csv.DictReader(f))
+        except OSError:
+            continue
+        if rows:
+            last = rows[-1]
+            break
+    if last is None:
+        return None
+    mc = last.get("membership_complete")
+    if mc in (None, ""):
+        return None  # partial/rotating row -> treat as no data, not a violation
+    complete = str(mc).strip().lower() == "true"
+    npu_raw = (last.get("n_pids_unexpected") or "").strip()
+    try:
+        npu = int(npu_raw) if npu_raw not in ("", "None") else 0
+    except ValueError:
+        npu = 0
+    return complete, npu
+
+
 # ---------------------------------------------------------------------------
 # GPU sanity gate
 # ---------------------------------------------------------------------------
@@ -1192,6 +1227,11 @@ class DynamoDisaggLifecycle(EngineLifecycle):
         self.serve_invocations: list[dict] = []
         self._log_paths: dict[str, str] = {}
         self._identity: dict = {}
+        # Runtime health (R2-3): the engine aggregate CSV prefix and the create
+        # time of each recorded PGID group-leader (a PGID-reuse anchor).
+        self.engine_group = self.cell["monitors"]["components"].get("engine_group", "engine")
+        self.agg_prefix = f"agg_{self.engine_group}"
+        self._leader_ctimes: dict[int, float] = {}
 
     def _worker_names(self) -> tuple[list[str], list[str]]:
         prefill = [f"{self.PREFILL_PREFIX}_{i}" for i in range(1, self.n_prefill + 1)]
@@ -1318,6 +1358,18 @@ class DynamoDisaggLifecycle(EngineLifecycle):
         # and is fail-hard on a missing component or expected_count mismatch.
         merge_component_identity(self.cell, self.component_pids)
         self._identity = json.loads(self.component_pids.read_text()).get("components", {})
+        # R2-3: anchor each recorded PGID group-leader by its create_time, so the
+        # health check can detect a leader that died or a PGID that got reused.
+        try:
+            import psutil
+            for comp in self.cell["monitors"]["components"]["components"]:
+                for pgid in comp.get("pgids", []):
+                    try:
+                        self._leader_ctimes[int(pgid)] = psutil.Process(int(pgid)).create_time()
+                    except Exception:
+                        pass  # leader not inspectable now; skip (health check tolerates)
+        except ImportError:
+            pass
         return None, None
 
     def primary_gpu(self) -> int:
@@ -1389,6 +1441,42 @@ class DynamoDisaggLifecycle(EngineLifecycle):
         except Exception:
             return False
 
+    def _membership_violation(self) -> Optional[str]:
+        """R2-3: read the latest engine-aggregate tick; a recorded PGID that died
+        (membership incomplete) or a stray outside the recorded PGIDs
+        (n_pids_unexpected > 0) is a violation the run-level validator would
+        otherwise catch only at the END, wasting the whole window."""
+        tick = read_latest_membership_tick(self.run_dir, self.agg_prefix)
+        if tick is None:
+            return None  # no readable tick yet -> tolerate
+        complete, n_unexpected = tick
+        if not complete:
+            return "membership incomplete on the latest tick (a recorded PGID died?)"
+        if n_unexpected > 0:
+            return f"n_pids_unexpected={n_unexpected} on the latest tick (stray outside recorded PGIDs)"
+        return None
+
+    def _leader_violation(self) -> Optional[str]:
+        """R2-3: each recorded PGID group-leader must still be the SAME process
+        (create_time unchanged); a died/reused leader is a membership violation
+        even if a look-alike now holds the pgid."""
+        if not self._leader_ctimes:
+            return None
+        try:
+            import psutil
+        except ImportError:
+            return None
+        for pgid, ct0 in self._leader_ctimes.items():
+            try:
+                ct = psutil.Process(pgid).create_time()
+            except psutil.NoSuchProcess:
+                return f"component leader pgid={pgid} is gone"
+            except psutil.AccessDenied:
+                continue  # can't inspect right now -> tolerate
+            if abs(ct - ct0) >= 1.0:
+                return f"component leader pgid={pgid} was reused (create_time changed)"
+        return None
+
     def health_check(self) -> Optional[str]:
         # All stack containers still running?
         down = [c for c in self.stack_containers() if not container_running(c)]
@@ -1398,7 +1486,11 @@ class DynamoDisaggLifecycle(EngineLifecycle):
         # caller's consecutive-failure counter.)
         if not self._models_listed_quick():
             return f"/v1/models no longer lists {self.model_name}"
-        return None
+        # Runtime membership + PGID-leader identity (defense-in-depth + early abort).
+        reason = self._membership_violation()
+        if reason is not None:
+            return reason
+        return self._leader_violation()
 
     def wait_quiescence(self) -> None:
         cooldown = int(self.cell.get("post_run_cooldown_s", 600))
@@ -1550,13 +1642,14 @@ def main() -> None:
     # names); the reaper handles host-side processes only.
     for line in reaper.reap_orphans(args.runs_root, current_run_id=run_id):
         log(line)
-    # An entry surviving the reap is a live orphan the reaper could not kill;
+    # An entry surviving the reap means either an ACTIVE run (a launcher is still
+    # alive -- accidental concurrent start) or an unkillable orphan. Either way,
     # refuse to start over it (a stray client would load the fresh endpoint).
     stuck = reaper.ledger_run_ids(args.runs_root)
     if stuck:
-        die(f"pre-run reaper could not kill recorded orphan(s) from prior run(s) {stuck}; "
-            f"refusing to start on a host with an unkillable orphan (kill it manually, then retry).",
-            rc=8)
+        die(f"pre-run reaper refuses to start: prior run(s) {stuck} are still active "
+            f"(launcher alive) or have an unkillable orphan -- see the [reaper] lines above. "
+            f"Stop/clear them, then retry.", rc=8)
 
     # 3. Select the engine lifecycle (single_container default / dynamo_disagg)
     #    and bring the engine up through it: teardown-stale, start, readiness,
@@ -1611,10 +1704,19 @@ def main() -> None:
     )
     log(f"monitors orchestrator pid={monitors_proc.pid}")
     # Record the monitors immediately (client_pid=None) to close the crash window
-    # between spawn and ledger record; upsert again once the client is up.
-    for line in reaper.record_children(args.runs_root, run_dir, run_id,
-                                       monitors_proc.pid, None):
-        log(line)
+    # between spawn and ledger record; upsert again once the client is up. If the
+    # record itself fails (R2-1: ledger I/O / permission error), stop the children
+    # we already spawned BEFORE dying, so we never leave an unrecorded orphan.
+    try:
+        for line in reaper.record_children(args.runs_root, run_dir, run_id,
+                                           monitors_proc.pid, None):
+            log(line)
+    except Exception as e:  # noqa: BLE001
+        log(f"FATAL: reaper.record_children (monitors) failed: {e!r}; stopping children")
+        stop_subprocess(monitors_proc, "monitors", grace_s=30.0)
+        if pid_daemon is not None:
+            stop_subprocess(pid_daemon, "pid_daemon")
+        die("could not record run children after monitors spawn", rc=8)
 
     client_config = materialize_client_config(args.repo_root, run_dir, cell, replica)
     manifest["client_config_path"] = str(client_config)
@@ -1650,10 +1752,21 @@ def main() -> None:
     client_proc = spawn_client(args.repo_root, run_dir, client_config, duration_s, log_dir)
     log(f"client pid={client_proc.pid}")
 
-    # Upsert with the client pid now that it is spawned.
-    for line in reaper.record_children(args.runs_root, run_dir, run_id,
-                                       monitors_proc.pid, client_proc.pid):
-        log(line)
+    # Upsert with the client pid now that it is spawned. On a record failure,
+    # stop the client AND monitors before dying (R2-1): otherwise the live client
+    # would keep loading the endpoint and no future run could reap it (the ledger
+    # would carry the monitors-only entry).
+    try:
+        for line in reaper.record_children(args.runs_root, run_dir, run_id,
+                                           monitors_proc.pid, client_proc.pid):
+            log(line)
+    except Exception as e:  # noqa: BLE001
+        log(f"FATAL: reaper.record_children (client upsert) failed: {e!r}; stopping children")
+        stop_subprocess(client_proc, "client", grace_s=30.0)
+        stop_subprocess(monitors_proc, "monitors", grace_s=30.0)
+        if pid_daemon is not None:
+            stop_subprocess(pid_daemon, "pid_daemon")
+        die("could not record run children after client spawn", rc=8)
 
     # 12. Supervise until duration elapses or any subprocess exits. Signal handlers
     #     were installed before bring-up (above).
