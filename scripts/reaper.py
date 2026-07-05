@@ -196,6 +196,11 @@ def record_children(runs_root: Path, run_dir: Path, run_id: str,
     """Write run_dir/child_pids.json and upsert the run into the runs-root ledger.
     The upsert is a locked, atomic read-modify-write. Returns log lines (normally
     empty; carries a corrupt-ledger report if one was found)."""
+    # Be forgiving on argument types: a str runs_root/run_dir must work. A cleanup
+    # tool that raises TypeError on a str path is useless at the moment a crashed
+    # run most needs reaping.
+    runs_root = Path(runs_root)
+    run_dir = Path(run_dir)
     entry: dict[str, Any] = {
         "run_id": run_id,
         "run_dir": str(run_dir),
@@ -216,6 +221,7 @@ def deregister_run(runs_root: Path, run_id: str) -> list[str]:
     """Remove a run's entry from the ledger (locked, atomic). Called on a clean
     teardown so a finished run is never a reap candidate for the next launch.
     Returns log lines (normally empty; carries a corrupt-ledger report if any)."""
+    runs_root = Path(runs_root)  # forgiving on a str argument
     def _remove(runs: list[dict], out: list[str]) -> list[dict]:
         return [r for r in runs if r.get("run_id") != run_id]
 
@@ -234,6 +240,7 @@ def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[
     The kill semantics (run-id + OUR_SCRIPTS match, pgid kill, decoy-sparing) are
     unchanged; only the ledger rewrite is now locked/atomic.
     """
+    runs_root = Path(runs_root)  # forgiving on a str argument
     def _reap_and_clear(runs: list[dict], out: list[str]) -> list[dict]:
         if not runs:
             out.append("[reaper] no recorded runs; nothing to reap")

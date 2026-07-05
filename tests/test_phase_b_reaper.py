@@ -233,6 +233,52 @@ class LaunchCellWiring(unittest.TestCase):
         self.assertIn("deregister", events)
 
 
+class StrPathForgiving(unittest.TestCase):
+    """A str runs_root/run_dir must work: today a str runs_root raised
+    'unsupported operand type(s) for /: str and str' exactly when the reaper was
+    needed to clean up a crashed run. A cleanup tool must be forgiving on types."""
+
+    def test_record_children_accepts_str_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reaper.record_children(tmp, str(Path(tmp) / "a"), "a", 1, 2)  # str args
+            runs = json.loads((Path(tmp) / reaper.LEDGER_NAME).read_text())
+            self.assertEqual([r["run_id"] for r in runs], ["a"])
+            self.assertTrue((Path(tmp) / "a" / "child_pids.json").exists())
+
+    def test_deregister_run_accepts_str_runs_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reaper.record_children(Path(tmp), Path(tmp) / "a", "a", 1, 2)
+            reaper.deregister_run(tmp, "a")  # str runs_root
+            self.assertEqual(json.loads((Path(tmp) / reaper.LEDGER_NAME).read_text()), [])
+
+    def test_reap_orphans_accepts_str_runs_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Must not raise TypeError on a str argument, even with an empty ledger.
+            lines = reaper.reap_orphans(tmp, current_run_id="x")  # str runs_root
+            self.assertIsInstance(lines, list)
+
+
+class SighupTeardown(unittest.TestCase):
+    """A dropped SSH session (SIGHUP) must trigger the graceful teardown path,
+    not a bare kill that skips cleanup."""
+
+    def test_launch_cell_registers_sighup_with_handle_signal(self):
+        registered = {}
+
+        def fake_signal(sig, handler):
+            registered[sig] = handler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(lc.signal, "signal", side_effect=fake_signal):
+                LaunchCellWiring()._run_main(Path(tmp), client_poll=None,
+                                             mono_step=1000.0, duration_s=1)
+        import signal as _signal
+        self.assertIn(_signal.SIGHUP, registered, "SIGHUP handler was not registered")
+        # SIGHUP shares the SAME handler as SIGTERM/SIGINT (the graceful path).
+        self.assertIs(registered[_signal.SIGHUP], registered[_signal.SIGTERM])
+        self.assertIs(registered[_signal.SIGHUP], registered[_signal.SIGINT])
+
+
 class AttachRunRegression(unittest.TestCase):
     def test_attach_run_calls_deregister_at_clean_end(self):
         src = (SCRIPTS / "attach_run.py").read_text()

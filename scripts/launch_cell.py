@@ -1482,6 +1482,9 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+    # A dropped SSH session sends SIGHUP; route it through the same graceful
+    # teardown instead of a bare process kill that would skip cleanup.
+    signal.signal(signal.SIGHUP, handle_signal)
 
     client_forced_kill = False
     client_summary: dict[str, Any] = {}
