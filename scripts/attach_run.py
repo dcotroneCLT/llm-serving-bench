@@ -93,6 +93,13 @@ def main() -> None:
     # is brought up by hand on the attach path).
     for line in reaper.reap_orphans(args.runs_root, current_run_id=run_id):
         lc.log(line)
+    # An entry surviving the reap is a live orphan the reaper could not kill;
+    # refuse to start over it (a stray client would load this run's endpoint).
+    stuck = reaper.ledger_run_ids(args.runs_root)
+    if stuck:
+        lc.die(f"pre-run reaper could not kill recorded orphan(s) from prior run(s) {stuck}; "
+               f"refusing to start on a host with an unkillable orphan (kill it manually, then retry).",
+               rc=8)
 
     monitors = cell["monitors"]
     components = monitors.get("components")
@@ -135,21 +142,9 @@ def main() -> None:
     manifest_path = run_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
 
-    monitors_proc = lc.spawn_monitors(
-        args.repo_root, run_dir, cell, pidfile, duration_s, log_dir, args.runs_root, run_id
-    )
-    lc.log(f"monitors pid={monitors_proc.pid}")
-
-    client_config = lc.materialize_client_config(args.repo_root, run_dir, cell, args.replica)
-    manifest["client_config_path"] = str(client_config)
-    manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
-    client_proc = lc.spawn_client(args.repo_root, run_dir, client_config, duration_s, log_dir)
-    lc.log(f"client pid={client_proc.pid}")
-
-    # Record this run's children so a future run's pre-run reaper can clean them
-    # up if this launcher dies without running its finally block.
-    reaper.record_children(args.runs_root, run_dir, run_id, monitors_proc.pid, client_proc.pid)
-
+    # Install the teardown signal handlers BEFORE spawning children, so a signal
+    # in the spawn/record window routes through graceful teardown instead of a
+    # bare kill that would orphan the client onto this run's endpoint.
     interrupted = False
 
     def handle_signal(_sig, _frame):
@@ -158,6 +153,24 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGHUP, handle_signal)
+
+    monitors_proc = lc.spawn_monitors(
+        args.repo_root, run_dir, cell, pidfile, duration_s, log_dir, args.runs_root, run_id
+    )
+    lc.log(f"monitors pid={monitors_proc.pid}")
+    # Record the monitors immediately (client_pid=None) to close the crash window
+    # between spawn and ledger record; upsert again once the client is up.
+    reaper.record_children(args.runs_root, run_dir, run_id, monitors_proc.pid, None)
+
+    client_config = lc.materialize_client_config(args.repo_root, run_dir, cell, args.replica)
+    manifest["client_config_path"] = str(client_config)
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
+    client_proc = lc.spawn_client(args.repo_root, run_dir, client_config, duration_s, log_dir)
+    lc.log(f"client pid={client_proc.pid}")
+
+    # Upsert with the client pid now that it is spawned.
+    reaper.record_children(args.runs_root, run_dir, run_id, monitors_proc.pid, client_proc.pid)
 
     mono_deadline = started_mono + duration_s
     try:

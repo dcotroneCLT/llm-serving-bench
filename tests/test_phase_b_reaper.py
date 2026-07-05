@@ -102,6 +102,10 @@ class CorruptLedger(unittest.TestCase):
 
 
 # --- launch_cell wiring -------------------------------------------------------
+def _last_index(seq, value):
+    return max(i for i, v in enumerate(seq) if v == value)
+
+
 class _FakeProc:
     def __init__(self, pid, poll_val=None):
         self.pid = pid
@@ -142,8 +146,10 @@ def _single_cell_yaml(tmp: Path) -> Path:
 
 
 class LaunchCellWiring(unittest.TestCase):
-    def _run_main(self, tmp: Path, client_poll, mono_step, duration_s):
+    def _run_main(self, tmp: Path, client_poll, mono_step, duration_s,
+                  ledger_stuck=None, teardown_raises=False):
         events: list[str] = []
+        run_dir = tmp / "runs" / "test_e1_r01"
 
         # Mock lifecycle: only the seams main() calls.
         lf = mock.MagicMock()
@@ -153,7 +159,14 @@ class LaunchCellWiring(unittest.TestCase):
         lf.primary_gpu.return_value = 0
         lf.manifest_sections.return_value = {}
         lf.manifest_baseline_sections.return_value = {}
-        lf.teardown.side_effect = lambda: events.append("teardown")
+        lf.health_check.return_value = None
+        if teardown_raises:
+            def _boom():
+                events.append("teardown")
+                raise RuntimeError("docker rm timed out")
+            lf.teardown.side_effect = _boom
+        else:
+            lf.teardown.side_effect = lambda: events.append("teardown")
         lf.finalize_manifest.side_effect = lambda m: None
 
         # Client config file the clean-teardown path reads.
@@ -162,6 +175,7 @@ class LaunchCellWiring(unittest.TestCase):
 
         reaper_mock = mock.MagicMock()
         reaper_mock.reap_orphans.side_effect = lambda *a, **k: (events.append("reap"), [])[1]
+        reaper_mock.ledger_run_ids.return_value = ledger_stuck or []
         reaper_mock.record_children.side_effect = lambda *a, **k: (events.append("record"), [])[1]
         reaper_mock.deregister_run.side_effect = lambda *a, **k: (events.append("deregister"), [])[1]
 
@@ -180,6 +194,7 @@ class LaunchCellWiring(unittest.TestCase):
             state["t"] += mono_step
             return state["t"]
 
+        exit_code = {"code": None}
         with mock.patch.object(lc.argparse.ArgumentParser, "parse_args", return_value=args), \
              mock.patch.multiple(
                  lc,
@@ -188,7 +203,7 @@ class LaunchCellWiring(unittest.TestCase):
                  make_lifecycle=mock.DEFAULT, host_info=mock.DEFAULT, git_sha=mock.DEFAULT,
                  spawn_monitors=mock.DEFAULT, materialize_client_config=mock.DEFAULT,
                  spawn_client=mock.DEFAULT, summarize_client_csvs=mock.DEFAULT,
-                 reaper=reaper_mock,
+                 stop_subprocess=mock.DEFAULT, reaper=reaper_mock,
              ) as m, \
              mock.patch.object(lc.time, "sleep", lambda *_: None), \
              mock.patch.object(lc.time, "monotonic", fake_monotonic), \
@@ -205,32 +220,66 @@ class LaunchCellWiring(unittest.TestCase):
             m["spawn_client"].side_effect = lambda *a, **k: (events.append("spawn_client"), _FakeProc(222, client_poll))[1]
             m["materialize_client_config"].return_value = cc
             m["summarize_client_csvs"].return_value = {"total": 1, "ok": 1, "status_counts": {}}
-            with self.assertRaises(SystemExit):
+            m["stop_subprocess"].return_value = False
+            try:
                 lc.main()
-        return events
+            except SystemExit as e:
+                exit_code["code"] = e.code
+        return {"events": events, "exit_code": exit_code["code"], "run_dir": run_dir}
 
     def test_clean_teardown_wiring_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             # mono_step large so the very first loop check trips the deadline
             # (clean "duration elapsed" path); client stays alive (poll None).
-            events = self._run_main(Path(tmp), client_poll=None, mono_step=1000.0, duration_s=1)
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1000.0, duration_s=1)
+        events = r["events"]
         # reap BEFORE bring-up.
         self.assertLess(events.index("reap"), events.index("bringup"))
-        # record AFTER spawning both monitors and client.
+        # A record right after the monitors spawn (client_pid=None) closes the
+        # crash window; the LAST record (the upsert) is after the client spawn.
         self.assertGreater(events.index("record"), events.index("spawn_monitors"))
-        self.assertGreater(events.index("record"), events.index("spawn_client"))
+        self.assertGreater(_last_index(events, "record"), events.index("spawn_client"))
         # deregister on the (clean) teardown, after teardown ran.
         self.assertIn("deregister", events)
         self.assertGreater(events.index("deregister"), events.index("teardown"))
+        self.assertEqual(r["exit_code"], 0)
 
     def test_abort_path_still_deregisters(self):
         with tempfile.TemporaryDirectory() as tmp:
             # mono_step tiny + huge duration so the deadline is NOT reached; the
             # client "exited early" (poll=1) drives the interrupted/abort path.
-            events = self._run_main(Path(tmp), client_poll=1, mono_step=1.0, duration_s=100000)
+            r = self._run_main(Path(tmp), client_poll=1, mono_step=1.0, duration_s=100000)
+        events = r["events"]
         self.assertLess(events.index("reap"), events.index("bringup"))
         self.assertIn("record", events)
         self.assertIn("deregister", events)
+        self.assertEqual(r["exit_code"], 2)
+
+    def test_reap_gate_fatal_refuses_to_start(self):
+        # R1-4: an unkillable recorded orphan (ledger entry survives reap) is
+        # fatal -- the run must refuse to start, BEFORE bring-up.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1000.0, duration_s=1,
+                               ledger_stuck=["stuck_run"])
+        self.assertEqual(r["exit_code"], 8)
+        self.assertIn("reap", r["events"])
+        self.assertNotIn("bringup", r["events"])  # died before bring-up
+
+    def test_teardown_error_recorded_and_still_finalizes(self):
+        # R1-5: a teardown step raising must be recorded, the remaining steps
+        # (deregister, manifest finalize) must still run, and exit is non-zero.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1000.0, duration_s=1,
+                               teardown_raises=True)
+            events = r["events"]
+            # deregister STILL ran despite the engine_teardown exception.
+            self.assertIn("deregister", events)
+            self.assertGreater(events.index("deregister"), events.index("teardown"))
+            # Manifest written with the teardown_errors key, and exit non-zero.
+            manifest = json.loads((r["run_dir"] / "manifest.json").read_text())
+            self.assertIn("teardown_errors", manifest)
+            self.assertTrue(any(te["step"] == "engine_teardown" for te in manifest["teardown_errors"]))
+            self.assertEqual(r["exit_code"], 2)
 
 
 class StrPathForgiving(unittest.TestCase):

@@ -359,6 +359,35 @@ def build_docker_run_cmd(
     return cmd
 
 
+def all_dyn_containers() -> list[str]:
+    """Every container (running or stopped) whose name starts with dyn_ -- the
+    Dynamo stack's naming prefix, across any topology/index."""
+    try:
+        r = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.SubprocessError:
+        return []
+    return [n for n in r.stdout.split() if n.startswith("dyn_")]
+
+
+def dynamo_engine_procs_on_host() -> list[int]:
+    """Host PIDs whose cmdline names a Dynamo engine worker/frontend -- used to
+    fail hard if an engine process survives the container sweep."""
+    hits: list[int] = []
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover
+        return hits
+    for p in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cl = " ".join(p.info.get("cmdline") or [])
+        except Exception:
+            continue
+        if "dynamo.vllm" in cl or "dynamo.frontend" in cl:
+            hits.append(p.info["pid"])
+    return hits
+
+
 def docker_inspect(container_name: str) -> dict:
     result = subprocess.run(
         ["docker", "inspect", container_name],
@@ -444,6 +473,75 @@ def verify_models_listed(models_url: str, model_name: str, timeout_s: int) -> No
             last_err = str(e)
         time.sleep(3)
     die(f"/v1/models did not list {model_name} within {timeout_s}s ({last_err})", rc=2)
+
+
+# ---------------------------------------------------------------------------
+# Runtime health (supervision-loop liveness of the engine, not just our children)
+# ---------------------------------------------------------------------------
+
+# The supervision loop runs a cheap health check on this cadence (inside the
+# existing 5 s cycle). Isolated failures are tolerated; only N consecutive
+# lifecycle-health failures, or a sustained all-fail client window, trip a death.
+HEALTH_CHECK_EVERY_S = 30
+HEALTH_FAIL_CONSECUTIVE = 3
+ENDPOINT_DEAD_WINDOW_S = 300      # ~5 min rolling window for endpoint-dead detection
+ENDPOINT_DEAD_MIN_ROWS = 5        # need at least this many rows before declaring death
+
+
+def container_running(name: str) -> bool:
+    """True if the container is running. A docker error (daemon hiccup) is
+    TOLERATED as running so a transient blip does not false-trigger a health kill;
+    a container docker definitively reports missing is not running."""
+    try:
+        r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name],
+                           capture_output=True, text=True, timeout=15)
+    except subprocess.SubprocessError:
+        return True  # can't tell -> tolerate
+    if r.returncode != 0:
+        err = (r.stderr or "").lower()
+        if "no such object" in err or "no such container" in err:
+            return False  # definitively absent
+        return True  # ambiguous docker error -> tolerate
+    return r.stdout.strip().lower() == "true"
+
+
+def client_all_fail_window(client_dir: Path, window_s: int, now_unix: float,
+                           min_rows: int = ENDPOINT_DEAD_MIN_ROWS) -> Optional[int]:
+    """Endpoint-dead detector. Return the number of client rows in the last
+    window_s IFF there are at least min_rows and NONE of them are status=ok
+    (the engine is de facto dead); else None.
+
+    Deliberately NOT a drop/error-RATE threshold: high drop rates are a legitimate
+    stress-workload signal (a prior cell ran at 14-16% dropped in a confirmed
+    stationary regime). ONLY an all-fail window counts as death. Reads just the two
+    newest requests_*.csv (rotation-safe, cheap at 48 h)."""
+    cutoff = now_unix - window_s
+    try:
+        files = sorted(client_dir.glob("requests_*.csv"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)[:2]
+    except OSError:
+        return None
+    total = 0
+    ok = 0
+    for path in files:
+        try:
+            with path.open(newline="") as f:
+                for row in csv.DictReader(f):
+                    ts_text = row.get("finished_at_unix") or row.get("submitted_at_unix") or ""
+                    try:
+                        ts = float(ts_text)
+                    except ValueError:
+                        continue
+                    if ts < cutoff:
+                        continue
+                    total += 1
+                    if (row.get("status") or "").strip() == "ok":
+                        ok += 1
+        except OSError:
+            continue
+    if total >= min_rows and ok == 0:
+        return total
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +1042,13 @@ class EngineLifecycle:
     def teardown(self) -> None:
         raise NotImplementedError
 
+    # -- periodic runtime liveness check (~every HEALTH_CHECK_EVERY_S). Return
+    #    None if healthy, else a short reason string. The supervision loop acts on
+    #    HEALTH_FAIL_CONSECUTIVE consecutive non-None results (isolated failures
+    #    are tolerated). Base default: always healthy.
+    def health_check(self) -> Optional[str]:
+        return None
+
     # -- post-teardown VRAM quiescence wait on the relevant GPU(s).
     def wait_quiescence(self) -> None:
         raise NotImplementedError
@@ -1027,6 +1132,11 @@ class SingleContainerLifecycle(EngineLifecycle):
         log(f"removing container {self.container_name}")
         subprocess.run(["docker", "rm", "-f", self.container_name],
                        check=False, capture_output=True, timeout=60)
+
+    def health_check(self) -> Optional[str]:
+        if not container_running(self.container_name):
+            return f"engine container {self.container_name} is not running"
+        return None
 
     def wait_quiescence(self) -> None:
         cooldown = int(self.cell.get("post_run_cooldown_s", 600))
@@ -1147,6 +1257,30 @@ class DynamoDisaggLifecycle(EngineLifecycle):
 
     def bring_up(self) -> None:
         deploy = self.args.repo_root / "deploy" / "dynamo"
+
+        # R1-3: sweep EVERY dyn_* engine container (any name/index/topology), not
+        # just this run's, BEFORE the baseline -- a stale container from a
+        # differently-named prior run (e.g. dyn_worker, dyn_prefill_2) could
+        # otherwise survive, re-register against the fresh etcd/NATS, and serve
+        # traffic outside our recorded PGID identity. infra_up.sh recreates
+        # etcd/nats afterwards, so sweeping them here is harmless.
+        stale = all_dyn_containers()
+        if stale:
+            log(f"[dynamo] sweeping stale dyn_* containers before bring-up: {stale}")
+            subprocess.run(["docker", "rm", "-f", *stale],
+                           check=False, capture_output=True, timeout=90)
+        # Then fail HARD if any dynamo/vllm engine process is still visible on the
+        # host (a container removed but its process lingering, or a non-container
+        # engine): proceeding would let it serve outside our identity.
+        deadline = time.monotonic() + 10
+        stray = dynamo_engine_procs_on_host()
+        while stray and time.monotonic() < deadline:
+            time.sleep(1)
+            stray = dynamo_engine_procs_on_host()
+        if stray:
+            die(f"stale dynamo/vllm engine process(es) still on host after container "
+                f"sweep: {stray}; refusing to bring up (kill them, then retry).", rc=3)
+
         # Baselines on BOTH GPUs before anything starts.
         for g in self.gpus:
             self.baselines[g] = vram_used_mib(g) or 0
@@ -1242,6 +1376,29 @@ class DynamoDisaggLifecycle(EngineLifecycle):
                                check=False, capture_output=True, timeout=60)
         except subprocess.SubprocessError as e:
             log(f"WARNING: could not verify dyn_* teardown: {e}")
+
+    def _models_listed_quick(self) -> bool:
+        """Short-timeout single GET of /v1/models; True iff it lists the model."""
+        try:
+            with urllib.request.urlopen(self.models_url, timeout=5) as resp:
+                if not (200 <= resp.status < 300):
+                    return False
+                body = resp.read().decode("utf-8", errors="replace")
+            ids = [m.get("id") for m in json.loads(body).get("data", [])]
+            return self.model_name in ids
+        except Exception:
+            return False
+
+    def health_check(self) -> Optional[str]:
+        # All stack containers still running?
+        down = [c for c in self.stack_containers() if not container_running(c)]
+        if down:
+            return f"stack container(s) not running: {down}"
+        # Frontend still serving the model? (isolated failures tolerated by the
+        # caller's consecutive-failure counter.)
+        if not self._models_listed_quick():
+            return f"/v1/models no longer lists {self.model_name}"
+        return None
 
     def wait_quiescence(self) -> None:
         cooldown = int(self.cell.get("post_run_cooldown_s", 600))
@@ -1371,6 +1528,21 @@ def main() -> None:
     (run_dir / "image_digest.txt").write_text(pin["digest"] + "\n")
     log(f"image: {image_full}  digest: {pin['digest']}")
 
+    # Install the teardown signal handlers BEFORE engine bring-up and child spawn,
+    # so a signal during bring-up / the spawn-vs-record window routes through the
+    # graceful teardown path instead of a bare kill that would leave an unreapable
+    # orphan client loading the NEXT run's endpoint.
+    interrupted = False
+
+    def handle_signal(_sig, _frame):
+        nonlocal interrupted
+        interrupted = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    # A dropped SSH session sends SIGHUP; route it through the same graceful path.
+    signal.signal(signal.SIGHUP, handle_signal)
+
     # Pre-run orphan reaper: kill leftover monitor/client children of a prior run
     # (run-id + script-name verified, PID-reuse-safe) BEFORE the engine stack
     # starts, so a stale sudo'd proc monitor is gone before the new one runs.
@@ -1378,6 +1550,13 @@ def main() -> None:
     # names); the reaper handles host-side processes only.
     for line in reaper.reap_orphans(args.runs_root, current_run_id=run_id):
         log(line)
+    # An entry surviving the reap is a live orphan the reaper could not kill;
+    # refuse to start over it (a stray client would load the fresh endpoint).
+    stuck = reaper.ledger_run_ids(args.runs_root)
+    if stuck:
+        die(f"pre-run reaper could not kill recorded orphan(s) from prior run(s) {stuck}; "
+            f"refusing to start on a host with an unkillable orphan (kill it manually, then retry).",
+            rc=8)
 
     # 3. Select the engine lifecycle (single_container default / dynamo_disagg)
     #    and bring the engine up through it: teardown-stale, start, readiness,
@@ -1431,6 +1610,11 @@ def main() -> None:
         args.repo_root, run_dir, cell, pidfile, duration_s, log_dir, args.runs_root, run_id
     )
     log(f"monitors orchestrator pid={monitors_proc.pid}")
+    # Record the monitors immediately (client_pid=None) to close the crash window
+    # between spawn and ledger record; upsert again once the client is up.
+    for line in reaper.record_children(args.runs_root, run_dir, run_id,
+                                       monitors_proc.pid, None):
+        log(line)
 
     client_config = materialize_client_config(args.repo_root, run_dir, cell, replica)
     manifest["client_config_path"] = str(client_config)
@@ -1466,28 +1650,19 @@ def main() -> None:
     client_proc = spawn_client(args.repo_root, run_dir, client_config, duration_s, log_dir)
     log(f"client pid={client_proc.pid}")
 
-    # Record this run's children so a future run's pre-run reaper can clean them
-    # up if this launcher dies without running its finally block.
+    # Upsert with the client pid now that it is spawned.
     for line in reaper.record_children(args.runs_root, run_dir, run_id,
                                        monitors_proc.pid, client_proc.pid):
         log(line)
 
-    # 12. Supervise until duration elapses or any subprocess exits.
+    # 12. Supervise until duration elapses or any subprocess exits. Signal handlers
+    #     were installed before bring-up (above).
     mono_deadline = started_mono + duration_s
-    interrupted = False
-
-    def handle_signal(_sig, _frame):
-        nonlocal interrupted
-        interrupted = True
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-    # A dropped SSH session sends SIGHUP; route it through the same graceful
-    # teardown instead of a bare process kill that would skip cleanup.
-    signal.signal(signal.SIGHUP, handle_signal)
 
     client_forced_kill = False
     client_summary: dict[str, Any] = {}
+    health_fail_streak = 0
+    last_health_mono = started_mono
     try:
         while not interrupted:
             time.sleep(5)
@@ -1502,6 +1677,39 @@ def main() -> None:
             if pid_daemon is not None and pid_daemon.poll() is not None:
                 log(f"WARNING: pid_daemon exited early rc={pid_daemon.returncode}")
                 interrupted = True
+            if interrupted:
+                break
+
+            # Runtime engine health (~every HEALTH_CHECK_EVERY_S). Without this, a
+            # dead engine/container at hour 12 would let the run complete "cleanly"
+            # with plausible partial data (client just logs errors). We reach here
+            # only with the client still alive (an exited client broke above).
+            now_mono = time.monotonic()
+            if now_mono - last_health_mono >= HEALTH_CHECK_EVERY_S:
+                last_health_mono = now_mono
+                reason = lifecycle.health_check()
+                if reason is None:
+                    health_fail_streak = 0
+                else:
+                    health_fail_streak += 1
+                    log(f"WARNING: engine health check failed "
+                        f"({health_fail_streak}/{HEALTH_FAIL_CONSECUTIVE}): {reason}")
+                    if health_fail_streak >= HEALTH_FAIL_CONSECUTIVE:
+                        log(f"FATAL: engine unhealthy for {health_fail_streak} consecutive "
+                            f"checks: {reason}; tearing down")
+                        interrupted = True
+                        break
+                # Endpoint-dead detection: a ~5 min window of client rows with ZERO
+                # status=ok while the client is alive == the engine is de facto
+                # dead. NOT a drop/error-RATE threshold (high drop rates are a
+                # legitimate stress signal); only the all-fail window counts.
+                dead_rows = client_all_fail_window(run_dir / "client",
+                                                   ENDPOINT_DEAD_WINDOW_S, time.time())
+                if dead_rows is not None:
+                    log(f"FATAL: endpoint dead -- {dead_rows} client rows in the last "
+                        f"{ENDPOINT_DEAD_WINDOW_S}s with zero status=ok; tearing down")
+                    interrupted = True
+                    break
     finally:
         # 13. Graceful teardown.
         if interrupted:
@@ -1531,26 +1739,43 @@ def main() -> None:
             log("WARNING: client produced request rows but zero status=ok rows")
             interrupted = True
 
-        stop_subprocess(monitors_proc, "monitors", grace_s=60.0)
+        # 14. Teardown. Each step is isolated so one failure (e.g. a docker rm
+        #     timeout while the daemon hangs) is RECORDED but the remaining steps
+        #     -- crucially deregister and the final manifest write -- still run.
+        #     Unattended diagnosis needs the run's final state exactly when
+        #     teardown is going wrong.
+        teardown_errors: list[dict] = []
+
+        def _teardown_step(name: str, fn) -> None:
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001 - teardown must never abort teardown
+                log(f"WARNING: teardown step '{name}' failed: {e!r}")
+                teardown_errors.append({"step": name, "error": repr(e)})
+
+        _teardown_step("stop_monitors",
+                       lambda: stop_subprocess(monitors_proc, "monitors", grace_s=60.0))
         if pid_daemon is not None:
-            stop_subprocess(pid_daemon, "pid_daemon")
-        # 14. Teardown the engine (save docker logs, remove container(s)). For
-        #     dynamo_disagg this covers the whole stack (serve_down + infra_down
-        #     + a dyn_* sweep); for single_container it is one docker rm -f.
-        lifecycle.teardown()
+            _teardown_step("stop_pid_daemon", lambda: stop_subprocess(pid_daemon, "pid_daemon"))
+        # Engine teardown: dynamo_disagg tears down the whole stack (serve_down +
+        # infra_down + a dyn_* sweep); single_container is one docker rm -f.
+        _teardown_step("engine_teardown", lifecycle.teardown)
         disable_abort_cleanup()
 
-        # Deregister from the reaper ledger now that this run's children are
-        # stopped: a cleanly-finished run (or one interrupted but torn down here)
-        # must not linger as a reap candidate for the next launch.
-        for line in reaper.deregister_run(args.runs_root, run_id):
-            log(line)
+        # Always deregister (even if a step above failed): a torn-down run must not
+        # linger as a reap candidate for the next launch.
+        def _deregister() -> None:
+            for line in reaper.deregister_run(args.runs_root, run_id):
+                log(line)
+        _teardown_step("deregister", _deregister)
 
-        # 15. Wait for VRAM quiescence on the cell's GPU(s).
-        lifecycle.wait_quiescence()
+        # VRAM quiescence on the cell's GPU(s).
+        _teardown_step("vram_quiescence", lifecycle.wait_quiescence)
 
-        # 16. Finalize manifest. lifecycle.finalize_manifest adds the docker-log
-        #     path key(s) LAST so single_container key order is unchanged.
+        # 15. Finalize manifest -- ALWAYS, even if teardown steps failed.
+        #     teardown_errors is present only when non-empty (single_container
+        #     byte-compat holds for clean runs); lifecycle.finalize_manifest adds
+        #     the docker-log path key(s) LAST so the clean-run key order is intact.
         ended_at_unix = time.time()
         manifest["ended_at"] = utc_iso()
         manifest["ended_at_unix"] = ended_at_unix
@@ -1558,11 +1783,15 @@ def main() -> None:
         manifest["interrupted_early"] = interrupted
         manifest["client_forced_kill"] = client_forced_kill
         manifest["client_summary"] = client_summary
+        if teardown_errors:
+            manifest["teardown_errors"] = teardown_errors
         lifecycle.finalize_manifest(manifest)
         manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
-        log(f"done. duration={manifest['duration_seconds_actual']:.0f}s interrupted={interrupted}")
+        log(f"done. duration={manifest['duration_seconds_actual']:.0f}s "
+            f"interrupted={interrupted} teardown_errors={len(teardown_errors)}")
 
-    sys.exit(0 if not interrupted else 2)
+    # Non-zero exit if the run was interrupted OR any teardown step failed.
+    sys.exit(0 if (not interrupted and not teardown_errors) else 2)
 
 
 if __name__ == "__main__":

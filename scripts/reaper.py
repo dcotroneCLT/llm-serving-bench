@@ -34,6 +34,12 @@ unrelated program will not match) and scoped to OUR processes. Root-owned
 children (the sudo'd proc monitor) are killed via `sudo -n kill` when a direct
 signal is refused. Process GROUPS are signalled (killpg) so a child's own
 subprocess tree goes with it.
+
+A kill is CONFIRMED (the target must actually be gone) before the ledger entry is
+dropped; the sudo fallback checks its return code and is bounded by a timeout. If
+a live orphan cannot be killed, its ledger entry is RETAINED and a loud line is
+emitted, and the pre-run reap callers (launch_cell, attach_run) refuse to start a
+new run on a host that still carries an unkillable recorded orphan.
 """
 
 from __future__ import annotations
@@ -84,27 +90,66 @@ def _is_ours(pid: int, run_id: str) -> Optional[str]:
     return cl
 
 
+def _confirm_gone(pid: int, timeout_s: float = 3.0) -> bool:
+    """True once pid is no longer a live process (or is a zombie awaiting reap).
+    Polls up to timeout_s because SIGKILL delivery is asynchronous. A pid we
+    cannot inspect (AccessDenied, e.g. still-running root process) counts as
+    ALIVE -- we must not declare a live orphan dead."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                return True  # dead, just not yet reaped; holds no resources
+        except psutil.NoSuchProcess:
+            return True
+        except psutil.AccessDenied:
+            pass  # exists but not inspectable -> treat as alive
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
 def _kill_pgid(pid: int) -> bool:
-    """SIGKILL the process group of pid; fall back to sudo for root-owned ones.
-    Returns True if a kill was issued."""
+    """SIGKILL the process group of pid (sudo -n fallback for root-owned ones) and
+    CONFIRM the process is actually gone. Returns True ONLY if confirmed
+    terminated; False means a still-live orphan we could not kill -- the caller
+    must retain the ledger entry rather than silently lose the only record of it.
+    """
     try:
         pgid = os.getpgid(pid)
     except (ProcessLookupError, OSError):
-        return False
+        return True  # already gone
     try:
         os.killpg(pgid, signal.SIGKILL)
-        return True
     except ProcessLookupError:
-        return False
+        return True  # gone between getpgid and kill
     except PermissionError:
-        # Root-owned (the sudo'd proc monitor): use the NOPASSWD sudo path.
-        subprocess.run(["sudo", "-n", "kill", "-9", f"-{pgid}"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
+        # Root-owned (the sudo'd proc monitor): NOPASSWD sudo path, but CHECK the
+        # return code and bound it with a timeout -- a refused/hung sudo must not
+        # be mistaken for a successful kill.
+        try:
+            r = subprocess.run(["sudo", "-n", "kill", "-9", f"-{pgid}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=10)
+        except (subprocess.SubprocessError, OSError):
+            return _confirm_gone(pid)  # sudo unavailable/timed out: gone only if truly dead
+        if r.returncode != 0:
+            return _confirm_gone(pid)  # sudo refused: gone only if it already died
+    # Direct kill or sudo kill issued; verify the process actually terminated.
+    return _confirm_gone(pid)
 
 
 def _ledger_path(runs_root: Path) -> Path:
     return runs_root / LEDGER_NAME
+
+
+def ledger_run_ids(runs_root) -> list[str]:
+    """Plain (lock-free; os.replace keeps reads consistent) list of run_ids
+    currently in the ledger. The pre-run reap callers use this to GATE: any entry
+    surviving reap_orphans() is a live orphan the reaper could not kill, and the
+    next run must refuse to start on that host."""
+    runs, _ = _read_ledger(_ledger_path(Path(runs_root)))
+    return [r.get("run_id", "") for r in runs]
 
 
 def _lock_path(runs_root: Path) -> Path:
@@ -238,17 +283,21 @@ def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[
     current_run_id is advisory (kept for call-site clarity / logging); the real
     protection is temporal (reap precedes record_children) plus the cmdline gate.
     The kill semantics (run-id + OUR_SCRIPTS match, pgid kill, decoy-sparing) are
-    unchanged; only the ledger rewrite is now locked/atomic.
+    unchanged; only the ledger rewrite is now locked/atomic, and an entry whose
+    live orphan could NOT be killed is RETAINED (not silently cleared) so the
+    caller can refuse to start a new run over an unkillable orphan.
     """
     runs_root = Path(runs_root)  # forgiving on a str argument
-    def _reap_and_clear(runs: list[dict], out: list[str]) -> list[dict]:
+    def _reap(runs: list[dict], out: list[str]) -> list[dict]:
         if not runs:
             out.append("[reaper] no recorded runs; nothing to reap")
             return []
+        retained: list[dict] = []
         for r in runs:
             run_id = r.get("run_id", "")
             run_dir = Path(r.get("run_dir", ""))
             killed = 0
+            unkillable = 0
             for pid in _candidate_pids(run_dir, r.get("monitors_pid"), r.get("client_pid")):
                 cl = _is_ours(pid, run_id)
                 if cl is None:
@@ -256,10 +305,19 @@ def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[
                 if _kill_pgid(pid):
                     killed += 1
                     out.append(f"[reaper] killed orphan pid={pid} run={run_id}: {cl[:80]}")
-            if killed == 0:
+                else:
+                    unkillable += 1
+                    out.append(f"[reaper] FATAL: could NOT kill live orphan pid={pid} "
+                               f"run={run_id}: {cl[:80]}; ledger entry RETAINED")
+            if unkillable:
+                # Keep the entry: a live orphan we could not kill must never be
+                # dropped from the record. The caller treats a retained entry as
+                # fatal for the next run.
+                retained.append(r)
+            elif killed == 0:
                 out.append(f"[reaper] run {run_id}: no live orphans")
-        # Every recorded run has been handled; clear the ledger (the current run
-        # re-adds itself via record_children right after spawning).
-        return []
+        # Cleaned runs are dropped; only unkillable-orphan runs remain (the current
+        # run re-adds itself via record_children right after spawning).
+        return retained
 
-    return _mutate_ledger(runs_root, _reap_and_clear)
+    return _mutate_ledger(runs_root, _reap)
