@@ -6,13 +6,7 @@
 # Prereq: bash deploy/dynamo/infra_up.sh
 # Usage:  bash deploy/dynamo/serve_aggregated.sh
 set -euo pipefail
-source "$(dirname "$0")/env.sh"
-
-COMMON_ENV=(
-  -e "ETCD_ENDPOINTS=http://localhost:${ETCD_CLIENT_PORT}"
-  -e "NATS_SERVER=nats://localhost:${NATS_PORT}"
-  -e "HF_HOME=/root/.cache/huggingface"
-)
+source "$(dirname "$0")/env.sh"   # COMMON_ENV, COMMON_MOUNT, WORKER_USER, start_frontend()
 
 docker rm -f "$DYN_FRONTEND_NAME" "$DYN_AGG_WORKER_NAME" >/dev/null 2>&1 || true
 
@@ -22,8 +16,7 @@ docker rm -f "$DYN_FRONTEND_NAME" "$DYN_AGG_WORKER_NAME" >/dev/null 2>&1 || true
 # write it. Aggregated mode needs no --kv-transfer-config / NIXL side channel.
 echo "[dynamo] worker on gpu $AGG_GPU"
 docker run -d --name "$DYN_AGG_WORKER_NAME" --network host --user "$WORKER_USER" \
-  --gpus "\"device=${AGG_GPU}\"" "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
-  -v "${HF_CACHE}:/root/.cache/huggingface" \
+  --gpus "\"device=${AGG_GPU}\"" "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" "${COMMON_MOUNT[@]}" \
   "$DYNAMO_IMAGE" \
   python -m dynamo.vllm \
     --model "$MODEL" --max-model-len "$MAX_MODEL_LEN" \
@@ -39,14 +32,13 @@ done
 
 # Frontend snapshots the model registry at startup and won't pick up a model that
 # finalizes later, so (re)start it and check /v1/models; if empty, restart and
-# retry. See serve_disaggregated.sh for the full rationale.
+# retry. Started via the shared start_frontend() (same --user 0:0 + HF cache mount
+# as the worker, required for discovery). See serve_disaggregated.sh for the full
+# rationale.
 echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT"
 served=0
 for attempt in $(seq 1 6); do
-  docker rm -f "$DYN_FRONTEND_NAME" >/dev/null 2>&1 || true
-  docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
-    "$DYNAMO_IMAGE" \
-    python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
+  start_frontend
   for _ in $(seq 1 6); do   # ~30s per attempt
     if curl -sf "http://localhost:${FRONTEND_HTTP_PORT}/v1/models" 2>/dev/null | grep -q '"id"'; then
       served=1; break

@@ -65,14 +65,10 @@ _etcd_keycount() {  # count of dynamo keys currently in etcd
   docker exec -e ETCDCTL_API=3 "$ETCD_NAME" etcdctl get "" --prefix --keys-only 2>/dev/null | grep -ci dynamo
 }
 
-_frontend_start() {  # start EXACTLY ONE frontend; no churn/restart from here on
-  docker rm -f "$FE" >/dev/null 2>&1 || true
-  docker run -d --name "$FE" --network host "${DOCKER_LOG_OPTS[@]}" \
-    -e "ETCD_ENDPOINTS=http://localhost:${ETCD_CLIENT_PORT}" \
-    -e "NATS_SERVER=nats://localhost:${NATS_PORT}" \
-    -e "HF_HOME=/root/.cache/huggingface" \
-    "$DYNAMO_IMAGE" python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
-}
+# The frontend is started via the shared start_frontend() from env.sh (same
+# --user 0:0 + HF cache mount as the workers) so it can materialize the model
+# card; no diag-local docker run, so this path cannot drift from the serve
+# scripts (that divergence was what made the failure look flaky).
 
 _capture_evidence() {
   mkdir -p "$EVID_DIR" 2>/dev/null || true
@@ -145,7 +141,7 @@ if [ "$FRONTEND_DELAY_S" -gt 0 ] 2>/dev/null; then
   echo "[diag] FRONTEND_DELAY_S=$FRONTEND_DELAY_S: waiting before starting the frontend ..."
   sleep "$FRONTEND_DELAY_S"
 fi
-_frontend_start
+start_frontend
 echo "[diag] one frontend started on :$FRONTEND_HTTP_PORT (no churn from here); polling ..."
 
 # --- step 3: poll etcd + /v1/models every POLL_INTERVAL_S for the window ---

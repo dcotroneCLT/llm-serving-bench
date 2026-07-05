@@ -110,14 +110,42 @@ Known benign warning: `'EngineCoreProc' object has no attribute
 get_kv_cache_group_metadata` — a Dynamo-1.2.0/vLLM-0.20.1 API drift that falls
 back to `cache_config.block_size`; the worker still registers and serves.
 
-## Registry flakiness diagnosis
+## Registry flakiness — ROOT CAUSE (resolved)
 
-Occasionally on `repass_gate2.sh` the disaggregated stack fails to serve:
-workers log `Registered base model`, the single long-lived frontend stays Up
-with HTTP 200 on `/health`, yet `/v1/models` stays `{"data":[]}` for 4+ minutes
-and through the frontend restart fallbacks — while an identical single-frontend
-probe in the same session serves `/v1/models` in ~5 s. The fault is one of two
-branches, and `diag_registry.sh` localizes which:
+**Root cause (found):** the frontend container was started WITHOUT the shared,
+root-owned HF cache identity that the workers use (`--user 0:0` + the
+`$HF_CACHE:/root/.cache/huggingface` mount). The frontend's discovery watcher
+materializes the model card on the fly via `hub::from_hf()`, and without that
+cache it fails:
+
+```
+ERROR dynamo_llm::discovery::watcher: Error adding model from discovery
+  model_name="Qwen/Qwen2.5-7B-Instruct" namespace="dynamo"
+  error="hub::from_hf(...): Failed to create cache directory
+  \"/root/.cache/huggingface/hub\": Permission denied (os error 13)"
+```
+
+So `/v1/models` stayed `{"data":[]}` even though **etcd held all 9 `dynamo` keys
+and worker registration was fine** — etcd/namespace/worker registration were
+NEVER the problem, and the frontend's `/health` stayed 200 the whole time
+(another reason `/health` is not a readiness check). It looked *flaky* only
+because there were TWO divergent frontend start paths (`serve_disaggregated.sh`
+and `diag_registry.sh`), started differently from run to run.
+
+**Fix:** the frontend is now started by a single `start_frontend()` helper in
+`env.sh`, using the SAME identity and cache mount as the workers (`--user 0:0`,
+`COMMON_ENV`, `COMMON_MOUNT`, host network, no `--gpus` — the frontend does not
+touch the GPU, so the "NVIDIA Driver was not detected" warning is expected). All
+frontend starts — `serve_disaggregated.sh` (including its restart fallbacks),
+`serve_aggregated.sh`, and `diag_registry.sh` — go through it; no duplicated
+`docker run … dynamo.frontend` lines remain anywhere under `deploy/dynamo/`.
+`/v1/models` remains the ONLY readiness check.
+
+### `diag_registry.sh` (kept for regressions)
+
+If the stack ever fails to serve again — workers log `Registered base model`,
+the frontend is Up with HTTP 200 on `/health`, yet `/v1/models` stays
+`{"data":[]}` — `diag_registry.sh` localizes the fault to one of two branches:
 
 ```bash
 conda activate wosar

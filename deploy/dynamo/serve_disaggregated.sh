@@ -20,14 +20,7 @@
 # freeze (a) the flags here and (b) the realized `ps` cmdlines into the cell
 # yaml component regexes (campaigns/extension/cells/val_dynamo_disagg.yaml).
 set -euo pipefail
-source "$(dirname "$0")/env.sh"
-
-COMMON_ENV=(
-  -e "ETCD_ENDPOINTS=http://localhost:${ETCD_CLIENT_PORT}"
-  -e "NATS_SERVER=nats://localhost:${NATS_PORT}"
-  -e "HF_HOME=/root/.cache/huggingface"
-)
-COMMON_MOUNT=(-v "${HF_CACHE}:/root/.cache/huggingface")
+source "$(dirname "$0")/env.sh"   # COMMON_ENV, COMMON_MOUNT, WORKER_USER, start_frontend()
 
 # Clean any stale components.
 docker rm -f "$DYN_FRONTEND_NAME" >/dev/null 2>&1 || true
@@ -129,11 +122,10 @@ fi
 # So: SETTLE past the readiness lag, then start ONE frontend and poll it WITHOUT
 # churn. Only if it never populates do we do a small number of clean restart
 # fallbacks (for the rare stuck-snapshot case). All windows are env-tunable.
-_frontend_start() {
-  docker rm -f "$DYN_FRONTEND_NAME" >/dev/null 2>&1 || true
-  docker run -d --name "$DYN_FRONTEND_NAME" --network host "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" \
-    "$DYNAMO_IMAGE" python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
-}
+# The frontend is started via the shared start_frontend() from env.sh (same
+# --user 0:0 + HF cache mount as the workers) so it can materialize the model
+# card; a frontend without that cache identity fails discovery and /v1/models
+# stays empty even though the workers registered in etcd.
 _frontend_poll() {  # $1 = number of 5 s polls
   local _
   for _ in $(seq 1 "$1"); do
@@ -151,12 +143,12 @@ echo "[dynamo] settling ${FRONTEND_SETTLE_S:-60}s for worker readiness before th
 sleep "${FRONTEND_SETTLE_S:-60}"
 echo "[dynamo] frontend on :$FRONTEND_HTTP_PORT (single long-lived; poll ~$(( POLL_TRIES * 5 ))s, ${RESTART_FALLBACKS} restart fallbacks)"
 served=0
-_frontend_start
+start_frontend
 if _frontend_poll "$POLL_TRIES"; then served=1; fi
 if [ "$served" != 1 ]; then
   for fb in $(seq 1 "$RESTART_FALLBACKS"); do
     echo "[dynamo] /v1/models still empty; clean restart fallback $fb ..."
-    _frontend_start
+    start_frontend
     if _frontend_poll "$POLL_TRIES"; then served=1; break; fi
   done
 fi

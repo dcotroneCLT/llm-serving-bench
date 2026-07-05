@@ -74,6 +74,35 @@ DYN_PREFILL_PREFIX="${DYN_PREFILL_PREFIX:-dyn_prefill}"
 DYN_DECODE_PREFIX="${DYN_DECODE_PREFIX:-dyn_decode}"
 DYN_AGG_WORKER_NAME="${DYN_AGG_WORKER_NAME:-dyn_worker}"
 
+# --- Shared container identity + env for EVERY Dynamo component (workers AND the
+#     frontend). One definition so the frontend cannot drift from the workers.
+#  - WORKER_USER (0:0, defined above): the shared HF cache is root-owned.
+#  - COMMON_ENV: etcd/NATS discovery endpoints + HF_HOME under the mounted cache.
+#  - COMMON_MOUNT: the root-owned shared HF cache. ---
+COMMON_ENV=(
+  -e "ETCD_ENDPOINTS=http://localhost:${ETCD_CLIENT_PORT}"
+  -e "NATS_SERVER=nats://localhost:${NATS_PORT}"
+  -e "HF_HOME=/root/.cache/huggingface"
+)
+COMMON_MOUNT=(-v "${HF_CACHE}:/root/.cache/huggingface")
+
+# Start the OpenAI-compatible frontend container. It MUST share the workers'
+# identity and cache: --user 0:0 + the root-owned shared HF cache mount. The
+# frontend's discovery watcher materializes the model card via hub::from_hf()
+# into /root/.cache/huggingface/hub; without the mount + root it fails with
+# "Failed to create cache directory ... Permission denied (os error 13)", the
+# discovery watcher drops the model, and /v1/models stays empty even though etcd
+# holds all the registration keys (this was the "flaky registry" root cause).
+# No --gpus: the frontend does not touch the GPU (the "NVIDIA Driver was not
+# detected" warning it prints is expected and harmless). Callers poll
+# /v1/models for readiness after this returns; this only launches the container.
+start_frontend() {
+  docker rm -f "$DYN_FRONTEND_NAME" >/dev/null 2>&1 || true
+  docker run -d --name "$DYN_FRONTEND_NAME" --network host --user "$WORKER_USER" \
+    "${DOCKER_LOG_OPTS[@]}" "${COMMON_ENV[@]}" "${COMMON_MOUNT[@]}" \
+    "$DYNAMO_IMAGE" python -m dynamo.frontend --http-port "$FRONTEND_HTTP_PORT" >/dev/null
+}
+
 # Engine aggregate name (-> agg_<group>) and the component PGID identity file the
 # bring-up records and the monitor (via attach_run/launch_cell) scopes to. Keep
 # DYN_ENGINE_GROUP in sync with monitors.components.engine_group in the cell yaml.
