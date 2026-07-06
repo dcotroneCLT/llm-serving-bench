@@ -252,10 +252,21 @@ def check(run_dir: Path) -> int:
     df[ts_col] = df[ts_col].astype(float)
     df = df.sort_values(ts_col)
 
-    # Decide warmup discard. If the run is < 2h, discard 30 min instead of 1h
-    # so we have enough samples for MK.
-    total_duration = df[ts_col].max() - df[ts_col].min()
-    warmup = 3600 if total_duration > 7200 else 1800
+    # Warmup discard: honor the run's DECLARED warmup_discard_s -- the single
+    # source of truth the rest of the pipeline (aging_io / aging_trends) uses --
+    # not a fixed heuristic. A short validation cell declares e.g. 120s; the old
+    # "3600 if >2h else 1800" heuristic exceeded a ~1200s validation run's span
+    # and discarded every sample ("insufficient samples after warmup discard: 0")
+    # even though the full rotated series was assembled correctly. Fall back to
+    # the heuristic only for older runs whose manifest lacks the field; a 36h
+    # baseline records warmup_discard_s=3600, matching the heuristic, so its
+    # result is byte-identical.
+    manifest_warmup = manifest.get("warmup_discard_s")
+    if manifest_warmup is not None:
+        warmup = int(manifest_warmup)
+    else:
+        total_duration = df[ts_col].max() - df[ts_col].min()
+        warmup = 3600 if total_duration > 7200 else 1800
 
     log(f"--- RSS slope test on column '{rss_col}' (timestamp: {ts_col}) ---")
     result = rss_slope_mb_per_h(df[rss_col].values, df[ts_col].values, warmup)
