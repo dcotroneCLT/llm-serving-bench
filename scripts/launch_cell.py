@@ -1661,10 +1661,20 @@ def main() -> None:
     # graceful teardown path instead of a bare kill that would leave an unreapable
     # orphan client loading the NEXT run's endpoint.
     interrupted = False
+    # Diagnosability: record WHY a run was interrupted (set once, at the moment the
+    # interruption is decided) so an unattended 48h run whose terminal is lost still
+    # explains its interrupted_early=true. Written to the manifest only when set, so
+    # clean runs stay byte-compatible.
+    interruption_reason: Optional[str] = None
 
     def handle_signal(_sig, _frame):
-        nonlocal interrupted
+        nonlocal interrupted, interruption_reason
         interrupted = True
+        if interruption_reason is None:
+            try:
+                interruption_reason = f"signal: {signal.Signals(_sig).name}"
+            except ValueError:
+                interruption_reason = f"signal: {_sig}"
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -1840,10 +1850,12 @@ def main() -> None:
                 if proc.poll() is not None:
                     log(f"WARNING: {name} exited early rc={proc.returncode}")
                     interrupted = True
+                    interruption_reason = interruption_reason or f"early_exit: {name} rc={proc.returncode}"
                     break
             if pid_daemon is not None and pid_daemon.poll() is not None:
                 log(f"WARNING: pid_daemon exited early rc={pid_daemon.returncode}")
                 interrupted = True
+                interruption_reason = interruption_reason or f"early_exit: pid_daemon rc={pid_daemon.returncode}"
             if interrupted:
                 break
 
@@ -1865,6 +1877,7 @@ def main() -> None:
                         log(f"FATAL: engine unhealthy for {health_fail_streak} consecutive "
                             f"checks: {reason}; tearing down")
                         interrupted = True
+                        interruption_reason = interruption_reason or f"health: {reason}"
                         break
                 # Endpoint-dead detection: a ~5 min window of client rows with ZERO
                 # status=ok while the client is alive == the engine is de facto
@@ -1876,6 +1889,8 @@ def main() -> None:
                     log(f"FATAL: endpoint dead -- {dead_rows} client rows in the last "
                         f"{ENDPOINT_DEAD_WINDOW_S}s with zero status=ok; tearing down")
                     interrupted = True
+                    interruption_reason = interruption_reason or (
+                        f"client_all_fail_window: {dead_rows} rows, 0 ok in {ENDPOINT_DEAD_WINDOW_S}s")
                     break
     finally:
         # 13. Graceful teardown.
@@ -1892,6 +1907,7 @@ def main() -> None:
                 log("client did not finish after duration; forcing shutdown")
                 client_forced_kill = stop_subprocess(client_proc, "client", grace_s=30.0)
                 interrupted = True
+                interruption_reason = interruption_reason or "client_drain_timeout"
 
         client_summary = summarize_client_csvs(run_dir / "client")
         log(
@@ -1902,9 +1918,11 @@ def main() -> None:
         if client_summary["total"] == 0:
             log("WARNING: client produced zero request rows")
             interrupted = True
+            interruption_reason = interruption_reason or "client_no_rows"
         elif client_summary["ok"] == 0:
             log("WARNING: client produced request rows but zero status=ok rows")
             interrupted = True
+            interruption_reason = interruption_reason or "client_no_ok_rows"
 
         # 14. Teardown. Each step is isolated so one failure (e.g. a docker rm
         #     timeout while the daemon hangs) is RECORDED but the remaining steps
@@ -1943,6 +1961,10 @@ def main() -> None:
         #     teardown_errors is present only when non-empty (single_container
         #     byte-compat holds for clean runs); lifecycle.finalize_manifest adds
         #     the docker-log path key(s) LAST so the clean-run key order is intact.
+        # A teardown failure is also a non-clean ending worth explaining; record it
+        # if nothing earlier already set a reason.
+        if teardown_errors and interruption_reason is None:
+            interruption_reason = "teardown_failed: " + ",".join(te["step"] for te in teardown_errors)
         ended_at_unix = time.time()
         manifest["ended_at"] = utc_iso()
         manifest["ended_at_unix"] = ended_at_unix
@@ -1952,6 +1974,9 @@ def main() -> None:
         manifest["client_summary"] = client_summary
         if teardown_errors:
             manifest["teardown_errors"] = teardown_errors
+        # Present ONLY when set (clean runs stay byte-compatible).
+        if interruption_reason is not None:
+            manifest["interruption_reason"] = interruption_reason
         lifecycle.finalize_manifest(manifest)
         manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
         log(f"done. duration={manifest['duration_seconds_actual']:.0f}s "

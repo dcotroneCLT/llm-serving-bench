@@ -162,10 +162,18 @@ def main() -> None:
     # in the spawn/record window routes through graceful teardown instead of a
     # bare kill that would orphan the client onto this run's endpoint.
     interrupted = False
+    # Record WHY the run was interrupted (set once) so a lost terminal still leaves
+    # an explanation; written to the manifest only when set (byte-compat for clean).
+    interruption_reason: Optional[str] = None
 
     def handle_signal(_sig, _frame):
-        nonlocal interrupted
+        nonlocal interrupted, interruption_reason
         interrupted = True
+        if interruption_reason is None:
+            try:
+                interruption_reason = f"signal: {signal.Signals(_sig).name}"
+            except ValueError:
+                interruption_reason = f"signal: {_sig}"
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -212,6 +220,7 @@ def main() -> None:
                 if proc.poll() is not None:
                     lc.log(f"WARNING: {name} exited early rc={proc.returncode}")
                     interrupted = True
+                    interruption_reason = interruption_reason or f"early_exit: {name} rc={proc.returncode}"
                     break
     finally:
         if client_proc.poll() is None:
@@ -230,6 +239,9 @@ def main() -> None:
         manifest["duration_seconds_actual"] = time.monotonic() - started_mono
         manifest["interrupted_early"] = interrupted
         manifest["client_summary"] = client_summary
+        # Present ONLY when set (clean runs stay byte-compatible).
+        if interruption_reason is not None:
+            manifest["interruption_reason"] = interruption_reason
         # Fold in realized arrival stats if the client wrote them.
         arr = run_dir / "client" / "arrival_stats.json"
         if arr.exists():

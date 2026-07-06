@@ -304,6 +304,20 @@ class LaunchCellWiring(unittest.TestCase):
         self.assertNotIn("spawn_client", r["events"])  # died before client spawn
         self.assertIn("monitors", r["stops"])
 
+    def test_interruption_reason_recorded_on_abort_absent_on_clean(self):
+        # Diagnosability: interrupted runs record WHY in manifest.interruption_reason;
+        # clean runs omit the key (byte-compat).
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1000.0, duration_s=1)
+            m = json.loads((r["run_dir"] / "manifest.json").read_text())
+            self.assertFalse(m["interrupted_early"])
+            self.assertNotIn("interruption_reason", m)  # clean -> key absent
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=1, mono_step=1.0, duration_s=100000)
+            m = json.loads((r["run_dir"] / "manifest.json").read_text())
+            self.assertTrue(m["interrupted_early"])
+            self.assertEqual(m.get("interruption_reason"), "early_exit: client rc=1")
+
     def test_teardown_error_recorded_and_still_finalizes(self):
         # R1-5: a teardown step raising must be recorded, the remaining steps
         # (deregister, manifest finalize) must still run, and exit is non-zero.
@@ -318,6 +332,8 @@ class LaunchCellWiring(unittest.TestCase):
             manifest = json.loads((r["run_dir"] / "manifest.json").read_text())
             self.assertIn("teardown_errors", manifest)
             self.assertTrue(any(te["step"] == "engine_teardown" for te in manifest["teardown_errors"]))
+            # A teardown failure is explained too (clean run had no earlier reason).
+            self.assertEqual(manifest.get("interruption_reason"), "teardown_failed: engine_teardown")
             self.assertEqual(r["exit_code"], 2)
 
 
