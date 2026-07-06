@@ -288,6 +288,65 @@ lifecycle:
 Single-container cells (standalone vLLM, Triton) are unaffected: their
 `launch_cell` path and manifests are byte-identical to before.
 
+## Driving the whole extension campaign: `scripts/campaign.py` (strictly serial)
+
+The extension campaign is ~57 runs of 48h each and is **strictly serial by
+design** — measurement isolation demands one run at a time, and the
+`dynamo_disagg` cells occupy both GPUs anyway. `scripts/campaign.py` dispatches
+**one global ordered queue** of `(cell, replica)` runs, one `launch_cell.py`
+subprocess at a time (the production path above), each waited to full
+completion (teardown + VRAM quiescence happen *inside* `launch_cell`) plus a
+configurable `inter_run_cooldown_s` before the next run. There is no thread
+pool and no parallel-slot model; a campaign yaml that tries to express
+parallelism (a `slots:` key, or `mode:` other than `serial`) is rejected at
+load time. (The retired n=3 parallel scheduler lives in this file's git
+history, not its runtime.)
+
+```bash
+# Pre-flight only: full schedule in order, per-cell calibration status,
+# estimated wallclock, and the free-space gate — then exit.
+python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --dry-run
+
+# Start fresh (wipes the state file) — run it inside tmux; it also tees all
+# output to campaigns/extension/state/logs/campaign_<ts>.log (stdout dies with
+# the terminal, and the run must survive tmux loss):
+tmux new -d -s ext_campaign \
+  'python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --start'
+
+# Stop and pick up across days: --resume skips completed runs and re-queues
+# interrupted/failed ones under the retry policy.
+python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --resume
+```
+
+The campaign yaml schema is documented in `campaigns/extension/campaign.yaml`
+(and the `scripts/campaign.py` module docstring). Behaviour that matters
+operationally:
+
+- **Retry policy.** An ordinary `launch_cell` failure is re-attempted **once**
+  (with `--attempt` incremented, so the stale run_dir is archived and a fresh
+  one is used), then marked `failed` and the queue moves on. `launch_cell`
+  **exit 9** (run-slot flock held by another launcher), **exit 8** (orphan
+  gate: a prior run is still active or has an unkillable orphan) and **exit 7**
+  (free-space gate on runs-root or the docker data-root) are **NOT run
+  failures** — they are host/precondition faults that a retry cannot fix, so
+  the campaign stops **loudly** (exit 5) without burning attempts. Resolve the
+  precondition (host ownership or free space), then `--resume`.
+- **Calibration is a pre-flight gate.** Per-cell `--calibration-file` is passed
+  through to `launch_cell`; if a required calibration is missing, or if any
+  provided calibration file is invalid/rejected (`status != "ok"` without
+  `allow_lower_bound_calibration`), the campaign fails **before run 1**, not at
+  run N=37. The same `launch_cell` gate is reused so pre-flight accepts exactly
+  what the run will accept.
+- **Signals.** `SIGTERM`/`SIGINT`/`SIGHUP` forward `SIGTERM` to the current
+  `launch_cell` child (graceful teardown), persist state (the in-flight run is
+  marked `interrupted`), and exit non-zero (4).
+- **State + resume.** `campaign_state.json` is written atomically (tmp +
+  rename) after every status change; `--resume` re-queues everything that is
+  not `completed`.
+
+Exit codes: `0` complete · `2` usage · `3` pre-flight failed · `4` interrupted
+by signal · `5` campaign-fatal (host ownership or free-space precondition).
+
 ## Re-pass gate (BATCH 1 + PHASE A): one command
 
 `repass_gate2.sh` is the consolidated box-validation gate. It brings the

@@ -1,0 +1,102 @@
+# Top-level descriptor for the WoSAR 2026 extension (DoW) campaign.
+#
+# Drives scripts/campaign.py, which is STRICTLY SERIAL by design:
+#   - one global ordered queue of (cell, replica) runs, no parallel slots;
+#   - each run is one launch_cell.py subprocess (the production path: typed
+#     lifecycles, run-slot flock, reaper, health checks), waited to full
+#     completion (incl. teardown + VRAM quiescence) plus inter_run_cooldown_s;
+#   - campaign_state.json (atomic writes) supports stop/restart across days.
+#
+# The full campaign is ~57 runs of 48h each (the Res V 16-run + 3 center-point
+# workload DoW, run identically on Dynamo-disagg / Triton+vLLM / vLLM-standalone).
+# The measurement-isolation constraint forbids any concurrency: the dynamo_disagg
+# cells occupy both GPUs anyway, and the other systems must not share the host.
+#
+# This file starts with the two STEP-1 validation cells so the serial path can
+# be exercised end-to-end before the 48h DoW cells + per-cell calibration files
+# are added. To grow it to the full campaign, append one `cells:` entry per
+# 48h cell yaml with its calibration_file (see the calibration block below),
+# and set `calibration_required: true` on each.
+
+campaign_id: extension_dow
+
+# Strict-serial marker. campaign.py REFUSES to run unless mode == "serial", and
+# refuses any `slots:` key. Parallelism cannot be expressed in this yaml.
+mode: serial
+
+description: |
+  WoSAR 2026 extension: workload DoW screening, one serial queue on the
+  launch_cell production path. Two STEP-1 validation cells here; extend with
+  the 48h DoW cells + per-cell calibration for the full ~57-run campaign.
+
+# Number of replicas per cell (the DoW uses 3; the validation pass uses 1).
+replicas_per_cell: 1
+
+# Queue order across cells x replicas:
+#   round_robin   : r1 of every cell, then r2 of every cell, ... (spreads
+#                   day-to-day environmental drift symmetrically across cells)
+#   cell_at_a_time: all replicas of one cell, then the next cell
+order: round_robin
+
+# Extra cooldown AFTER launch_cell has fully exited (teardown + VRAM quiescence
+# already happen inside launch_cell) before the next run starts. Seconds.
+inter_run_cooldown_s: 300
+
+# Per-run overhead added to each cell's duration_s for the pre-flight estimate
+# only (startup + teardown + cooldown). Does not affect execution.
+est_run_overhead_s: 3600
+
+# Pre-flight free-space gate on runs_root (GB). Also passed to launch_cell as
+# --min-free-gb so each run re-checks at start.
+min_free_gb: 50
+
+# Global default for accepting a non-saturated ("lower bound") calibration.
+# Off: a non-saturated ceiling makes the DoW fraction-of-ceiling rate factor
+# meaningless. Per-cell entries may override this.
+allow_lower_bound_calibration: false
+
+# Retry policy: one automatic re-attempt (with --attempt incremented) on an
+# ordinary launch_cell failure, then the run is marked FAILED and the queue
+# moves on. launch_cell exit 7 (free-space gate), 8 (orphan gate), or 9
+# (run-slot lock) are NOT run failures -- they are host/precondition faults that
+# retrying cannot fix, so campaign.py stops the whole campaign loudly instead of
+# burning attempts.
+retry_policy:
+  max_retries: 1
+
+# Runs root. Each (cell, replica) gets <runs_root>/<campaign_id>_<cell_id>_r<NN>/.
+runs_root: /home/dcotrone/wosar/runs
+
+# Paths passed to launch_cell. repo_root is optional; if omitted it is inferred
+# as two levels up from this file (campaigns/extension/ -> repo root).
+paths:
+  hf_cache_host: /home/dcotrone/wosar/hf_cache
+  repo_root: /home/dcotrone/wosar/llm-serving-bench
+
+# Campaign state + logs, relative to this file. Written atomically. logs/ holds
+# a timestamped campaign_<ts>.log per invocation (stdout dies with the terminal).
+state_file: state/campaign_state.json
+
+# Ordered cell list. Each entry:
+#   id:                    cell id (defaults to the cell yaml's cell_id)
+#   yaml:                  cell yaml path, relative to this file
+#   calibration_file:      JSON from scripts/calibrate_rate.py, relative to this
+#                          file; passed to launch_cell as --calibration-file
+#   calibration_required:  if true, a missing calibration fails PRE-FLIGHT; any
+#                          provided-but-invalid calibration file also fails
+#                          PRE-FLIGHT (before run 1), not at run N=37
+#   allow_lower_bound_calibration: per-cell override of the global default
+#
+# The two validation cells below use a small fixed rate (no calibration), so
+# calibration_required is false. The 48h DoW cells MUST set it true, e.g.:
+#   - id: dow_dynamo_c01
+#     yaml: cells/dow_dynamo_c01.yaml
+#     calibration_file: calibration/dow_dynamo_c01.json
+#     calibration_required: true
+cells:
+  - id: val_vllm
+    yaml: cells/val_vllm.yaml
+    calibration_required: false
+  - id: val_dynamo_disagg
+    yaml: cells/val_dynamo_disagg.yaml
+    calibration_required: false

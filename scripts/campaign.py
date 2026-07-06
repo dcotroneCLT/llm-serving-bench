@@ -1,68 +1,88 @@
-"""Campaign orchestrator for WoSAR 2026 n=3 replication.
+"""Serial campaign orchestrator for the WoSAR 2026 extension (DoW) campaign.
 
-Reads campaigns/<id>/campaign.yaml and dispatches launch_cell.py for
-each (cell, replica) pair across parallel GPU slots.
+The extension campaign is ~57 runs of 48h each and is STRICTLY SERIAL by
+design: measurement isolation demands one run at a time, and the
+dynamo_disagg cells occupy both GPUs anyway. There is no thread pool and no
+parallel-slot model. One global ordered queue of (cell, replica) runs is
+dispatched, one launch_cell.py subprocess at a time, each waited to full
+completion (including teardown and VRAM quiescence inside launch_cell) plus a
+configurable inter-run cooldown before the next run starts.
 
-Topology comes from campaign.yaml. For the WoSAR 2026 campaign:
+    History note: the earlier n=3 (`campaigns/wosar2026/`) campaign used a
+    parallel GPU-slot scheduler (thread-per-slot). That campaign is complete;
+    its runtime path is intentionally NOT preserved here. The git history of
+    this file preserves the slot model; this revision replaces it with the
+    serial scheduler the extension requires. A campaign yaml that tries to
+    express parallelism (a `slots:` key, or `mode:` other than "serial") is
+    rejected at load time.
 
-  slot gpu0: cells [e1, a1]  -> 6 runs sequentially on GPU 0
-  slot gpu1: cells [e2, a2]  -> 6 runs sequentially on GPU 1
-  slot gpu2: cells [e3, e3b] -> 6 runs sequentially on GPU 2
+Campaign yaml schema (see campaigns/extension/campaign.yaml):
 
-Slots run in parallel; runs within a slot run sequentially. Calendar:
-max(per-slot sequential time) = 6 runs * ~38h = ~9.5 days
-(36h aging + startup/cooldown overhead).
+    campaign_id: extension_dow
+    mode: serial                 # REQUIRED, must equal "serial"
+    replicas_per_cell: 3
+    order: round_robin           # round_robin | cell_at_a_time
+    inter_run_cooldown_s: 300    # extra wait AFTER launch_cell fully exits
+    est_run_overhead_s: 3600     # added to each cell duration_s for the estimate
+    min_free_gb: 50              # pre-flight free-space gate on runs_root
+    allow_lower_bound_calibration: false   # global default; per-cell override
+    retry_policy:
+      max_retries: 1             # one automatic re-attempt, then mark failed
+    runs_root: /home/dcotrone/wosar/runs
+    paths:
+      hf_cache_host: /home/dcotrone/wosar/hf_cache
+      repo_root: /home/dcotrone/wosar/llm-serving-bench   # optional; else inferred
+    state_file: state/campaign_state.json                 # relative to this yaml
+    cells:
+      - id: val_vllm
+        yaml: cells/val_vllm.yaml
+        calibration_file: calibration/val_vllm.json   # optional, relative to yaml
+        calibration_required: true                    # fail pre-flight if invalid
+        allow_lower_bound_calibration: false          # optional per-cell override
 
-Checkpointing:
+Retry policy (requirement 3):
+  * launch_cell exit 0            -> completed.
+  * launch_cell exit 7 (free-space gate), 8 (orphan gate) or 9 (run-slot lock)
+    -> NOT a run failure. These are host/precondition fatals: a filesystem is
+    too full/undeterminable, or something else owns the host. Retrying cannot
+    fix them, so this is a CAMPAIGN-LEVEL FATAL -- stop the whole campaign
+    loudly (do NOT burn a retry) and exit non-zero.
+  * any other non-zero exit      -> run failure. Re-attempt once (--attempt
+    incremented), then mark failed and move on to the next run.
 
-  campaign_state.json holds the status of every (cell, replica) pair:
-    pending | running | completed | failed | skipped
-  Updated after each launch_cell.py exits. On orchestrator restart,
-  the file is consulted to skip completed runs and resume the rest.
+Resumability (requirement 4):
+  campaign_state.json records per-run status (pending|running|completed|failed|
+  interrupted|host_conflict|insufficient_space), written atomically (write-tmp +
+  rename). --resume skips completed runs and re-queues every non-completed run
+  (interrupted/failed/fatal-precondition runs re-enter the policy). The operator
+  can stop and restart across days.
 
-Retry policy:
-
-  Each (cell, replica) gets one automatic retry on failure. After
-  two failures, the run is marked 'failed' and the slot moves on
-  (campaign.yaml.retry_policy.on_repeated_failure controls this).
-
-Sanity runs:
-
-  After all slot runs complete, sanity_runs from campaign.yaml are
-  dispatched on the appropriate slot (single-threaded tail).
+Signals (requirement 5):
+  SIGTERM/SIGINT/SIGHUP forward SIGTERM to the current launch_cell child (which
+  tears down gracefully), persist state, and exit non-zero. Campaign runs live
+  inside tmux but must survive its loss -- hence the log file (requirement 7).
 
 Usage:
 
-  python3 scripts/campaign.py \
-      --campaign-yaml campaigns/wosar2026/campaign.yaml \
-      --dry-run                  # print schedule and exit
+  python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --dry-run
+  python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --start
+  python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --resume
 
-  python3 scripts/campaign.py \
-      --campaign-yaml campaigns/wosar2026/campaign.yaml \
-      --start
+Recommended deployment (survives ssh disconnect; the log file survives tmux loss):
 
-  python3 scripts/campaign.py \
-      --campaign-yaml campaigns/wosar2026/campaign.yaml \
-      --resume                   # pick up from state file
-
-Recommended deployment:
-
-  tmux new -d -s wosar_campaign \\
-      'python3 scripts/campaign.py --campaign-yaml ... --start \\
-           > /home/dcotrone/wosar/runs/campaign.log 2>&1'
-
-  Survives ssh disconnect. Reattach: `tmux attach -t wosar_campaign`.
+  tmux new -d -s ext_campaign \\
+      'python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --start'
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import signal
+import os
 import shutil
+import signal
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -71,21 +91,108 @@ from typing import Optional
 
 import yaml  # type: ignore
 
+# launch_cell is a sibling module. We reuse its calibration gate so the campaign
+# pre-flight accepts EXACTLY what launch_cell will accept at run time -- the
+# contract in launch_cell.py is the single source of truth (a pre-flight that
+# diverged would defeat requirement 6).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import launch_cell  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Exit codes (campaign.py's own) and the launch_cell contract codes.
+# ---------------------------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_USAGE = 2            # argparse-style usage error
+EXIT_PREFLIGHT = 3        # pre-flight failed (calibration/config/free space)
+EXIT_INTERRUPTED = 4      # stopped by a signal
+EXIT_CAMPAIGN_FATAL = 5   # a child reported a host/precondition fatal (7/8/9)
+
+# launch_cell exit codes that are HOST/PRECONDITION fatals, not run failures:
+# retrying cannot fix them (something else owns the host, or a filesystem is
+# too full / undeterminable). They stop the campaign loudly instead of burning
+# retries (requirement 3, extended to the precondition gate on review).
+LC_FREE_SPACE = 7         # free-space gate (runs-root or docker data-root)
+LC_ORPHAN_GATE = 8        # pre-run reaper / host-wide reaper: unkillable orphan
+LC_SLOT_LOCKED = 9        # run-slot flock held by another launcher
+
+# rc -> (persisted status, human reason). host_conflict = another launcher/orphan
+# owns the host; insufficient_space = a filesystem gate refused the start.
+FATAL_STATUS: dict[int, tuple[str, str]] = {
+    LC_FREE_SPACE: ("insufficient_space", "free-space gate (runs-root or docker data-root too full / undeterminable)"),
+    LC_ORPHAN_GATE: ("host_conflict", "orphan gate: a prior run is still active or has an unkillable orphan"),
+    LC_SLOT_LOCKED: ("host_conflict", "run-slot lock held by another launcher"),
+}
+FATAL_CODES = frozenset(FATAL_STATUS)
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
 
 def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def log(msg: str) -> None:
+    # Prints through sys.stdout, which main() tees into the campaign log file.
     print(f"[campaign] {utc_iso()} {msg}", flush=True)
 
 
-def host_port_from_mapping(port_mapping: str) -> Optional[str]:
-    """Return host port from Docker -p syntax [ip:]host:container[/proto]."""
-    parts = str(port_mapping).split(":")
-    if len(parts) < 2:
+class Tee:
+    """Duplicate everything written to stdout/stderr into a log file too.
+
+    stdout alone dies with the terminal (we learned this the hard way, hence
+    requirement 7). tmux may also be lost; the file is the durable record.
+    """
+
+    def __init__(self, *streams) -> None:
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for s in self.streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def nearest_existing(path: Path) -> Path:
+    """The path itself if it exists, else its nearest existing ancestor."""
+    p = path
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return p
+
+
+def free_gb(path: Path) -> Optional[float]:
+    try:
+        return shutil.disk_usage(str(nearest_existing(path))).free / (1024 ** 3)
+    except OSError:
         return None
-    return parts[-2]
 
 
 def container_running(name: str) -> bool:
@@ -101,7 +208,17 @@ def container_running(name: str) -> bool:
     return result.returncode == 0 and name in result.stdout.split()
 
 
-def run_dir_looks_active(run_dir: Path, container_name: str) -> bool:
+def run_dir_looks_active(run_dir: Path, container_name: Optional[str]) -> bool:
+    """A run_dir with an unfinished manifest and a live container is an ACTIVE
+    run. During a strictly-serial campaign that means another launcher owns the
+    host -- we must not archive over it.
+
+    Single-container cells are active only if the recorded container is still
+    running. Multi-container cells (dynamo_disagg) have no single container name
+    to key on; if their manifest is unfinished, treat the run_dir as active or
+    unknown and refuse to archive it. Renaming an active run_dir would move the
+    directory out from under a live launch_cell before its run-slot lock can
+    reject us."""
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.exists():
         return False
@@ -111,16 +228,27 @@ def run_dir_looks_active(run_dir: Path, container_name: str) -> bool:
         return False
     if manifest.get("ended_at"):
         return False
-    return manifest.get("container", {}).get("name") == container_name and container_running(container_name)
+    if container_name is None:
+        return True
+    return (
+        manifest.get("container", {}).get("name") == container_name
+        and container_running(container_name)
+    )
 
 
-def expected_container_name(cell_yaml: str, replica: int) -> str:
+def expected_container_name(cell_yaml: str, replica: int) -> Optional[str]:
+    """The single container name a cell will use, or None for a multi-container
+    lifecycle (dynamo_disagg) that declares no container_name_template."""
     cell = yaml.safe_load(Path(cell_yaml).read_text())
-    template = cell["engine"]["container_name_template"]
+    template = cell.get("engine", {}).get("container_name_template")
+    if not template:
+        return None
     return str(template).replace("{replica}", f"{replica:02d}")
 
 
 def archive_existing_run_dir(run_dir: Path, attempt: int) -> Optional[Path]:
+    """Move a stale run_dir aside so launch_cell's assert_run_dir_fresh passes
+    on the next attempt. Returns the archive path, or None if nothing to move."""
     if not run_dir.exists():
         return None
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -135,30 +263,29 @@ def archive_existing_run_dir(run_dir: Path, attempt: int) -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Schedule building
+# Data model
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class RunSpec:
     cell_id: str
-    cell_yaml: str          # relative to repo root
+    cell_yaml: str                 # absolute path
     replica: int
-    slot_name: str
-    gpu_device: int
-    duration_s_override: Optional[int] = None
-    gpu_device_override: Optional[int] = None
-    sanity: bool = False
+    duration_s: int                # from the cell yaml, for the estimate only
+    calibration_file: Optional[str] = None      # absolute path or None
+    calibration_required: bool = False
+    allow_lower_bound_calibration: bool = False
 
     @property
     def run_key(self) -> str:
-        suffix = "_sanity" if self.sanity else ""
-        return f"{self.cell_id}_r{self.replica:02d}{suffix}"
+        return f"{self.cell_id}_r{self.replica:02d}"
 
 
 @dataclass
 class RunStatus:
-    status: str = "pending"            # pending | running | completed | failed
+    # pending | running | completed | failed | interrupted | host_conflict | insufficient_space
+    status: str = "pending"
     attempts: int = 0
     last_started_at: Optional[str] = None
     last_ended_at: Optional[str] = None
@@ -188,179 +315,252 @@ class State:
         )
 
 
-def build_schedule(campaign: dict, campaign_yaml_path: Path) -> dict[str, list[RunSpec]]:
-    """Return a dict slot_name -> list of RunSpec, in execution order."""
-    cells_by_id: dict[str, str] = {}
-    cell_gpu_by_id: dict[str, int] = {}
-    cell_ports_by_id: dict[str, set[str]] = {}
-    for cell_rel in campaign["cells"]:
-        cell_path = (campaign_yaml_path.parent / cell_rel).resolve()
-        cell = yaml.safe_load(cell_path.read_text())
-        cid = cell["cell_id"]
-        cells_by_id[cid] = str(cell_path)
-        cell_gpu_by_id[cid] = int(cell["engine"]["gpu_device"])
-        cell_ports_by_id[cid] = {
-            p for p in (host_port_from_mapping(x) for x in cell["engine"].get("port_mapping", [])) if p
-        }
+class CampaignFatal(Exception):
+    """A child reported a host/precondition fatal (launch_cell exit 7/8/9), or
+    the campaign found an active run_dir it must not clobber. The whole campaign
+    stops."""
 
-    port_owners: dict[str, list[tuple[str, int]]] = {}
-    for cid, ports in cell_ports_by_id.items():
-        for port in ports:
-            port_owners.setdefault(port, []).append((cid, cell_gpu_by_id[cid]))
-    for port, owners in port_owners.items():
-        if len({gpu for _, gpu in owners}) > 1:
-            raise ValueError(f"host port {port} is used across parallel GPU slots: {owners}")
+    def __init__(self, run_key: str, rc: int, detail: str) -> None:
+        super().__init__(detail)
+        self.run_key = run_key
+        self.rc = rc
+        self.detail = detail
 
-    replicas = int(campaign["replicas_per_cell"])
-    order = campaign.get("intra_slot_order", "round_robin")
-    schedule: dict[str, list[RunSpec]] = {}
 
-    for slot in campaign["slots"]:
-        slot_name = slot["name"]
-        gpu_device = int(slot["gpu_device"])
-        cell_ids = list(slot["cells"])
-        for cid in cell_ids:
-            if cid not in cells_by_id:
-                raise ValueError(f"slot {slot_name} references unknown cell {cid}")
-            if cell_gpu_by_id[cid] != gpu_device:
-                raise ValueError(
-                    f"slot {slot_name} gpu_device={gpu_device} but cell {cid} "
-                    f"engine.gpu_device={cell_gpu_by_id[cid]}"
-                )
+class CampaignInterrupted(Exception):
+    """A signal asked the campaign to stop."""
 
-        if order == "round_robin":
-            # r1 of cell A, r1 of B, ..., r2 of A, r2 of B, ...
-            slot_runs = []
+
+class PreflightError(Exception):
+    """Something the operator must fix before the campaign can start."""
+
+
+# ---------------------------------------------------------------------------
+# Campaign yaml -> validated config + ordered schedule
+# ---------------------------------------------------------------------------
+
+
+def load_campaign(campaign_path: Path) -> dict:
+    """Load and validate the campaign yaml. Rejects any attempt to express
+    parallelism: the extension campaign is strictly serial by design."""
+    campaign = yaml.safe_load(campaign_path.read_text())
+    if not isinstance(campaign, dict):
+        raise PreflightError(f"{campaign_path}: not a mapping")
+
+    mode = campaign.get("mode")
+    if mode != "serial":
+        raise PreflightError(
+            f"{campaign_path}: mode must be 'serial' (got {mode!r}). This "
+            "orchestrator only runs strictly-serial campaigns; the parallel "
+            "slot model is retired."
+        )
+    if "slots" in campaign:
+        raise PreflightError(
+            f"{campaign_path}: 'slots:' is not allowed in a serial campaign. "
+            "Parallel GPU slots are retired; use an ordered 'cells:' list."
+        )
+    for required in ("campaign_id", "cells", "runs_root"):
+        if required not in campaign:
+            raise PreflightError(f"{campaign_path}: missing required key {required!r}")
+    return campaign
+
+
+def build_schedule(campaign: dict, campaign_path: Path) -> list[RunSpec]:
+    """Return the single global ordered queue of RunSpec.
+
+    order == round_robin  : r1 of A, r1 of B, ..., r2 of A, r2 of B, ...
+    order == cell_at_a_time: r1..rN of A, then r1..rN of B, ...
+    """
+    yaml_dir = campaign_path.parent
+    replicas = int(campaign.get("replicas_per_cell", 1))
+    order = campaign.get("order", "cell_at_a_time")
+    if order not in ("round_robin", "cell_at_a_time"):
+        raise PreflightError(f"unknown order: {order!r}")
+    global_allow_lb = bool(campaign.get("allow_lower_bound_calibration", False))
+
+    # Normalize each cell entry to a dict and load its yaml (for cell_id + duration).
+    cells: list[dict] = []
+    for raw in campaign["cells"]:
+        entry = {"yaml": raw} if isinstance(raw, str) else dict(raw)
+        cell_yaml = (yaml_dir / entry["yaml"]).resolve()
+        if not cell_yaml.exists():
+            raise PreflightError(f"cell yaml not found: {cell_yaml}")
+        cell_doc = yaml.safe_load(cell_yaml.read_text())
+        cell_id = entry.get("id") or cell_doc.get("cell_id")
+        if not cell_id:
+            raise PreflightError(f"{cell_yaml}: no cell_id and no 'id' in the campaign entry")
+        duration_s = int(entry.get("duration_s_override") or cell_doc.get("duration_s") or 0)
+
+        calib_file = entry.get("calibration_file")
+        calib_abs = str((yaml_dir / calib_file).resolve()) if calib_file else None
+        cells.append(
+            {
+                "cell_id": cell_id,
+                "cell_yaml": str(cell_yaml),
+                "duration_s": duration_s,
+                "calibration_file": calib_abs,
+                "calibration_required": bool(entry.get("calibration_required", False)),
+                "allow_lower_bound_calibration": bool(
+                    entry.get("allow_lower_bound_calibration", global_allow_lb)
+                ),
+            }
+        )
+
+    seen = [c["cell_id"] for c in cells]
+    dupes = {cid for cid in seen if seen.count(cid) > 1}
+    if dupes:
+        raise PreflightError(f"duplicate cell ids in campaign: {sorted(dupes)}")
+
+    def make(cell: dict, rep: int) -> RunSpec:
+        return RunSpec(
+            cell_id=cell["cell_id"],
+            cell_yaml=cell["cell_yaml"],
+            replica=rep,
+            duration_s=cell["duration_s"],
+            calibration_file=cell["calibration_file"],
+            calibration_required=cell["calibration_required"],
+            allow_lower_bound_calibration=cell["allow_lower_bound_calibration"],
+        )
+
+    schedule: list[RunSpec] = []
+    if order == "round_robin":
+        for rep in range(1, replicas + 1):
+            for cell in cells:
+                schedule.append(make(cell, rep))
+    else:  # cell_at_a_time
+        for cell in cells:
             for rep in range(1, replicas + 1):
-                for cid in cell_ids:
-                    slot_runs.append(
-                        RunSpec(
-                            cell_id=cid,
-                            cell_yaml=cells_by_id[cid],
-                            replica=rep,
-                            slot_name=slot_name,
-                            gpu_device=gpu_device,
-                        )
-                    )
-        elif order == "cell_at_a_time":
-            slot_runs = []
-            for cid in cell_ids:
-                for rep in range(1, replicas + 1):
-                    slot_runs.append(
-                        RunSpec(
-                            cell_id=cid,
-                            cell_yaml=cells_by_id[cid],
-                            replica=rep,
-                            slot_name=slot_name,
-                            gpu_device=gpu_device,
-                        )
-                    )
-        else:
-            raise ValueError(f"unknown intra_slot_order: {order}")
-
-        schedule[slot_name] = slot_runs
-
+                schedule.append(make(cell, rep))
     return schedule
 
 
-def build_sanity_runs(campaign: dict, campaign_yaml_path: Path) -> list[RunSpec]:
-    """Return a list of sanity RunSpec, dispatched after the main schedule."""
-    cells_by_id: dict[str, str] = {}
-    for cell_rel in campaign["cells"]:
-        cell_path = (campaign_yaml_path.parent / cell_rel).resolve()
-        cell = yaml.safe_load(cell_path.read_text())
-        cells_by_id[cell["cell_id"]] = str(cell_path)
+# ---------------------------------------------------------------------------
+# Pre-flight
+# ---------------------------------------------------------------------------
 
-    out: list[RunSpec] = []
-    for s in campaign.get("sanity_runs", []):
-        cid = s["cell"]
-        replica_id = s.get("replica_id", "sanity")
-        gpu_override = int(s["gpu_device_override"])
-        duration_override = int(s["duration_s_override"])
-        out.append(
-            RunSpec(
-                cell_id=cid,
-                cell_yaml=cells_by_id[cid],
-                replica=99,  # sentinel, real id is via gpu_override + sanity flag
-                slot_name=f"sanity_{cid}_gpu{gpu_override}",
-                gpu_device=gpu_override,
-                duration_s_override=duration_override,
-                gpu_device_override=gpu_override,
-                sanity=True,
-            )
+
+def validate_calibration(spec: RunSpec) -> tuple[bool, str]:
+    """Return (ok, message) for a spec's calibration file. Uses launch_cell's
+    own gate so this matches exactly what the run will accept."""
+    if not spec.calibration_file:
+        if spec.calibration_required:
+            return False, "REQUIRED but no calibration_file given"
+        return True, "none (not required)"
+    path = Path(spec.calibration_file)
+    if not path.exists():
+        return False, f"MISSING: {path}"
+    try:
+        calib = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return False, f"INVALID JSON: {e}"
+    try:
+        rate = launch_cell.resolve_calibrated_rate(
+            calib, spec.allow_lower_bound_calibration
         )
-    return out
+    except launch_cell.CalibrationError as e:
+        return False, f"REJECTED: {e}"
+    status = calib.get("status")
+    return True, f"ok (status={status}, rate={rate})"
 
 
-# ---------------------------------------------------------------------------
-# Slot worker
-# ---------------------------------------------------------------------------
-
-
-class SlotWorker(threading.Thread):
-    """Drive one GPU slot's run queue sequentially."""
+class Campaign:
+    """The serial scheduler. Holds config, state, and the signal-forwarding
+    handle to the current launch_cell child."""
 
     def __init__(
         self,
-        slot_name: str,
-        runs: list[RunSpec],
-        state: State,
-        state_lock: threading.Lock,
-        state_path: Path,
         campaign: dict,
-        repo_root: Path,
-        runs_root: Path,
-        hf_cache_host: Path,
-        stop_event: threading.Event,
+        campaign_path: Path,
+        schedule: list[RunSpec],
+        state: State,
+        state_path: Path,
     ) -> None:
-        super().__init__(name=f"slot-{slot_name}", daemon=False)
-        self.slot_name = slot_name
-        self.runs = runs
-        self.state = state
-        self.state_lock = state_lock
-        self.state_path = state_path
         self.campaign = campaign
-        self.repo_root = repo_root
-        self.runs_root = runs_root
-        self.hf_cache_host = hf_cache_host
-        self.stop_event = stop_event
+        self.campaign_path = campaign_path
+        self.schedule = schedule
+        self.state = state
+        self.state_path = state_path
+
+        yaml_dir = campaign_path.parent
+        self.campaign_id = campaign["campaign_id"]
+        self.runs_root = Path(campaign["runs_root"])
+        paths = campaign.get("paths", {})
+        self.hf_cache_host = Path(paths["hf_cache_host"])
+        self.repo_root = (
+            Path(paths["repo_root"]) if paths.get("repo_root")
+            else yaml_dir.parent.parent
+        )
+        self.max_retries = int(campaign.get("retry_policy", {}).get("max_retries", 1))
+        self.inter_run_cooldown_s = int(campaign.get("inter_run_cooldown_s", 0))
+        self.est_run_overhead_s = int(campaign.get("est_run_overhead_s", 0))
+        self.min_free_gb = float(campaign.get("min_free_gb", 20.0))
+
+        # Signal state. current_proc is set only while a child is alive.
         self.current_proc: Optional[subprocess.Popen] = None
+        self._interrupted = False
+        self._interrupt_signal: Optional[int] = None
 
-    def _persist_state(self) -> None:
-        with self.state_lock:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            # Atomic write: write to tmp file then rename, so a crash
-            # mid-write does not leave campaign_state.json half-written.
-            # On the same filesystem, rename(2) is atomic.
-            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-            tmp.write_text(json.dumps(self.state.to_dict(), indent=2))
-            import os as _os
-            _os.replace(tmp, self.state_path)
+        # Injection seams for the unit tests (no docker/GPU/subprocess needed):
+        self._popen = subprocess.Popen                 # child spawner
+        self._sleep = time.sleep                       # cooldown sleeper
+        self._skip_run_dir_prep = False                # bypass docker/fs guard
 
-    def _run_one(self, spec: RunSpec) -> int:
-        status = self.state.runs.setdefault(spec.run_key, RunStatus())
-        status.attempts += 1
-        status.status = "running"
-        status.last_started_at = utc_iso()
-        self._persist_state()
+    # -- state persistence --------------------------------------------------
 
-        run_dir = self.runs_root / f"{self.campaign['campaign_id']}_{spec.cell_id}_r{spec.replica:02d}"
-        container_name = expected_container_name(spec.cell_yaml, spec.replica)
-        if run_dir_looks_active(run_dir, container_name):
-            log(f"[{self.slot_name}] refusing to start {spec.run_key}: run_dir and container {container_name} look active")
-            status.last_ended_at = utc_iso()
-            status.last_rc = 125
-            self._persist_state()
-            return 125
-        if container_running(container_name):
-            log(f"[{self.slot_name}] container {container_name} is already running; launch_cell will tear it down before retry")
-        archived = archive_existing_run_dir(run_dir, status.attempts)
-        if archived is not None:
-            log(f"[{self.slot_name}] archived pre-existing run_dir for {spec.run_key}: {archived}")
-        run_dir.mkdir(parents=True, exist_ok=True)
-        launch_log = run_dir / "launch_cell.log"
-        status.log_path = str(launch_log)
+    def persist_state(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write: write to a tmp file then rename. On the same filesystem
+        # rename(2) is atomic, so a crash mid-write never truncates the state.
+        tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.state.to_dict(), indent=2))
+        os.replace(tmp, self.state_path)
 
+    def _status(self, spec: RunSpec) -> RunStatus:
+        return self.state.runs.setdefault(spec.run_key, RunStatus())
+
+    # -- signal handling ----------------------------------------------------
+
+    def install_signal_handlers(self) -> None:
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, self.handle_signal)
+
+    def handle_signal(self, signum, _frame) -> None:
+        # Runs in the main thread between bytecodes. Forward SIGTERM to the
+        # child so it tears down gracefully; mark the in-flight run interrupted
+        # and persist so state survives even if we die right after.
+        self._interrupted = True
+        self._interrupt_signal = signum
+        log(f"signal {signum} received: forwarding SIGTERM to launch_cell child and shutting down")
+        proc = self.current_proc
+        if proc is not None:
+            try:
+                proc.send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as e:  # pragma: no cover - defensive
+                log(f"failed to signal child: {e}")
+        for st in self.state.runs.values():
+            if st.status == "running":
+                st.status = "interrupted"
+        try:
+            self.persist_state()
+        except Exception as e:  # pragma: no cover - defensive
+            log(f"failed to persist state in signal handler: {e}")
+
+    def _sleep_interruptible(self, seconds: float) -> None:
+        """Cooldown that returns promptly if a signal arrives. Counted in 1s
+        ticks (not wall-clock) so it checks the interrupt flag every second and
+        stays unit-testable with an injected sleeper."""
+        remaining = float(seconds)
+        tick = 1.0
+        while remaining > 0 and not self._interrupted:
+            dt = min(tick, remaining)
+            self._sleep(dt)
+            remaining -= dt
+
+    # -- launching one run --------------------------------------------------
+
+    def _build_cmd(self, spec: RunSpec, attempt: int) -> list[str]:
         cmd = [
             sys.executable,
             str(self.repo_root / "scripts" / "launch_cell.py"),
@@ -369,203 +569,318 @@ class SlotWorker(threading.Thread):
             "--runs-root", str(self.runs_root),
             "--repo-root", str(self.repo_root),
             "--hf-cache-host", str(self.hf_cache_host),
-            "--campaign-id", self.campaign["campaign_id"],
-            "--attempt", str(status.attempts),
+            "--campaign-id", self.campaign_id,
+            "--attempt", str(attempt),
+            "--min-free-gb", str(self.min_free_gb),
         ]
-        if spec.gpu_device_override is not None:
-            cmd += ["--gpu-device-override", str(spec.gpu_device_override)]
-        if spec.duration_s_override is not None:
-            cmd += ["--duration-s-override", str(spec.duration_s_override)]
+        if spec.calibration_file:
+            cmd += ["--calibration-file", spec.calibration_file]
+        if spec.allow_lower_bound_calibration:
+            cmd += ["--allow-lower-bound-calibration"]
+        return cmd
 
-        log(f"[{self.slot_name}] starting {spec.run_key} attempt={status.attempts}")
-        log(f"[{self.slot_name}] cmd: {' '.join(cmd)}")
-
-        with launch_log.open("ab", buffering=0) as log_f:
-            self.current_proc = subprocess.Popen(
-                cmd,
-                stdout=log_f,
-                stderr=subprocess.STDOUT,
+    def _prepare_run_dir(self, spec: RunSpec, attempt: int) -> Path:
+        """Archive any stale run_dir so launch_cell starts fresh. Refuse (fatal)
+        if the run_dir belongs to an ACTIVE single-container run owned by another
+        launcher. Multi-container cells (dynamo_disagg) declare no single
+        container name -- expected_container_name returns None, so an unfinished
+        manifest is treated as active/unknown and never archived."""
+        run_dir = self.runs_root / f"{self.campaign_id}_{spec.cell_id}_r{spec.replica:02d}"
+        if self._skip_run_dir_prep:
+            return run_dir
+        container_name = expected_container_name(spec.cell_yaml, spec.replica)
+        if run_dir_looks_active(run_dir, container_name):
+            raise CampaignFatal(
+                spec.run_key, LC_ORPHAN_GATE,
+                f"run_dir {run_dir} and container {container_name} look ACTIVE; "
+                "another launcher owns the host. Stopping the campaign.",
             )
+        archived = archive_existing_run_dir(run_dir, attempt)
+        if archived is not None:
+            log(f"archived pre-existing run_dir for {spec.run_key}: {archived}")
+        return run_dir
+
+    def _launch_cell_rc(self, spec: RunSpec, attempt: int) -> int:
+        """Spawn launch_cell for one run and wait for it to fully exit. Returns
+        the child exit code. All docker/subprocess/fs side effects live here so
+        the retry/resume/signal logic above stays unit-testable."""
+        run_dir = self._prepare_run_dir(spec, attempt)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        launch_log = run_dir / "launch_cell.log"
+        self._status(spec).log_path = str(launch_log)
+
+        cmd = self._build_cmd(spec, attempt)
+        log(f"starting {spec.run_key} attempt={attempt}")
+        log(f"cmd: {' '.join(cmd)}")
+
+        with open(launch_log, "ab", buffering=0) as log_f:
+            self.current_proc = self._popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
             try:
                 rc = self.current_proc.wait()
-            except KeyboardInterrupt:
-                rc = -1
             finally:
                 self.current_proc = None
-        status.last_ended_at = utc_iso()
-        status.last_rc = rc
         return rc
 
-    def run(self) -> None:
-        max_retries = int(self.campaign.get("retry_policy", {}).get("max_retries", 1))
-        on_failure = self.campaign.get("retry_policy", {}).get(
-            "on_repeated_failure", "log_and_continue"
+    def _dispatch(self, spec: RunSpec) -> int:
+        """One launch_cell invocation: bump the cumulative attempt counter,
+        mark running, persist, run, record the result, persist."""
+        status = self._status(spec)
+        status.attempts += 1
+        attempt = status.attempts
+        status.status = "running"
+        status.last_started_at = utc_iso()
+        status.last_ended_at = None
+        status.last_rc = None
+        self.persist_state()
+
+        rc = self._launch_cell_rc(spec, attempt)
+
+        status.last_ended_at = utc_iso()
+        status.last_rc = rc
+        self.persist_state()
+        return rc
+
+    def _mark_fatal(self, spec: RunSpec, rc: int) -> None:
+        """Record the fatal status for a spec before the campaign stops, so the
+        state file explains WHY on resume/diagnostics (fixes the earlier
+        'stuck in running' after a pre-child fatal)."""
+        status, _ = FATAL_STATUS.get(rc, ("host_conflict", "host precondition"))
+        self._status(spec).status = status
+        self.persist_state()
+
+    def _run_with_retry(self, spec: RunSpec) -> str:
+        """Run one spec under the retry policy. Returns 'completed' or 'failed'.
+        Raises CampaignFatal on a host/precondition exit (7/8/9) or a pre-child
+        active-run detection; CampaignInterrupted on signal."""
+        session_attempts = 0
+        while True:
+            if self._interrupted:
+                raise CampaignInterrupted()
+
+            try:
+                rc = self._dispatch(spec)
+            except CampaignFatal as f:
+                # _prepare_run_dir refused BEFORE the child ran (run_dir looks
+                # active). _dispatch left status 'running'; correct it so the
+                # persisted state is not misleading, then propagate.
+                self._mark_fatal(spec, f.rc)
+                raise
+
+            # A signal during the run already tore the child down; wait() has
+            # returned. Do not treat as a run failure or retry.
+            if self._interrupted:
+                status = self._status(spec)
+                if status.status != "interrupted":
+                    status.status = "interrupted"
+                    self.persist_state()
+                raise CampaignInterrupted()
+
+            if rc == 0:
+                self._status(spec).status = "completed"
+                self.persist_state()
+                log(f"{spec.run_key} COMPLETED")
+                return "completed"
+
+            if rc in FATAL_CODES:
+                # NOT a run failure: retrying cannot fix host ownership or a full
+                # filesystem. Record why and stop the campaign loudly.
+                _, human = FATAL_STATUS[rc]
+                self._mark_fatal(spec, rc)
+                raise CampaignFatal(
+                    spec.run_key, rc,
+                    f"launch_cell exit {rc} ({human}).",
+                )
+
+            # Ordinary failure -> re-attempt once, then give up on this run.
+            session_attempts += 1
+            if session_attempts > self.max_retries:
+                self._status(spec).status = "failed"
+                self.persist_state()
+                log(f"{spec.run_key} FAILED after {session_attempts} attempt(s) rc={rc}")
+                return "failed"
+            log(f"{spec.run_key} failed rc={rc}, retrying ({session_attempts}/{self.max_retries})")
+
+    # -- pre-flight ---------------------------------------------------------
+
+    def pending_specs(self) -> list[RunSpec]:
+        """Specs that still need to run (everything not 'completed')."""
+        out = []
+        for spec in self.schedule:
+            st = self.state.runs.get(spec.run_key)
+            if st and st.status == "completed":
+                continue
+            out.append(spec)
+        return out
+
+    def preflight(self) -> None:
+        """Print the schedule, calibration status, estimate, and free space.
+        Raise PreflightError if a REQUIRED calibration is missing/invalid or
+        free space is below the gate -- BEFORE any run starts (requirements 6, 8)."""
+        log(f"campaign_id: {self.campaign_id}")
+        log(f"repo_root:   {self.repo_root}")
+        log(f"runs_root:   {self.runs_root}")
+        log(f"state_file:  {self.state_path}")
+        log(
+            f"retry: max_retries={self.max_retries}  "
+            f"cooldown={self.inter_run_cooldown_s}s  min_free={self.min_free_gb}GB"
         )
 
-        for spec in self.runs:
-            if self.stop_event.is_set():
-                log(f"[{self.slot_name}] stop_event set, abandoning queue")
-                return
+        pending = self.pending_specs()
+        completed = len(self.schedule) - len(pending)
+        log(f"schedule: {len(self.schedule)} runs total, {completed} already completed, {len(pending)} to run")
 
-            existing = self.state.runs.get(spec.run_key)
-            if existing and existing.status == "completed":
-                log(f"[{self.slot_name}] skipping {spec.run_key} (already completed)")
-                continue
+        # Full schedule in order, with per-cell calibration status.
+        calib_failures: list[str] = []
+        total_est_s = 0
+        for i, spec in enumerate(self.schedule, 1):
+            st = self.state.runs.get(spec.run_key)
+            state_note = f"  [{st.status}]" if st else ""
+            # A present-but-unacceptable calibration_file ALWAYS fails pre-flight:
+            # _build_cmd passes it to launch_cell regardless of calibration_required,
+            # and launch_cell would reject it at run time (burning the run).
+            # calibration_required only governs the file-absent case. So any
+            # ok == False (required-and-absent, or present-and-unacceptable) is fatal.
+            ok, msg = validate_calibration(spec)
+            if not ok:
+                calib_failures.append(f"{spec.run_key}: {msg}")
+            will_run = not (st and st.status == "completed")
+            if will_run:
+                total_est_s += spec.duration_s + self.est_run_overhead_s
+            log(f"  {i:3d}. {spec.run_key}{state_note}  calib={msg}")
 
-            rc = self._run_one(spec)
-            attempts_used = 1
-            while rc != 0 and attempts_used <= max_retries:
-                if self.stop_event.is_set():
-                    return
-                log(f"[{self.slot_name}] {spec.run_key} failed rc={rc}, retrying ({attempts_used}/{max_retries})")
-                rc = self._run_one(spec)
-                attempts_used += 1
+        log(f"estimated remaining wallclock: {format_duration(total_est_s)} "
+            f"(sum of duration_s + {self.est_run_overhead_s}s overhead per pending run)")
 
-            status = self.state.runs[spec.run_key]
-            if rc == 0:
-                status.status = "completed"
-                log(f"[{self.slot_name}] {spec.run_key} COMPLETED")
-            else:
-                status.status = "failed"
-                log(f"[{self.slot_name}] {spec.run_key} FAILED after {attempts_used} attempt(s) rc={rc}")
-                if on_failure == "log_and_halt_slot":
-                    log(f"[{self.slot_name}] halting slot per retry_policy")
-                    self._persist_state()
-                    return
-            self._persist_state()
+        fg = free_gb(self.runs_root)
+        if fg is None:
+            log(f"free space on {self.runs_root}: UNKNOWN (could not stat)")
+        else:
+            log(f"free space on {nearest_existing(self.runs_root)}: {fg:.1f} GB")
 
-    def interrupt(self) -> None:
-        if self.current_proc is not None:
+        # Hard gates -- fail before the first run.
+        if calib_failures:
+            raise PreflightError(
+                "required calibration file(s) missing/invalid:\n  "
+                + "\n  ".join(calib_failures)
+            )
+        if fg is not None and fg < self.min_free_gb:
+            raise PreflightError(
+                f"free space {fg:.1f} GB on {self.runs_root} is below the "
+                f"min_free_gb gate ({self.min_free_gb} GB)"
+            )
+
+    # -- main loop ----------------------------------------------------------
+
+    def run(self) -> int:
+        """Drive the queue serially. Returns the process exit code."""
+        pending = self.pending_specs()
+        for idx, spec in enumerate(pending):
+            if self._interrupted:
+                log("interrupted before starting the next run")
+                self.persist_state()
+                return EXIT_INTERRUPTED
             try:
-                self.current_proc.send_signal(signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+                self._run_with_retry(spec)
+            except CampaignInterrupted:
+                log("campaign interrupted; state persisted")
+                return EXIT_INTERRUPTED
+            except CampaignFatal as f:
+                log(f"CAMPAIGN FATAL on {f.run_key}: {f.detail}")
+                log("stopping the campaign. Resolve the host precondition (ownership "
+                    "or free space), then --resume.")
+                return EXIT_CAMPAIGN_FATAL
+
+            # Inter-run cooldown before the next run (skip after the last one).
+            is_last = idx == len(pending) - 1
+            if not is_last and self.inter_run_cooldown_s > 0:
+                log(f"inter-run cooldown: {self.inter_run_cooldown_s}s")
+                self._sleep_interruptible(self.inter_run_cooldown_s)
+                if self._interrupted:
+                    log("interrupted during cooldown; state persisted")
+                    self.persist_state()
+                    return EXIT_INTERRUPTED
+
+        log("campaign complete")
+        failed = [k for k, s in self.state.runs.items() if s.status == "failed"]
+        if failed:
+            log(f"NOTE: {len(failed)} run(s) ended FAILED: {sorted(failed)}")
+        return EXIT_OK
 
 
 # ---------------------------------------------------------------------------
-# Main
+# main
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Orchestrate the n=3 replication campaign.")
+def setup_logfile(state_path: Path) -> Path:
+    """Tee stdout/stderr into a timestamped log file under the state dir."""
+    log_dir = state_path.parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_path = log_dir / f"campaign_{stamp}.log"
+    log_f = open(log_path, "a", buffering=1)
+    sys.stdout = Tee(sys.__stdout__, log_f)
+    sys.stderr = Tee(sys.__stderr__, log_f)
+    return log_path
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="Serial orchestrator for the extension (DoW) campaign.")
     p.add_argument("--campaign-yaml", type=Path, required=True)
     p.add_argument("--start", action="store_true", help="Start fresh (delete existing state file).")
-    p.add_argument("--resume", action="store_true", help="Resume from state file.")
-    p.add_argument("--dry-run", action="store_true", help="Print schedule and exit.")
-    args = p.parse_args()
+    p.add_argument("--resume", action="store_true", help="Resume from the state file.")
+    p.add_argument("--dry-run", action="store_true", help="Run pre-flight (schedule + gates) and exit.")
+    args = p.parse_args(argv)
 
     if args.start and args.resume:
         print("--start and --resume are mutually exclusive", file=sys.stderr)
-        sys.exit(2)
+        return EXIT_USAGE
     if not (args.start or args.resume or args.dry_run):
         print("must specify --start, --resume, or --dry-run", file=sys.stderr)
-        sys.exit(2)
+        return EXIT_USAGE
 
     campaign_path = args.campaign_yaml.resolve()
-    campaign = yaml.safe_load(campaign_path.read_text())
-    # Repo root inferred as two levels up from campaigns/<id>/campaign.yaml.
-    repo_root = campaign_path.parent.parent.parent
-    runs_root = Path(campaign["runs_root"])
-    hf_cache_host = Path(campaign["paths"]["hf_cache_host"])
+    try:
+        campaign = load_campaign(campaign_path)
+        schedule = build_schedule(campaign, campaign_path)
+    except PreflightError as e:
+        print(f"[campaign] PREFLIGHT ERROR: {e}", file=sys.stderr)
+        return EXIT_PREFLIGHT
 
-    schedule = build_schedule(campaign, campaign_path)
-    sanity = build_sanity_runs(campaign, campaign_path)
+    state_path = (campaign_path.parent / campaign.get("state_file", "state/campaign_state.json")).resolve()
 
-    log(f"campaign_id: {campaign['campaign_id']}")
-    log(f"repo_root: {repo_root}")
-    log(f"runs_root: {runs_root}")
-    for slot_name, runs in schedule.items():
-        log(f"slot {slot_name}: {len(runs)} runs -> {[r.run_key for r in runs]}")
-    if sanity:
-        log(f"sanity runs: {[r.run_key + '_' + r.slot_name for r in sanity]}")
-
-    if args.dry_run:
-        return
-
-    state_path = (campaign_path.parent / campaign["state_file"]).resolve()
-    if args.start and state_path.exists():
+    # --start wipes prior state; --resume loads it; --dry-run neither writes nor deletes.
+    if args.start and state_path.exists() and not args.dry_run:
         log(f"--start: deleting existing state at {state_path}")
         state_path.unlink()
     if args.resume and not state_path.exists():
         log(f"--resume: no state file at {state_path}, starting fresh")
 
-    if state_path.exists():
+    if state_path.exists() and not args.start:
         state = State.from_dict(json.loads(state_path.read_text()))
-        log(f"loaded state, {sum(1 for s in state.runs.values() if s.status == 'completed')} runs already completed")
     else:
         state = State(campaign_id=campaign["campaign_id"])
 
-    state_lock = threading.Lock()
-    stop_event = threading.Event()
+    # Tee output to a durable log file (skip for --dry-run to avoid side effects).
+    if not args.dry_run:
+        log_path = setup_logfile(state_path)
+        log(f"campaign log: {log_path}")
 
-    # Build slot workers
-    workers: list[SlotWorker] = []
-    for slot_name, runs in schedule.items():
-        w = SlotWorker(
-            slot_name=slot_name,
-            runs=runs,
-            state=state,
-            state_lock=state_lock,
-            state_path=state_path,
-            campaign=campaign,
-            repo_root=repo_root,
-            runs_root=runs_root,
-            hf_cache_host=hf_cache_host,
-            stop_event=stop_event,
-        )
-        workers.append(w)
+    camp = Campaign(campaign, campaign_path, schedule, state, state_path)
 
-    # Signal handling: SIGTERM/SIGINT triggers stop_event and propagates to current launch_cell.
-    def handle(_sig, _frame):
-        log("signal received, requesting shutdown of all slots")
-        stop_event.set()
-        for w in workers:
-            w.interrupt()
+    try:
+        camp.preflight()
+    except PreflightError as e:
+        print(f"[campaign] PREFLIGHT ERROR: {e}", file=sys.stderr)
+        return EXIT_PREFLIGHT
 
-    signal.signal(signal.SIGTERM, handle)
-    signal.signal(signal.SIGINT, handle)
+    if args.dry_run:
+        log("--dry-run: pre-flight OK, exiting without running")
+        return EXIT_OK
 
-    # Start all slot workers
-    for w in workers:
-        w.start()
-        log(f"started slot worker {w.slot_name}")
-
-    # Wait for all slot workers to finish
-    for w in workers:
-        w.join()
-        log(f"slot {w.slot_name} done")
-
-    if stop_event.is_set():
-        log("orchestrator interrupted, sanity runs SKIPPED")
-        sys.exit(2)
-
-    # Dispatch sanity runs sequentially (single thread)
-    for spec in sanity:
-        log(f"sanity: {spec.run_key} on gpu {spec.gpu_device_override}")
-        existing = state.runs.get(spec.run_key)
-        if existing and existing.status == "completed":
-            log(f"sanity {spec.run_key} already completed, skipping")
-            continue
-        # Reuse slot worker logic for the sanity run on a one-off basis.
-        sanity_worker = SlotWorker(
-            slot_name=spec.slot_name,
-            runs=[spec],
-            state=state,
-            state_lock=state_lock,
-            state_path=state_path,
-            campaign=campaign,
-            repo_root=repo_root,
-            runs_root=runs_root,
-            hf_cache_host=hf_cache_host,
-            stop_event=stop_event,
-        )
-        sanity_worker.start()
-        sanity_worker.join()
-
-    log("campaign complete")
-    sys.exit(0)
+    camp.install_signal_handlers()
+    return camp.run()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
