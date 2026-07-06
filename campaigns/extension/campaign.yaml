@@ -64,10 +64,11 @@ allow_lower_bound_calibration: false
 
 # Retry policy: one automatic re-attempt (with --attempt incremented) on an
 # ordinary launch_cell failure, then the run is marked FAILED and the queue
-# moves on. launch_cell exit 7 (free-space gate), 8 (orphan gate), or 9
-# (run-slot lock) are NOT run failures -- they are host/precondition faults that
-# retrying cannot fix, so campaign.py stops the whole campaign loudly instead of
-# burning attempts.
+# moves on. launch_cell exit 6 (image-digest / run_dir precondition gate), 7
+# (free-space gate), 8 (orphan gate), or 9 (run-slot lock) -- the codes
+# launch_cell exports as NONRETRYABLE_EXIT_CODES -- are NOT run failures: they
+# are host/precondition faults that retrying cannot fix, so campaign.py stops
+# the whole campaign loudly instead of burning attempts.
 retry_policy:
   max_retries: 1
 

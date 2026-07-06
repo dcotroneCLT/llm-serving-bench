@@ -6,7 +6,7 @@ in the style of tests/test_phase_*.py. They cover:
   * scheduler ordering (round_robin / cell_at_a_time) and the serial-only guard
     (mode must be "serial"; a `slots:` key is rejected);
   * retry semantics: one automatic re-attempt then FAILED; launch_cell exit
-    7/8/9 are CAMPAIGN-FATAL, not run failures (no retry burned);
+    6/7/8/9 are CAMPAIGN-FATAL, not run failures (no retry burned);
   * resume from a partial state file (completed skipped, others re-queued);
   * signal forwarding to a mock child + state persisted + non-zero exit;
   * pre-flight calibration failure raised BEFORE any run starts.
@@ -222,29 +222,31 @@ class RetrySemantics(unittest.TestCase):
             # b never started -- campaign stopped on the fatal.
             self.assertNotIn("b_r01", c.state.runs)
 
-    def test_exit_6_pin_mismatch_is_campaign_fatal_no_retry(self):
-        # launch_cell exits 6 on an image digest pin mismatch, documented as a
-        # non-retryable precondition. Retrying pulls the same wrong image, so it
-        # must NOT burn a retry and must halt the campaign.
+    def test_exit_6_precondition_is_campaign_fatal_no_retry(self):
+        # launch_cell exits 6 on a non-retryable precondition gate (image digest
+        # mismatch OR non-fresh run_dir). Retrying cannot fix it, so it must NOT
+        # burn a retry and must halt the campaign. rc=6 is overloaded, so the
+        # persisted status is the honest "precondition_failed" (the specific gate
+        # message lives in the run's per-attempt child log), not "image_pin_*".
         with tempfile.TemporaryDirectory() as tmp:
             spec = make_spec("a")
             c = make_campaign(tmp, [spec])
-            launcher = ScriptedLauncher({"a_r01": [camp.LC_PIN_MISMATCH, 0]})
+            launcher = ScriptedLauncher({"a_r01": [camp.LC_PRECONDITION, 0]})
             c._launch_cell_rc = launcher
             with self.assertRaises(camp.CampaignFatal) as ctx:
                 c._run_with_retry(spec)
-            self.assertEqual(ctx.exception.rc, camp.LC_PIN_MISMATCH)
+            self.assertEqual(ctx.exception.rc, camp.LC_PRECONDITION)
             self.assertEqual(len(launcher.calls), 1)          # no retry burned
-            self.assertEqual(c.state.runs["a_r01"].status, "image_pin_mismatch")
+            self.assertEqual(c.state.runs["a_r01"].status, "precondition_failed")
 
     def test_run_loop_exit_6_halts_with_fatal_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             specs = [make_spec("a"), make_spec("b")]
             c = make_campaign(tmp, specs)
-            c._launch_cell_rc = ScriptedLauncher({"a_r01": [camp.LC_PIN_MISMATCH]})
+            c._launch_cell_rc = ScriptedLauncher({"a_r01": [camp.LC_PRECONDITION]})
             self.assertEqual(c.run(), camp.EXIT_CAMPAIGN_FATAL)
             self.assertNotIn("b_r01", c.state.runs)
-            self.assertEqual(c.state.runs["a_r01"].status, "image_pin_mismatch")
+            self.assertEqual(c.state.runs["a_r01"].status, "precondition_failed")
 
     def test_launch_cell_nonretryable_codes_are_all_campaign_fatal(self):
         # Cross-check the two tables so they cannot drift silently: every exit

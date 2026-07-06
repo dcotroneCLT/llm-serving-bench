@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import json
 import os
 import platform
@@ -1981,6 +1982,7 @@ def main() -> None:
     health_fail_streak = 0
     last_health_mono = started_mono
     last_disk_mono = started_mono
+    disk_csv_warned = False  # log a non-fatal disk_usage.csv write failure only once
     # Set to 7 by the mid-run disk watchdog so the run exits with the free-space
     # code the campaign treats as CAMPAIGN-FATAL (disk does not free itself, so a
     # retry would burn an attempt for nothing), overriding the generic rc=2.
@@ -2040,15 +2042,29 @@ def main() -> None:
 
             # Mid-run disk watchdog (~every DISK_CHECK_EVERY_S), independent of the
             # health cadence. Applies to BOTH lifecycles (the supervision loop is
-            # shared). Append a trend row, then abort if either filesystem breached
-            # the mid-run floor. exit 7 makes the campaign treat it as fatal.
+            # shared). exit 7 makes the campaign treat a breach as fatal.
             if now_mono - last_disk_mono >= DISK_CHECK_EVERY_S:
                 last_disk_mono = now_mono
-                append_disk_usage_row(
-                    run_dir / "disk_usage.csv",
-                    disk_usage_snapshot(args.runs_root, docker_root, run_dir, time.time()))
+                # Compute the breach verdict FIRST. The trend CSV is a side
+                # channel and must never mask or downgrade a disk-floor breach.
                 breach = disk_watchdog_reason(
                     args.runs_root, docker_root, args.min_free_gb_mid_run)
+                # Best-effort trend row. A full runs-root (ENOSPC) is itself
+                # breach evidence -- the exact scenario the watchdog exists for --
+                # so an ENOSPC write failure escalates even if the free_gb probe
+                # read nominally OK (reserved blocks / a race). Any other error
+                # (e.g. EACCES) is transient: warn ONCE and keep running.
+                try:
+                    append_disk_usage_row(
+                        run_dir / "disk_usage.csv",
+                        disk_usage_snapshot(args.runs_root, docker_root, run_dir, time.time()))
+                except OSError as e:
+                    if e.errno == errno.ENOSPC and breach is None:
+                        breach = (f"disk_floor: runs-root out of space -- "
+                                  f"disk_usage.csv write failed ENOSPC ({run_dir})")
+                    elif not disk_csv_warned:
+                        log(f"WARNING: could not write disk_usage.csv: {e!r} (continuing)")
+                        disk_csv_warned = True
                 if breach is not None:
                     log(f"FATAL: mid-run disk floor breached: {breach}; tearing down")
                     interrupted = True

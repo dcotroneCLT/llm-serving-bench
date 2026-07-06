@@ -42,11 +42,13 @@ Campaign yaml schema (see campaigns/extension/campaign.yaml):
 
 Retry policy (requirement 3):
   * launch_cell exit 0            -> completed.
-  * launch_cell exit 7 (free-space gate), 8 (orphan gate) or 9 (run-slot lock)
-    -> NOT a run failure. These are host/precondition fatals: a filesystem is
-    too full/undeterminable, or something else owns the host. Retrying cannot
-    fix them, so this is a CAMPAIGN-LEVEL FATAL -- stop the whole campaign
-    loudly (do NOT burn a retry) and exit non-zero.
+  * launch_cell exit 6 (image-digest / run_dir precondition gate), 7 (free-space
+    gate), 8 (orphan gate) or 9 (run-slot lock) -- the set launch_cell exports
+    as NONRETRYABLE_EXIT_CODES -> NOT a run failure. These are
+    host/precondition fatals: a precondition refused, a filesystem is too
+    full/undeterminable, or something else owns the host. Retrying cannot fix
+    them, so this is a CAMPAIGN-LEVEL FATAL -- stop the whole campaign loudly
+    (do NOT burn a retry) and exit non-zero.
   * any other non-zero exit      -> run failure. Re-attempt once (--attempt
     incremented), then mark failed and move on to the next run.
 
@@ -107,7 +109,7 @@ EXIT_OK = 0
 EXIT_USAGE = 2            # argparse-style usage error
 EXIT_PREFLIGHT = 3        # pre-flight failed (calibration/config/free space)
 EXIT_INTERRUPTED = 4      # stopped by a signal
-EXIT_CAMPAIGN_FATAL = 5   # a child reported a host/precondition fatal (7/8/9)
+EXIT_CAMPAIGN_FATAL = 5   # a child reported a non-retryable fatal (launch_cell.NONRETRYABLE_EXIT_CODES: 6/7/8/9)
 
 # launch_cell exit codes that are HOST/PRECONDITION fatals, not run failures:
 # retrying cannot fix them (something else owns the host, a filesystem is too
@@ -116,17 +118,18 @@ EXIT_CAMPAIGN_FATAL = 5   # a child reported a host/precondition fatal (7/8/9)
 # gates on review). These MUST stay in sync with launch_cell's own contract:
 # every code launch_cell.NONRETRYABLE_EXIT_CODES lists is enforced fatal here
 # (cross-checked by test_launch_cell_nonretryable_codes_are_all_campaign_fatal).
-LC_PIN_MISMATCH = 6       # image digest pin mismatch / run_dir not fresh (precondition gate)
+LC_PRECONDITION = 6       # non-retryable precondition gate: image digest mismatch OR run_dir not fresh
 LC_FREE_SPACE = 7         # free-space gate (runs-root or docker data-root)
 LC_ORPHAN_GATE = 8        # pre-run reaper / host-wide reaper: unkillable orphan
 LC_SLOT_LOCKED = 9        # run-slot flock held by another launcher
 
 # rc -> (persisted status, human reason). host_conflict = another launcher/orphan
 # owns the host; insufficient_space = a filesystem gate refused the start;
-# image_pin_mismatch = the local image does not match the pinned digest, so the
-# run would be unreproducible (retrying pulls the same wrong image).
+# precondition_failed = a pre-run precondition gate refused (exit 6 is raised by
+# BOTH the image-digest-mismatch and the non-fresh-run_dir checks, so the status
+# stays honest and the per-attempt child log carries the specific message).
 FATAL_STATUS: dict[int, tuple[str, str]] = {
-    LC_PIN_MISMATCH: ("image_pin_mismatch", "image digest pin mismatch (or run_dir not fresh): launch_cell precondition gate at exit 6"),
+    LC_PRECONDITION: ("precondition_failed", "non-retryable precondition: image digest pin mismatch or run_dir not fresh -- see the run's per-attempt child log for the specific gate message"),
     LC_FREE_SPACE: ("insufficient_space", "free-space gate (runs-root or docker data-root too full / undeterminable)"),
     LC_ORPHAN_GATE: ("host_conflict", "orphan gate: a prior run is still active or has an unkillable orphan"),
     LC_SLOT_LOCKED: ("host_conflict", "run-slot lock held by another launcher"),
@@ -323,7 +326,7 @@ class State:
 
 
 class CampaignFatal(Exception):
-    """A child reported a host/precondition fatal (launch_cell exit 7/8/9), or
+    """A child reported a non-retryable fatal (launch_cell exit 6/7/8/9), or
     the campaign found an active run_dir it must not clobber. The whole campaign
     stops."""
 
@@ -703,7 +706,7 @@ class Campaign:
 
     def _run_with_retry(self, spec: RunSpec) -> str:
         """Run one spec under the retry policy. Returns 'completed' or 'failed'.
-        Raises CampaignFatal on a host/precondition exit (7/8/9) or a pre-child
+        Raises CampaignFatal on a non-retryable exit (6/7/8/9) or a pre-child
         active-run detection; CampaignInterrupted on signal."""
         session_attempts = 0
         while True:

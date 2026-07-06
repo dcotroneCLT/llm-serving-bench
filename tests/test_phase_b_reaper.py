@@ -8,6 +8,7 @@ on both the clean and the abort teardown), plus an attach_run regression.
 
 Run: python3 -m unittest tests.test_phase_b_reaper
 """
+import errno
 import json
 import multiprocessing as mp
 import sys
@@ -149,9 +150,11 @@ class LaunchCellWiring(unittest.TestCase):
     def _run_main(self, tmp: Path, client_poll, mono_step, duration_s,
                   ledger_stuck=None, teardown_raises=False, record_raises=None,
                   disk_free_gb=None, disk_check_every=None,
-                  health_reason=None, health_every=None):
+                  health_reason=None, health_every=None, append_error=None):
         events: list[str] = []
+        logs: list[str] = []
         run_dir = tmp / "runs" / "test_e1_r01"
+        real_append = lc.append_disk_usage_row  # capture before patching
 
         # Mock lifecycle: only the seams main() calls.
         lf = mock.MagicMock()
@@ -222,11 +225,13 @@ class LaunchCellWiring(unittest.TestCase):
                  spawn_monitors=mock.DEFAULT, materialize_client_config=mock.DEFAULT,
                  spawn_client=mock.DEFAULT, summarize_client_csvs=mock.DEFAULT,
                  stop_subprocess=mock.DEFAULT, reaper=reaper_mock, free_gb=mock.DEFAULT,
+                 append_disk_usage_row=mock.DEFAULT,
              ) as m, \
              mock.patch.object(lc, "DISK_CHECK_EVERY_S",
                                disk_check_every if disk_check_every is not None else lc.DISK_CHECK_EVERY_S), \
              mock.patch.object(lc, "HEALTH_CHECK_EVERY_S",
                                health_every if health_every is not None else lc.HEALTH_CHECK_EVERY_S), \
+             mock.patch.object(lc, "log", lambda msg: logs.append(msg)), \
              mock.patch.object(lc.time, "sleep", lambda *_: None), \
              mock.patch.object(lc.time, "monotonic", fake_monotonic), \
              mock.patch.object(lc.time, "time", lambda: 1000.0):
@@ -235,6 +240,11 @@ class LaunchCellWiring(unittest.TestCase):
             # Free space seen by the mid-run watchdog + the disk_usage.csv row.
             # Default is comfortably above the floor so existing tests are healthy.
             m["free_gb"].return_value = disk_free_gb if disk_free_gb is not None else 500.0
+            # Trend-CSV append: raise the injected error, else use the real writer.
+            if append_error is not None:
+                m["append_disk_usage_row"].side_effect = append_error
+            else:
+                m["append_disk_usage_row"].side_effect = real_append
             m["load_image_pin"].return_value = {"image_tag": "img:tag", "digest": "sha256:d",
                                                 "source_tag": "s", "pinned_at": "2026"}
             m["verify_image_digest"].return_value = None
@@ -253,7 +263,7 @@ class LaunchCellWiring(unittest.TestCase):
         manifest_path = run_dir / "manifest.json"
         manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
         return {"events": events, "exit_code": exit_code["code"], "run_dir": run_dir,
-                "stops": stops, "manifest": manifest}
+                "stops": stops, "manifest": manifest, "logs": logs}
 
     def test_clean_teardown_wiring_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -330,6 +340,41 @@ class LaunchCellWiring(unittest.TestCase):
         self.assertEqual(r["exit_code"], 2)
         self.assertTrue(r["manifest"]["interrupted_early"])
         self.assertTrue(r["manifest"]["interruption_reason"].startswith("health:"))
+
+    def test_disk_csv_append_failure_does_not_mask_a_breach(self):
+        # FIX 1(a): the trend-CSV append is a side channel. Even if it raises,
+        # a genuine floor breach must still exit 7 with the breach reason.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=100000, disk_free_gb=1.0, disk_check_every=0,
+                               append_error=OSError("boom"))
+            self.assertEqual(r["exit_code"], 7)
+            self.assertTrue(r["manifest"]["interrupted_early"])
+            self.assertTrue(r["manifest"]["interruption_reason"].startswith("disk_floor"))
+            self.assertIn("deregister", r["events"])
+
+    def test_disk_csv_append_enospc_is_treated_as_breach(self):
+        # FIX 1(b): an ENOSPC write failure IS breach evidence (runs-root full),
+        # even when the free_gb probe read nominally OK -> exit 7.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=100000, disk_free_gb=500.0, disk_check_every=0,
+                               append_error=OSError(errno.ENOSPC, "No space left on device"))
+            self.assertEqual(r["exit_code"], 7)
+            self.assertTrue(r["manifest"]["interrupted_early"])
+            self.assertIn("ENOSPC", r["manifest"]["interruption_reason"])
+
+    def test_disk_csv_transient_append_error_warns_once_and_continues(self):
+        # FIX 1(c): a transient write error (EACCES) with the floor OK does not
+        # abort the run and is logged ONCE (no per-check spam over a 48h run).
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=20, disk_free_gb=500.0, disk_check_every=0,
+                               append_error=OSError(errno.EACCES, "Permission denied"))
+            self.assertEqual(r["exit_code"], 0)  # ran to the duration deadline
+            self.assertNotIn("interruption_reason", r["manifest"])
+            warnings = [m for m in r["logs"] if "could not write disk_usage.csv" in m]
+            self.assertEqual(len(warnings), 1)  # warn-once, not per-check
 
     def test_reap_gate_fatal_refuses_to_start(self):
         # R1-4: an unkillable recorded orphan (ledger entry survives reap) is
