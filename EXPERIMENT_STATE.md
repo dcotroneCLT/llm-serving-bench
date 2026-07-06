@@ -54,12 +54,40 @@ heartbeats/multi-slot support (campaign is strictly serial by design); full
 cgroup identity validation (leader create_time anchor suffices given runtime
 health checks).
 
-**NEXT STEP (resume here):** PHASE B item 3 -- serialize `campaign.py`
-(strictly serial scheduling on the launch_cell production path, no parallel
-slots) -> item 5 mid-run disk watchdog -> LONG TEST on the production path.
-Reviews are CLOSED for the long test; further findings go to the pre-campaign
-backlog. Also pending: manifest `interruption_reason` micro-fix (prompt
-already drafted), NTP slew evidence from the box.
+**PHASE B item 3 (serial campaign.py) DONE and box-validated (2026-07-06).**
+Rewritten as a strictly serial scheduler (yaml cannot express parallelism:
+`mode: serial` required, `slots:` rejected), launch_cell subprocess dispatch
+with inter-run cooldown, atomic resumable state file, exit codes (0 ok / 3
+pre-flight / 4 interrupted / 5 campaign-fatal), lock/orphan exits 8-9 treated
+as campaign-fatal (host conflict, no retry burned), per-cell calibration as a
+pre-flight gate, campaign log + per-attempt child log capture streamed to the
+terminal (`state/logs/<run_id>_attempt<N>.log`). Mini-campaign on the box
+(val_vllm + val_dynamo_disagg through the production path): both COMPLETED,
+including a REAL retry: attempt 1 of the dynamo cell died with
+`FATAL: endpoint dead -- 68 client rows in last 300s with zero status=ok`
+(R1-1 all-fail window firing on a genuine SUT pathology, see below), the
+campaign retried, attempt 2 completed clean. Recovery path validated on
+hardware.
+
+**SUT phenomenology worth remembering (2026-07-06, val cell, 25-min run):**
+the Dynamo disaggregated stack entered a KV-transfer stall mid-run: NIXL
+prefill->decode transfer times of 140-148 s (vs ~28 ms post time), 55-64
+requests stuck deferred, generation throughput repeatedly at 0 tok/s,
+requests hanging 180+ s, zero client-side successes for 5+ minutes, engine
+containers still "Up" and /v1/models still serving. Transient (retry ran
+clean), but this is exactly the class of degradation the DoW prefix-repeat
+factor will stress for 48h. If it recurs at non-trivial rates, 48h runs will
+burn whole retry budgets; keep an eye on per-cell attempt budgeting.
+
+**NEXT STEP (resume here):** PHASE B item 5 -- mid-run disk watchdog on the
+launch_cell supervision path (runs-root + real DockerRootDir, graceful
+teardown below floor, campaign-fatal semantics) -> LONG TEST on the
+production path. Reviews are CLOSED for the long test; further findings go
+to the pre-campaign backlog. Residual small items: manifest
+`interruption_reason` micro-fix (prompt drafted, not yet run), NTP slew
+evidence from the box (chrony absent; need `timedatectl`), campaign Ctrl-C
+interrupt+resume never manually exercised on the box (covered by synthetic
+SIGTERM test + the real retry; will be exercised in the long-test dry run).
 
 ---
 
