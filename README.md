@@ -82,9 +82,6 @@ checkpoints state after each run, and retries an ordinary failure once.
 
 ## Analysis
 
-Pilot figures still run with no arguments. Production analysis should
-point at the campaign descriptor and the run root:
-
 Install the analysis dependencies first if your Python environment does
 not already have them:
 
@@ -92,12 +89,54 @@ not already have them:
 python3 -m pip install -r analysis/requirements.txt
 ```
 
+Pilot figures still run with no arguments. Production analysis points at a
+campaign descriptor (or a specific run directory) and the run root.
+
+### Active campaign (extension)
+
+Per-run integrity checks. `validation_check.py` is for single-process cells
+(e.g. `val_vllm`); a multi-process / Dynamo cell (`val_dynamo_disagg`) has an
+aggregate proc series and must use the extension validator, which the
+single-process checker also redirects to:
+
+```bash
+python3 analysis/validation_check.py --run-dir /home/dcotrone/wosar/runs/extension_dow_val_vllm_r01
+python3 analysis/validate_extension_run.py --run-dir /home/dcotrone/wosar/runs/extension_dow_val_dynamo_disagg_r01
+```
+
+Cell-agnostic per-run trend / step analyses work directly on any run dir:
+
+```bash
+python3 analysis/aging_trends.py /home/dcotrone/wosar/runs/extension_dow_val_vllm_r01 --alpha 0.10 --downsample-seconds 60
+python3 analysis/stepness.py --logs-root /home/dcotrone/wosar/runs
+```
+
+The campaign-aware plotters accept `--campaign-yaml`; pass extension cell ids
+explicitly (their built-in defaults such as `--cells a1,e2` and
+`--lockstep-cell e2` refer to retired baseline cells that do not exist in the
+extension campaign):
+
+```bash
+python3 analysis/plot_rss_2x2.py --campaign-yaml campaigns/extension/campaign.yaml --runs-root /home/dcotrone/wosar/runs --cells val_vllm --replicas all
+python3 analysis/diagnose_step_patterns.py --campaign-yaml campaigns/extension/campaign.yaml --runs-root /home/dcotrone/wosar/runs --cells val_vllm --replicas all
+```
+
+Note: `plot_rss_2x2` / `plot_rss_combined` were designed to overlay the six
+baseline cells; they run on the extension campaign but their multi-cell /
+lockstep framing (`--lockstep-cell`) is baseline-oriented, so on the two
+current validation cells the single-panel overlay is the useful output.
+
+### Baseline (n=3, retired)
+
+These reproduce the completed n=3 WoSAR 2026 study from its archived runs
+under `campaigns/wosar2026/`. Kept for provenance; the descriptor is not
+launchable by the current serial orchestrator (see Legacy note above).
+
 ```bash
 python3 analysis/plot_rss_2x2.py --campaign-yaml campaigns/wosar2026/campaign.yaml --runs-root /home/dcotrone/wosar/runs --replicas all
 python3 analysis/plot_rss_combined.py --campaign-yaml campaigns/wosar2026/campaign.yaml --runs-root /home/dcotrone/wosar/runs --replicas 1
 python3 analysis/diagnose_step_patterns.py --campaign-yaml campaigns/wosar2026/campaign.yaml --runs-root /home/dcotrone/wosar/runs --cells a1,e2 --replicas all
 python3 analysis/aging_trends.py /home/dcotrone/wosar/runs/wosar2026_e1_r01 --alpha 0.10 --downsample-seconds 60
-python3 analysis/stepness.py --logs-root /home/dcotrone/wosar/runs
 ```
 
 See `analysis/README.md` for the full analysis pipeline.
