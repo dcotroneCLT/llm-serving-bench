@@ -140,6 +140,19 @@ def die(msg: str, rc: int = 1) -> None:
     sys.exit(rc)
 
 
+# Exit codes that are NON-RETRYABLE host/precondition faults: retrying cannot
+# fix them, so the campaign scheduler must treat them as CAMPAIGN-FATAL rather
+# than burn a retry and move on. This is the source of truth for that contract;
+# scripts/campaign.py FATAL_STATUS must cover every code listed here (enforced
+# by tests/test_phase_b_campaign.py). Keep the two in sync when adding a gate.
+#   6 = image digest pin mismatch (verify_image_digest) / run_dir not fresh
+#       (assert_run_dir_fresh) -- both refuse before the run and recur on retry
+#   7 = free-space gate (require_free_space)
+#   8 = orphan gate (reaper: a prior run still active / unkillable orphan)
+#   9 = run-slot lock held by another launcher
+NONRETRYABLE_EXIT_CODES = frozenset({6, 7, 8, 9})
+
+
 def free_gb(path: Path) -> Optional[float]:
     """Free GiB at `path`, or None if it cannot be stat'd. NEVER returns inf:
     fabricating 'infinite free space' on error would make a disk gate pass when

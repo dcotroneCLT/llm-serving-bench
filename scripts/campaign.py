@@ -110,16 +110,23 @@ EXIT_INTERRUPTED = 4      # stopped by a signal
 EXIT_CAMPAIGN_FATAL = 5   # a child reported a host/precondition fatal (7/8/9)
 
 # launch_cell exit codes that are HOST/PRECONDITION fatals, not run failures:
-# retrying cannot fix them (something else owns the host, or a filesystem is
-# too full / undeterminable). They stop the campaign loudly instead of burning
-# retries (requirement 3, extended to the precondition gate on review).
+# retrying cannot fix them (something else owns the host, a filesystem is too
+# full / undeterminable, or the pinned image is wrong). They stop the campaign
+# loudly instead of burning retries (requirement 3, extended to the precondition
+# gates on review). These MUST stay in sync with launch_cell's own contract:
+# every code launch_cell.NONRETRYABLE_EXIT_CODES lists is enforced fatal here
+# (cross-checked by test_launch_cell_nonretryable_codes_are_all_campaign_fatal).
+LC_PIN_MISMATCH = 6       # image digest pin mismatch / run_dir not fresh (precondition gate)
 LC_FREE_SPACE = 7         # free-space gate (runs-root or docker data-root)
 LC_ORPHAN_GATE = 8        # pre-run reaper / host-wide reaper: unkillable orphan
 LC_SLOT_LOCKED = 9        # run-slot flock held by another launcher
 
 # rc -> (persisted status, human reason). host_conflict = another launcher/orphan
-# owns the host; insufficient_space = a filesystem gate refused the start.
+# owns the host; insufficient_space = a filesystem gate refused the start;
+# image_pin_mismatch = the local image does not match the pinned digest, so the
+# run would be unreproducible (retrying pulls the same wrong image).
 FATAL_STATUS: dict[int, tuple[str, str]] = {
+    LC_PIN_MISMATCH: ("image_pin_mismatch", "image digest pin mismatch (or run_dir not fresh): launch_cell precondition gate at exit 6"),
     LC_FREE_SPACE: ("insufficient_space", "free-space gate (runs-root or docker data-root too full / undeterminable)"),
     LC_ORPHAN_GATE: ("host_conflict", "orphan gate: a prior run is still active or has an unkillable orphan"),
     LC_SLOT_LOCKED: ("host_conflict", "run-slot lock held by another launcher"),

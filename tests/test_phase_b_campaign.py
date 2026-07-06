@@ -222,6 +222,39 @@ class RetrySemantics(unittest.TestCase):
             # b never started -- campaign stopped on the fatal.
             self.assertNotIn("b_r01", c.state.runs)
 
+    def test_exit_6_pin_mismatch_is_campaign_fatal_no_retry(self):
+        # launch_cell exits 6 on an image digest pin mismatch, documented as a
+        # non-retryable precondition. Retrying pulls the same wrong image, so it
+        # must NOT burn a retry and must halt the campaign.
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = make_spec("a")
+            c = make_campaign(tmp, [spec])
+            launcher = ScriptedLauncher({"a_r01": [camp.LC_PIN_MISMATCH, 0]})
+            c._launch_cell_rc = launcher
+            with self.assertRaises(camp.CampaignFatal) as ctx:
+                c._run_with_retry(spec)
+            self.assertEqual(ctx.exception.rc, camp.LC_PIN_MISMATCH)
+            self.assertEqual(len(launcher.calls), 1)          # no retry burned
+            self.assertEqual(c.state.runs["a_r01"].status, "image_pin_mismatch")
+
+    def test_run_loop_exit_6_halts_with_fatal_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            specs = [make_spec("a"), make_spec("b")]
+            c = make_campaign(tmp, specs)
+            c._launch_cell_rc = ScriptedLauncher({"a_r01": [camp.LC_PIN_MISMATCH]})
+            self.assertEqual(c.run(), camp.EXIT_CAMPAIGN_FATAL)
+            self.assertNotIn("b_r01", c.state.runs)
+            self.assertEqual(c.state.runs["a_r01"].status, "image_pin_mismatch")
+
+    def test_launch_cell_nonretryable_codes_are_all_campaign_fatal(self):
+        # Cross-check the two tables so they cannot drift silently: every exit
+        # code launch_cell declares non-retryable must be campaign-fatal.
+        import launch_cell as lc
+        missing = set(lc.NONRETRYABLE_EXIT_CODES) - set(camp.FATAL_CODES)
+        self.assertEqual(
+            missing, set(),
+            f"launch_cell non-retryable codes not in campaign FATAL_STATUS: {missing}")
+
 
 # --------------------------------------------------------------------------
 # Ordering + cooldown through the run loop
