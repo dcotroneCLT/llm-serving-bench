@@ -305,6 +305,38 @@ def specs_from_run_dirs(run_dirs: Sequence[Path], warmup_s: Optional[float] = No
     return [spec_from_run_dir(path, i, warmup_s=warmup_s) for i, path in enumerate(run_dirs)]
 
 
+def normalize_campaign_cells(campaign: dict) -> list[dict]:
+    """Normalize campaign['cells'] to a list of {'id': Optional[str], 'yaml': str}.
+
+    Mirrors scripts/campaign.py build_schedule: an entry is either a bare cell
+    yaml path (legacy string form) or an object {id, yaml, ...} (the extension
+    campaign form). Assuming the string form -- as the old code did -- throws a
+    TypeError on the extension campaign's object entries."""
+    out: list[dict] = []
+    for raw in campaign["cells"]:
+        entry = {"yaml": raw} if isinstance(raw, str) else dict(raw)
+        if not entry.get("yaml"):
+            raise ValueError(f"campaign cell entry has no 'yaml': {raw!r}")
+        out.append({"id": entry.get("id"), "yaml": str(entry["yaml"])})
+    return out
+
+
+def proc_prefix_from_cell_doc(cell_doc: dict) -> Optional[str]:
+    """Analysis-side mirror of launch_cell.proc_prefix_for_cell: multi-process
+    cells (monitors.components) aggregate as agg_<engine_group>; single-process
+    cells use monitors.proc.label. Used only as a FALLBACK -- the authoritative
+    per-run value is manifest.proc_prefix, recorded by launch_cell."""
+    monitors = cell_doc.get("monitors")
+    if isinstance(monitors, dict):
+        components = monitors.get("components")
+        if isinstance(components, dict) and components:
+            return f"agg_{components.get('engine_group', 'engine')}"
+        proc = monitors.get("proc")
+        if isinstance(proc, dict) and proc.get("label"):
+            return str(proc["label"])
+    return None
+
+
 def specs_from_campaign(
     campaign_yaml: Path,
     runs_root: Optional[Path] = None,
@@ -316,16 +348,20 @@ def specs_from_campaign(
     campaign = load_yaml_minimal(campaign_yaml, kind="campaign")
     campaign_id = campaign.get("campaign_id", campaign_yaml.parent.name)
     root = (runs_root or Path(campaign["runs_root"])).expanduser()
-    cell_paths = [campaign_yaml.parent / rel for rel in campaign["cells"]]
+    entries = normalize_campaign_cells(campaign)
     replicas_per_cell = int(campaign.get("replicas_per_cell", 1))
 
     specs: list[RunSpec] = []
-    for cell_path in cell_paths:
+    for entry in entries:
+        cell_path = campaign_yaml.parent / entry["yaml"]
         cell = load_yaml_minimal(cell_path, kind="cell")
-        cell_id = str(cell["cell_id"]).lower()
+        cell_id = str(entry["id"] or cell["cell_id"]).lower()
         if cells is not None and cell_id not in cells:
             continue
-        proc_prefix = str(cell["monitors"]["proc"]["label"])
+        # Fallback proc prefix from the cell yaml (agg_<group> for multi-process
+        # cells like dynamo_disagg); the authoritative source is the per-run
+        # manifest, read inside the replica loop.
+        cell_proc_prefix = proc_prefix_from_cell_doc(cell)
         cell_warmup = warmup_s if warmup_s is not None else float(cell.get("warmup_discard_s", DEFAULT_WARMUP_S))
         color, linestyle = style_for_cell(cell_id, len(specs))
         for rep in range(1, replicas_per_cell + 1):
@@ -333,12 +369,16 @@ def specs_from_campaign(
             if replicas is not None and rep_s not in replicas and str(rep) not in replicas:
                 continue
             run_id = f"{campaign_id}_{cell_id}_r{rep_s}"
+            run_dir = root / run_id
+            # Prefer what launch_cell actually recorded for THIS run (handles
+            # multi-process agg_<group>); fall back to the cell-yaml derivation.
+            proc_prefix = discover_proc_prefix(run_dir, load_manifest(run_dir)) or cell_proc_prefix
             specs.append(
                 RunSpec(
                     id=f"{cell_id.upper()} r{rep_s}",
-                    run_dir=root / run_id,
+                    run_dir=run_dir,
                     proc_prefix=proc_prefix,
-                    label=label_for_run(cell_id, rep_s, root / run_id),
+                    label=label_for_run(cell_id, rep_s, run_dir),
                     color=color,
                     linestyle=linestyle,
                     warmup_s=cell_warmup,
@@ -378,18 +418,36 @@ def scalar_value(text: str) -> str:
 def parse_campaign_yaml_minimal(path: Path) -> dict:
     data: dict = {"cells": []}
     in_cells = False
+    current: Optional[dict] = None  # the object-style cell entry being filled
     for raw in path.read_text().splitlines():
         line = raw.rstrip()
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        # A new top-level key ends the cells block.
         if re.match(r"^[A-Za-z_][A-Za-z0-9_]*:", line):
             in_cells = False
+            current = None
         if stripped == "cells:":
             in_cells = True
+            current = None
             continue
         if in_cells and stripped.startswith("- "):
-            data["cells"].append(scalar_value(stripped[2:]))
+            body = stripped[2:].strip()
+            if ":" in body:
+                # Object entry, e.g. "- id: val_vllm" (extension campaign form).
+                k, v = body.split(":", 1)
+                current = {k.strip(): scalar_value(v)}
+                data["cells"].append(current)
+            else:
+                # Bare yaml path string (legacy form).
+                data["cells"].append(scalar_value(body))
+                current = None
+            continue
+        if in_cells and current is not None and ":" in stripped:
+            # Continuation key of the current object entry (yaml:, calibration_*).
+            k, v = stripped.split(":", 1)
+            current[k.strip()] = scalar_value(v)
             continue
         for key in ("campaign_id", "runs_root", "replicas_per_cell"):
             if stripped.startswith(f"{key}:"):

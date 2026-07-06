@@ -1,0 +1,14 @@
+# Development / test dependencies.
+#
+# Enough to run the full test suite and exercise scripts/ off-box (no GPU,
+# no docker): `python3 -m unittest discover -s tests`. The test modules import
+# scripts/, client/, and analysis/ modules, which pull in the runtime and
+# analysis third-party packages below.
+
+# Runtime (scripts/, client/, monitoring/)
+PyYAML>=6.0        # campaign / cell yaml parsing (scripts/campaign.py, launch_cell.py)
+psutil>=5.9        # process/orphan management (scripts/reaper.py, monitoring/)
+httpx>=0.24        # async benchmarking client (client/)
+
+# Analysis (analysis/) -- also imported by tests/test_aging_io.py
+-r analysis/requirements.txt

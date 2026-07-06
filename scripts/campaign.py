@@ -900,6 +900,19 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if state_path.exists() and not args.start:
         state = State.from_dict(json.loads(state_path.read_text()))
+        # Refuse to resume a state file that belongs to a DIFFERENT campaign:
+        # the state_file path can be shared/misconfigured, and silently mixing
+        # run provenance across campaigns corrupts the checkpoint. --start is
+        # the explicit escape hatch (it wipes the state above).
+        if state.campaign_id != campaign["campaign_id"]:
+            print(
+                f"[campaign] PREFLIGHT ERROR: state at {state_path} belongs to "
+                f"campaign {state.campaign_id!r}, not {campaign['campaign_id']!r}. "
+                "Point --campaign-yaml at the matching campaign, use a distinct "
+                "state_file, or pass --start to wipe and begin fresh.",
+                file=sys.stderr,
+            )
+            return EXIT_PREFLIGHT
     else:
         state = State(campaign_id=campaign["campaign_id"])
 

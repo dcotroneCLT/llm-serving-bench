@@ -2,8 +2,10 @@
 Run: python3 -m unittest tests.test_phase_a_calibration
 """
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
@@ -61,6 +63,33 @@ class ResolveCalibratedRate(unittest.TestCase):
     def test_missing_rate_refused_even_with_override(self):
         with self.assertRaises(lc.CalibrationError):
             lc.resolve_calibrated_rate({"status": "ok", "rate_calibrated_rps": None}, True)
+
+
+class StaleSweepGuard(unittest.TestCase):
+    """F3: a rate subdir with a prior sweep's CSVs must not be silently reused
+    (window_stats_from_csvs reads every requests_*.csv in it)."""
+
+    def test_refuses_reuse_with_stale_csvs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = Path(tmp) / "rate_5.0"
+            sub.mkdir()
+            (sub / "requests_000000.csv").write_text("status\nok\n")
+            with self.assertRaises(cr.StaleSweepDir):
+                cr.run_one_rate(Path(tmp), Path("cfg"), "http://x", "proto",
+                                "model", 5.0, 30, 64, sub)
+
+    def test_clean_subdir_runs_and_records_ratio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = Path(tmp) / "rate_5.0"  # does not exist yet
+            with mock.patch.object(cr.subprocess, "run") as mrun, \
+                 mock.patch.object(cr, "window_stats_from_csvs",
+                                   return_value={"achieved_rps": 4.5}):
+                stats = cr.run_one_rate(Path(tmp), Path("cfg"), "http://x",
+                                        "proto", "model", 5.0, 30, 64, sub)
+            mrun.assert_called_once()
+            self.assertTrue(sub.exists())
+            self.assertEqual(stats["offered_rate"], 5.0)
+            self.assertAlmostEqual(stats["achieved_ratio"], 0.9)
 
 
 if __name__ == "__main__":

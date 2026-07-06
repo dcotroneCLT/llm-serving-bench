@@ -642,5 +642,85 @@ class ReviewFixes(unittest.TestCase):
             self.assertEqual(on_disk["runs"]["a_r01"]["status"], "host_conflict")
 
 
+# --------------------------------------------------------------------------
+# main() guards: resume campaign_id match (F7) + documented paths (F1)
+# --------------------------------------------------------------------------
+
+
+class MainGuards(unittest.TestCase):
+    def _write_serial_campaign(self, tmp, campaign_id="testc"):
+        tmp = Path(tmp)
+        (tmp / "cells").mkdir(parents=True, exist_ok=True)
+        (tmp / "cells" / "a.yaml").write_text("cell_id: a\nduration_s: 100\n")
+        y = tmp / "campaign.yaml"
+        y.write_text(
+            f"campaign_id: {campaign_id}\n"
+            "mode: serial\n"
+            f"runs_root: {tmp / 'runs'}\n"
+            "replicas_per_cell: 1\n"
+            "min_free_gb: 0.0\n"
+            "paths:\n"
+            f"  hf_cache_host: {tmp / 'hf'}\n"
+            f"  repo_root: {tmp / 'repo'}\n"
+            "cells:\n"
+            "  - id: a\n    yaml: cells/a.yaml\n"
+        )
+        return y
+
+    def test_resume_wrong_campaign_id_refused(self):
+        # F7: a state file from another campaign must not be silently resumed.
+        with tempfile.TemporaryDirectory() as tmp:
+            y = self._write_serial_campaign(tmp, campaign_id="testc")
+            state_path = Path(tmp) / "state" / "campaign_state.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(
+                camp.State(campaign_id="OTHER").to_dict()))
+            rc = camp.main(["--campaign-yaml", str(y), "--resume"])
+            self.assertEqual(rc, camp.EXIT_PREFLIGHT)
+            # State on disk is untouched (not wiped, not overwritten).
+            self.assertEqual(
+                json.loads(state_path.read_text())["campaign_id"], "OTHER")
+
+    def test_start_overrides_wrong_campaign_id(self):
+        # --start is the explicit escape hatch: it wipes the mismatched state.
+        with tempfile.TemporaryDirectory() as tmp:
+            y = self._write_serial_campaign(tmp, campaign_id="testc")
+            state_path = Path(tmp) / "state" / "campaign_state.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(
+                camp.State(campaign_id="OTHER").to_dict()))
+            # --start + --dry-run: wipes state, runs preflight, exits OK without
+            # the campaign_id guard tripping.
+            rc = camp.main(["--campaign-yaml", str(y), "--start", "--dry-run"])
+            self.assertEqual(rc, camp.EXIT_OK)
+
+    def test_dry_run_of_documented_command(self):
+        # F1: the documented `--dry-run` invocation must actually work on a
+        # serial campaign (regression against README/orchestrator drift).
+        with tempfile.TemporaryDirectory() as tmp:
+            y = self._write_serial_campaign(tmp)
+            rc = camp.main(["--campaign-yaml", str(y), "--dry-run"])
+            self.assertEqual(rc, camp.EXIT_OK)
+
+    def test_canonical_extension_campaign_loads(self):
+        # F1: the campaign the README points operators at must load under the
+        # current strictly-serial orchestrator (mode: serial, no slots:).
+        canonical = REPO / "campaigns" / "extension" / "campaign.yaml"
+        if not canonical.exists():
+            self.skipTest("canonical extension campaign not present")
+        campaign = camp.load_campaign(canonical)
+        sched = camp.build_schedule(campaign, canonical)
+        self.assertTrue(sched)  # non-empty ordered queue
+
+    def test_legacy_parallel_campaign_is_rejected(self):
+        # The retired parallel campaign (if still on disk) must be rejected, so
+        # nobody launches it by accident against the serial orchestrator.
+        legacy = REPO / "campaigns" / "wosar2026" / "campaign.yaml"
+        if not legacy.exists():
+            self.skipTest("legacy campaign already removed")
+        with self.assertRaises(camp.PreflightError):
+            camp.load_campaign(legacy)
+
+
 if __name__ == "__main__":
     unittest.main()

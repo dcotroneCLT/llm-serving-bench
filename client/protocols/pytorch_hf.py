@@ -10,8 +10,12 @@ The PyTorch+HF naive engine in this project exposes:
     request body:  {"prompt": str, "max_tokens": int, "stream": bool}
     non-streaming response:
       {"text": str, "prompt_tokens": int, "completion_tokens": int}
-    streaming response: SSE with "data: {token text}" lines, terminated by
-                       "data: [DONE]" and a final usage frame "data: {...}".
+    streaming response: SSE where every frame is JSON (engine streaming.py):
+      data: {"text": "..."}                              # one+ text chunks
+      data: {"prompt_tokens": N, "completion_tokens": M}  # final usage frame
+      data: [DONE]                                        # sentinel
+    The text-then-usage-then-[DONE] order matters: TTFT is stamped on the
+    first non-empty TEXT frame, never on the usage/sentinel frames.
 
 This adapter intentionally uses the same data shape as a stripped-down
 OpenAI completions API to keep the three adapters comparable. The HF
@@ -77,16 +81,23 @@ class PyTorchHFAdapter(ProtocolAdapter):
                         if not line or not line.startswith("data:"):
                             continue
                         data = line[len("data:"):].strip()
-                        if data == "[DONE]":
+                        if not data or data == "[DONE]":
                             continue
-                        if result.first_token_at_unix is None:
-                            result.stamp("first_token")
+                        # Parse BEFORE stamping: a usage / empty / malformed
+                        # frame arriving first must not be mistaken for the
+                        # first token, which would corrupt TTFT.
                         try:
                             obj = json.loads(data)
                         except json.JSONDecodeError:
                             continue
+                        if not isinstance(obj, dict):
+                            continue
                         if "prompt_tokens" in obj or "completion_tokens" in obj:
                             last_usage = obj
+                            continue
+                        # Text chunk: stamp TTFT on the FIRST non-empty text.
+                        if obj.get("text") and result.first_token_at_unix is None:
+                            result.stamp("first_token")
                     result.stamp("finished")
                     result.actual_input_tokens = last_usage.get("prompt_tokens")
                     result.actual_output_tokens = last_usage.get("completion_tokens")

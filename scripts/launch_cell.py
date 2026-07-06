@@ -303,14 +303,58 @@ def load_image_pin(pin_path: Path) -> dict:
     return json.loads(pin_path.read_text())
 
 
-def verify_image_present(image_tag: str) -> None:
-    rc = subprocess.run(
+def verify_image_present(image_tag: str) -> dict:
+    """Return the `docker image inspect` object for image_tag; die if absent."""
+    result = subprocess.run(
         ["docker", "image", "inspect", image_tag],
         capture_output=True,
+        text=True,
         timeout=30,
-    ).returncode
-    if rc != 0:
+    )
+    if result.returncode != 0:
         die(f"image not present locally: {image_tag}. Run scripts/utils/pin_images.sh.")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        die(f"could not parse `docker image inspect {image_tag}`: {e}")
+        return {}  # unreachable (die exits); keeps type-checkers happy
+    if not data:
+        die(f"image not present locally: {image_tag}. Run scripts/utils/pin_images.sh.")
+    return data[0]
+
+
+def verify_image_digest(image_tag: str, pinned_digest: str) -> None:
+    """Fail unless the local `image_tag` actually resolves to `pinned_digest`.
+
+    A tag is mutable: an upstream repo can re-push/re-tag the same
+    `repo:tag` to different bytes after we pinned it. Recording pin['digest']
+    in the manifest WITHOUT checking (the old behaviour) produced a manifest
+    that claims reproducibility it cannot back -- a re-tagged image would run
+    under the pinned digest string while being different bytes.
+
+    Compare the pinned sha256 against the image's RepoDigests (the registry
+    content digest). Locally-built images have no RepoDigests, so fall back to
+    the image ID -- exactly how scripts/utils/pin_images.sh derives the digest
+    field for those. Mismatch is a non-retryable precondition (rc=6)."""
+    info = verify_image_present(image_tag)
+    repo_digests = info.get("RepoDigests") or []
+    local_shas = {rd.split("@", 1)[1] for rd in repo_digests if "@" in rd}
+    image_id = str(info.get("Id", ""))
+
+    if pinned_digest in local_shas:
+        return
+    # Locally-built image (no registry digest): pin_images.sh recorded .Id.
+    if not local_shas and pinned_digest and pinned_digest == image_id:
+        return
+
+    observed = ", ".join(sorted(local_shas)) or image_id or "unknown"
+    die(
+        f"image digest mismatch for {image_tag}: pin expects {pinned_digest}, "
+        f"local image is {observed}. The tag was re-pushed/re-tagged since "
+        "pinning. Re-pin (scripts/utils/pin_images.sh) or pull the pinned "
+        "digest. Refusing to run to keep the manifest reproducible.",
+        rc=6,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1652,9 +1696,13 @@ def main() -> None:
     image_full = f'{cell["engine"]["image_repo"]}:{cell["engine"]["image_tag"]}'
     if pin["image_tag"] != image_full:
         die(f"image pin mismatch: cell expects {image_full}, pin file has {pin['image_tag']}")
-    verify_image_present(image_full)
-    (run_dir / "image_digest.txt").write_text(pin["digest"] + "\n")
-    log(f"image: {image_full}  digest: {pin['digest']}")
+    pinned_digest = str(pin.get("digest", "")).strip()
+    if not pinned_digest:
+        die(f"image pin file for {image_full} has no 'digest'. Run "
+            "scripts/utils/pin_images.sh to record it before a production run.")
+    verify_image_digest(image_full, pinned_digest)
+    (run_dir / "image_digest.txt").write_text(pinned_digest + "\n")
+    log(f"image: {image_full}  digest: {pinned_digest} (verified against local image)")
 
     # Install the teardown signal handlers BEFORE engine bring-up and child spawn,
     # so a signal during bring-up / the spawn-vs-record window routes through the

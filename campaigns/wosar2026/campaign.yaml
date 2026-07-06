@@ -1,3 +1,13 @@
+# =============================================================================
+# LEGACY / RETIRED — DO NOT LAUNCH.
+#
+# This is the original parallel (3-slot) descriptor for the WoSAR 2026 n=3
+# replication baseline, kept for provenance only. The current orchestrator
+# (scripts/campaign.py) is STRICTLY SERIAL and REJECTS this file at pre-flight:
+# it has no `mode: serial` and it declares `slots:` (both forbidden). The active
+# campaign is campaigns/extension/campaign.yaml. See README "Current Campaign".
+# =============================================================================
+#
 # Top-level campaign descriptor for the WoSAR 2026 n=3 replication.
 #
 # Drives scripts/campaign.py:

@@ -213,7 +213,7 @@ class LaunchCellWiring(unittest.TestCase):
              mock.patch.multiple(
                  lc,
                  require_free_space=mock.DEFAULT, docker_root_dir=mock.DEFAULT,
-                 load_image_pin=mock.DEFAULT, verify_image_present=mock.DEFAULT,
+                 load_image_pin=mock.DEFAULT, verify_image_digest=mock.DEFAULT,
                  make_lifecycle=mock.DEFAULT, host_info=mock.DEFAULT, git_sha=mock.DEFAULT,
                  spawn_monitors=mock.DEFAULT, materialize_client_config=mock.DEFAULT,
                  spawn_client=mock.DEFAULT, summarize_client_csvs=mock.DEFAULT,
@@ -226,7 +226,7 @@ class LaunchCellWiring(unittest.TestCase):
             m["docker_root_dir"].return_value = tmp
             m["load_image_pin"].return_value = {"image_tag": "img:tag", "digest": "sha256:d",
                                                 "source_tag": "s", "pinned_at": "2026"}
-            m["verify_image_present"].return_value = None
+            m["verify_image_digest"].return_value = None
             m["make_lifecycle"].return_value = lf
             m["host_info"].return_value = {}
             m["git_sha"].return_value = None

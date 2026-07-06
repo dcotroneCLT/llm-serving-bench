@@ -22,7 +22,7 @@ from pathlib import Path
 
 import yaml  # type: ignore
 
-from benchmark import BenchmarkEngine
+from benchmark import BenchmarkEngine, WriterFatalError
 from prompt_sampler import PromptSampler
 from protocols.pytorch_hf import PyTorchHFAdapter
 from protocols.triton_vllm import TritonVLLMAdapter
@@ -112,6 +112,12 @@ def main() -> None:
 
     try:
         loop.run_until_complete(engine.run(duration_seconds=args.duration_seconds))
+    except WriterFatalError as e:
+        # Results could no longer be persisted (disk full / I/O error). Exit
+        # non-zero so launch_cell records this run as failed rather than a clean
+        # measurement; see client_fatal.json in the output dir.
+        print(f"[run_client] FATAL {e}", file=sys.stderr)
+        sys.exit(3)
     finally:
         loop.close()
 

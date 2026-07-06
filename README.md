@@ -12,21 +12,37 @@ overall structure are expected to change.
 
 ## Current Campaign
 
-The active experiment is the WoSAR 2026 replication campaign:
+The active experiment is the WoSAR 2026 **extension** (workload
+day-of-week screening), a strictly serial follow-on to the completed n=3
+replication baseline:
 
 - Model: `Qwen/Qwen2.5-7B-Instruct`, BF16.
-- Production cells: `e1`, `a1`, `e2`, `a2`, `e3`, `e3b`.
-- Replication: 3 replicas per cell, 18 production runs total.
-- Duration: 36h measured aging window per production run, after engine
-  readiness.
+- Serving systems compared: Dynamo-disagg, Triton+vLLM, vLLM-standalone.
+- Full campaign: ~57 runs of 48h each; the descriptor currently ships two
+  STEP-1 validation cells so the serial path can be exercised end-to-end
+  before the 48h DoW cells and per-cell calibration are appended.
 - Warmup discard: first 1h excluded from slope and figure normalization.
-- Topology: 3 parallel GPU slots, two cells per slot, round-robin by
-  replica.
+- Topology: **one serial queue**, no parallel GPU slots — the
+  measurement-isolation constraint forbids concurrency (the dynamo_disagg
+  cells occupy both GPUs, and the other systems must not share the host).
 
-The canonical campaign descriptor is
-`campaigns/wosar2026/campaign.yaml`; each cell YAML is the single source
-of truth for container image pin, GPU assignment, monitor labels,
-workload target rate, duration, and warmup discard.
+The completed **baseline** was the n=3 replication over cells
+`e1`, `a1`, `e2`, `a2`, `e3`, `e3b` (3 replicas each, 36h aging windows);
+its retired parallel descriptor is noted under Legacy below.
+
+The **active** campaign descriptor is
+`campaigns/extension/campaign.yaml` (the WoSAR 2026 extension / workload
+DoW screening). It is driven by `scripts/campaign.py`, which is **strictly
+serial** by design — one global ordered queue of `(cell, replica)` runs on
+the `launch_cell` production path, no parallel GPU slots (the
+measurement-isolation constraint forbids concurrency). Each cell YAML is
+the single source of truth for container image pin, GPU assignment, monitor
+labels, workload target rate, duration, and warmup discard.
+
+> **Legacy:** `campaigns/wosar2026/campaign.yaml` is the retired parallel
+> (3-slot) descriptor from the original n=3 study, kept for provenance. The
+> current serial orchestrator **rejects** it (it has no `mode: serial` and
+> declares `slots:`), so it cannot be launched by accident.
 
 ## Repository layout
 
@@ -46,20 +62,23 @@ runs/         experiment outputs (gitignored)
 Use the smoke gate before burning a long GPU slot:
 
 ```bash
-bash scripts/smoke_test.sh campaigns/wosar2026/cells/e1.yaml
+bash scripts/smoke_test.sh campaigns/extension/cells/val_vllm.yaml
 ```
 
-Preview and launch the full campaign:
+Preview and launch the full campaign (exactly one of `--start`/`--resume`):
 
 ```bash
-python3 scripts/campaign.py --campaign-yaml campaigns/wosar2026/campaign.yaml --dry-run
-python3 scripts/campaign.py --campaign-yaml campaigns/wosar2026/campaign.yaml --start
-python3 scripts/campaign.py --campaign-yaml campaigns/wosar2026/campaign.yaml --resume
+python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --dry-run
+python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --start
+python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --resume
 ```
 
-For a single cell/replica, use `scripts/launch_cell.py`; the campaign
-orchestrator is preferred for production because it checkpoints state,
-retries failures once, and keeps GPU slots balanced.
+`--start` wipes any existing state file and begins fresh; `--resume`
+continues from the checkpoint (and refuses to resume a state file written
+by a different `campaign_id`). For a single cell/replica, use
+`scripts/launch_cell.py`; the campaign orchestrator is preferred for
+production because it runs strictly serially on the production launch path,
+checkpoints state after each run, and retries an ordinary failure once.
 
 ## Analysis
 
@@ -82,6 +101,19 @@ python3 analysis/stepness.py --logs-root /home/dcotrone/wosar/runs
 ```
 
 See `analysis/README.md` for the full analysis pipeline.
+
+## Tests
+
+The test suite runs off-box (no GPU, no docker). Install the dev
+dependencies, then run it with the stdlib test runner:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m unittest discover -s tests
+```
+
+`requirements-dev.txt` pulls in the runtime packages the tests import
+transitively (`PyYAML`, `psutil`, `httpx`) plus the analysis stack.
 
 ## Status
 

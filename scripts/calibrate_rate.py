@@ -162,10 +162,27 @@ def _latency_climb_frac(e2e_with_ts: list[tuple[float, float]]) -> float:
 # ---------------------------------------------------------------------------
 
 
+class StaleSweepDir(RuntimeError):
+    """A per-rate sweep subdir already holds requests_*.csv from a prior run."""
+
+
 def run_one_rate(
     repo_root: Path, config: Path, base_url: str, protocol: str, model: str,
     rate: float, window_s: int, concurrency_cap: int, sub: Path,
 ) -> dict:
+    # Refuse to reuse a rate subdir that still holds a prior sweep's CSVs:
+    # window_stats_from_csvs() reads EVERY requests_*.csv in `sub`, so leftover
+    # files would silently inflate n_total/achieved and skew the ceiling and the
+    # calibrated rate. Calibration probes are ephemeral, so the fix is to fail
+    # loudly rather than mix (mirrors launch_cell's assert_run_dir_fresh).
+    stale = sorted(glob.glob(str(sub / "requests_*.csv")))
+    if stale:
+        raise StaleSweepDir(
+            f"refusing to reuse {sub}: it already holds {len(stale)} "
+            "requests_*.csv from a prior sweep, which window_stats_from_csvs "
+            "would mix into this rate's stats. Remove the stale sweep dir or "
+            "pass a fresh --sweep-dir."
+        )
     sub.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable, str(repo_root / "client" / "run_client.py"),
@@ -289,4 +306,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except StaleSweepDir as e:
+        print(f"[calibrate] ERROR: {e}", file=sys.stderr)
+        sys.exit(2)

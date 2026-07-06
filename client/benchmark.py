@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import glob
 import json
 import math
 import os
@@ -257,6 +258,12 @@ def sample_max_tokens(rng: random.Random, median: int, p95: int, lo: int, hi: in
     return sample_prompt_length(rng, median, p95, lo, hi)
 
 
+class WriterFatalError(RuntimeError):
+    """Persisting a result row failed (e.g. disk full / I/O error). The run
+    cannot record results any more, so it is aborted rather than silently
+    truncated. run_client surfaces this as a non-zero exit."""
+
+
 class BenchmarkEngine:
     def __init__(
         self,
@@ -324,16 +331,44 @@ class BenchmarkEngine:
         self.in_flight = 0
         self._stop = asyncio.Event()
         self._tasks: set[asyncio.Task] = set()
+        # Set (once) if persisting a result row ever fails: a writer I/O fault
+        # is fatal and distinct from a per-request error (see _write_row).
+        self._writer_error: Optional[str] = None
         self._restore_state()
 
     def _restore_state(self) -> None:
+        state_next = 0
         if self.state_path.exists():
             try:
                 s = json.loads(self.state_path.read_text())
-                self.req_id_next = int(s.get("req_id_next", 0))
+                state_next = int(s.get("req_id_next", 0))
                 # writer seq does not need to be restored: a new run uses fresh files
             except (json.JSONDecodeError, ValueError):
-                pass
+                state_next = 0
+        # state.json is only checkpointed every ~30s, so after a crash the CSVs
+        # can hold requests NEWER than the last checkpoint. Resuming from the
+        # stale state_next would REUSE those req_ids and emit duplicate keys
+        # across files. Take the max of the checkpoint and (highest req_id
+        # already on disk) + 1 so req_ids stay globally unique across a resume.
+        csv_next = self._max_req_id_in_csvs() + 1
+        self.req_id_next = max(state_next, csv_next)
+
+    def _max_req_id_in_csvs(self) -> int:
+        """Highest req_id already written to requests_*.csv, or -1 if none."""
+        highest = -1
+        for path in glob.glob(str(self.output_dir / "requests_*.csv")):
+            try:
+                with open(path, newline="") as fp:
+                    for row in csv.DictReader(fp):
+                        try:
+                            rid = int(row.get("req_id", ""))
+                        except (TypeError, ValueError):
+                            continue
+                        if rid > highest:
+                            highest = rid
+            except OSError:
+                continue
+        return highest
 
     def _persist_state(self) -> None:
         try:
@@ -343,6 +378,21 @@ class BenchmarkEngine:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    def _write_row(self, row: dict) -> None:
+        """Persist one result row. A writer failure (disk full / I/O error) is
+        FATAL and categorically different from an adapter/request error: it
+        means results can no longer be recorded, so turning it into an 'error'
+        row -- or letting the task exception be swallowed by gather() -- would
+        drop data invisibly. Capture the fault once, stop the run, and let
+        run() surface a non-zero exit + an explicit marker file."""
+        if self._writer_error is not None:
+            return  # already aborting; do not thrash a broken writer
+        try:
+            self.writer.write(row)
+        except Exception as e:
+            self._writer_error = f"{type(e).__name__}: {str(e)[:500]}"
+            self.request_stop()
 
     async def _dispatch_one(self, http: httpx.AsyncClient, req_id: int,
                             submitted_at_unix: float, submitted_at_mono: float) -> None:
@@ -378,7 +428,6 @@ class BenchmarkEngine:
             result.requested_input_tokens = approx_in
             result.shared_prefix_applied = shared_prefix_applied
             fill_derived_latencies(result)
-            self.writer.write(result.to_csv_row())
         except asyncio.CancelledError:
             result = RequestResult(
                 req_id=req_id,
@@ -396,9 +445,11 @@ class BenchmarkEngine:
                 shared_prefix_applied=shared_prefix_applied,
             )
             fill_derived_latencies(result)
-            self.writer.write(result.to_csv_row())
+            self._write_row(result.to_csv_row())
             raise
         except Exception as e:
+            # An ADAPTER/request failure: recorded as an 'error' row. Distinct
+            # from a WRITER failure, which _write_row escalates to fatal.
             result = RequestResult(
                 req_id=req_id,
                 submitted_at_unix=submitted_at_unix,
@@ -415,7 +466,9 @@ class BenchmarkEngine:
                 shared_prefix_applied=shared_prefix_applied,
             )
             fill_derived_latencies(result)
-            self.writer.write(result.to_csv_row())
+            self._write_row(result.to_csv_row())
+        else:
+            self._write_row(result.to_csv_row())
         finally:
             self.in_flight -= 1
 
@@ -431,7 +484,7 @@ class BenchmarkEngine:
             error_message="concurrency cap reached",
             streaming=False,
         )
-        self.writer.write(result.to_csv_row())
+        self._write_row(result.to_csv_row())
 
     async def run(self, duration_seconds: float) -> None:
         rate = self.target_rate_rps
@@ -512,7 +565,11 @@ class BenchmarkEngine:
             # error rows are flushed BEFORE close (R3-4), not lost or written after.
             await drain_and_grace(self._tasks, drain_s=60.0, cancel_grace_s=5.0)
             self._persist_state()
-            self.writer.close()
+            try:
+                self.writer.close()
+            except Exception as e:
+                if self._writer_error is None:
+                    self._writer_error = f"close: {type(e).__name__}: {str(e)[:500]}"
 
             # Record the realized arrival statistics so the manifest can show
             # what the server actually saw (esp. the bursty CoV vs poisson).
@@ -538,3 +595,17 @@ class BenchmarkEngine:
                 (self.output_dir / "arrival_stats.json").write_text(json.dumps(stats, indent=2))
             except OSError:
                 pass
+
+            # A writer I/O fault mid-run means results were being dropped: abort
+            # loudly with an explicit marker + non-zero exit (via run_client) so
+            # the run is not mistaken for a clean, complete measurement.
+            if self._writer_error is not None:
+                try:
+                    (self.output_dir / "client_fatal.json").write_text(json.dumps(
+                        {"fatal": "writer_error", "error": self._writer_error}, indent=2))
+                except OSError:
+                    pass
+                raise WriterFatalError(
+                    f"CSV writer failed mid-run: {self._writer_error}. Results can "
+                    "no longer be recorded; aborting so the run is not silently "
+                    "truncated.")
