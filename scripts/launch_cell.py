@@ -2153,29 +2153,50 @@ def main() -> None:
         #     teardown_errors is present only when non-empty (single_container
         #     byte-compat holds for clean runs); lifecycle.finalize_manifest adds
         #     the docker-log path key(s) LAST so the clean-run key order is intact.
-        # A teardown failure is also a non-clean ending worth explaining; record it
-        # if nothing earlier already set a reason.
-        if teardown_errors and interruption_reason is None:
-            interruption_reason = "teardown_failed: " + ",".join(te["step"] for te in teardown_errors)
-        ended_at_unix = time.time()
-        manifest["ended_at"] = utc_iso()
-        manifest["ended_at_unix"] = ended_at_unix
-        manifest["duration_seconds_actual"] = time.monotonic() - started_mono
-        manifest["interrupted_early"] = interrupted
-        manifest["client_forced_kill"] = client_forced_kill
-        manifest["client_summary"] = client_summary
-        if teardown_errors:
-            manifest["teardown_errors"] = teardown_errors
-        # Present ONLY when set (clean runs stay byte-compatible).
-        if interruption_reason is not None:
-            manifest["interruption_reason"] = interruption_reason
-        lifecycle.finalize_manifest(manifest)
-        manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
-        log(f"done. duration={manifest['duration_seconds_actual']:.0f}s "
-            f"interrupted={interrupted} teardown_errors={len(teardown_errors)}")
+        # Finalization must NEVER change the decided exit code. On a full disk
+        # the manifest write itself fails (ENOSPC), so wrap the ENTIRE tail: once
+        # an exit code is decided (e.g. the watchdog chose 7), no finalization
+        # error may replace or downgrade it. If finalization is the FIRST place a
+        # storage-fatal errno appears, that too is a disk-floor condition -> 7;
+        # any other finalization error with no decided code becomes a non-zero
+        # failure (never a false success). Swallow and log: a stale/absent
+        # manifest on a full disk is acceptable -- the exit code is the contract.
+        try:
+            # A teardown failure is also a non-clean ending worth explaining;
+            # record it if nothing earlier already set a reason.
+            if teardown_errors and interruption_reason is None:
+                interruption_reason = "teardown_failed: " + ",".join(te["step"] for te in teardown_errors)
+            ended_at_unix = time.time()
+            manifest["ended_at"] = utc_iso()
+            manifest["ended_at_unix"] = ended_at_unix
+            manifest["duration_seconds_actual"] = time.monotonic() - started_mono
+            manifest["interrupted_early"] = interrupted
+            manifest["client_forced_kill"] = client_forced_kill
+            manifest["client_summary"] = client_summary
+            if teardown_errors:
+                manifest["teardown_errors"] = teardown_errors
+            # Present ONLY when set (clean runs stay byte-compatible).
+            if interruption_reason is not None:
+                manifest["interruption_reason"] = interruption_reason
+            lifecycle.finalize_manifest(manifest)
+            manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
+            log(f"done. duration={manifest['duration_seconds_actual']:.0f}s "
+                f"interrupted={interrupted} teardown_errors={len(teardown_errors)}")
+        except Exception as e:  # noqa: BLE001 - the exit code must survive finalization
+            log(f"WARNING: manifest finalization failed: {e!r} (the exit code is "
+                "the durable contract; the manifest may be stale or absent)")
+            if exit_code_override is None:
+                if isinstance(e, OSError) and e.errno in STORAGE_FATAL_ERRNOS:
+                    code = errno.errorcode.get(e.errno, str(e.errno))
+                    exit_code_override = 7
+                    interruption_reason = interruption_reason or (
+                        f"disk_floor: storage write failure {code} during manifest finalization")
+                else:
+                    exit_code_override = 2  # finalization failed; never report success
 
-    # A mid-run disk-floor breach exits 7 (campaign-fatal) regardless of teardown
-    # outcome; otherwise non-zero if the run was interrupted OR a teardown step
+    # exit_code_override is the DECIDED code and must survive: the disk watchdog
+    # (mid-run or during finalization) sets 7, a finalization failure sets a
+    # non-zero. Otherwise non-zero if the run was interrupted OR a teardown step
     # failed, else clean 0.
     if exit_code_override is not None:
         sys.exit(exit_code_override)

@@ -150,7 +150,8 @@ class LaunchCellWiring(unittest.TestCase):
     def _run_main(self, tmp: Path, client_poll, mono_step, duration_s,
                   ledger_stuck=None, teardown_raises=False, record_raises=None,
                   disk_free_gb=None, disk_check_every=None,
-                  health_reason=None, health_every=None, append_error=None):
+                  health_reason=None, health_every=None, append_error=None,
+                  finalize_error=None):
         events: list[str] = []
         logs: list[str] = []
         run_dir = tmp / "runs" / "test_e1_r01"
@@ -173,7 +174,13 @@ class LaunchCellWiring(unittest.TestCase):
             lf.teardown.side_effect = _boom
         else:
             lf.teardown.side_effect = lambda: events.append("teardown")
-        lf.finalize_manifest.side_effect = lambda m: None
+        # finalize_manifest sits in the wrapped finalization tail immediately
+        # before the manifest write; raising here injects a finalization-time
+        # failure (e.g. ENOSPC on the final write) for the exit-code tests.
+        def _finalize(_m):
+            if finalize_error is not None:
+                raise finalize_error
+        lf.finalize_manifest.side_effect = _finalize
 
         # Client config file the clean-teardown path reads.
         cc = tmp / "client_config.yaml"
@@ -387,6 +394,38 @@ class LaunchCellWiring(unittest.TestCase):
             self.assertNotIn("interruption_reason", r["manifest"])
             warnings = [m for m in r["logs"] if "could not write disk_usage.csv" in m]
             self.assertEqual(len(warnings), 1)  # warn-once, not per-check
+
+    def test_finalization_failure_does_not_downgrade_decided_exit_7(self):
+        # FIX (this pass) (a): storage-fatal on the trend CSV decides exit 7,
+        # then a storage-fatal on the final manifest write must NOT replace it
+        # with an uncaught OSError -- the decided 7 survives.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=100000, disk_free_gb=500.0, disk_check_every=0,
+                               append_error=OSError(errno.ENOSPC, "No space"),
+                               finalize_error=OSError(errno.ENOSPC, "No space"))
+            self.assertEqual(r["exit_code"], 7)
+            self.assertTrue(any("manifest finalization failed" in m for m in r["logs"]))
+
+    def test_finalization_storage_fatal_alone_sets_exit_7(self):
+        # (b): a storage-fatal on the final manifest write with NO prior breach
+        # is itself a disk-floor condition -> exit 7 (not a masked error/0).
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1000.0,
+                               duration_s=1,
+                               finalize_error=OSError(errno.ENOSPC, "No space"))
+            self.assertEqual(r["exit_code"], 7)
+            self.assertTrue(any("manifest finalization failed" in m for m in r["logs"]))
+
+    def test_finalization_nonstorage_error_preserves_override(self):
+        # (c): a non-storage exception during finalization with an override
+        # already decided (disk breach -> 7) preserves it and logs the error.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=100000, disk_free_gb=1.0, disk_check_every=0,
+                               finalize_error=RuntimeError("boom"))
+            self.assertEqual(r["exit_code"], 7)
+            self.assertTrue(any("manifest finalization failed" in m for m in r["logs"]))
 
     def test_reap_gate_fatal_refuses_to_start(self):
         # R1-4: an unkillable recorded orphan (ledger entry survives reap) is
