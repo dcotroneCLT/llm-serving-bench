@@ -364,6 +364,18 @@ class LaunchCellWiring(unittest.TestCase):
             self.assertTrue(r["manifest"]["interrupted_early"])
             self.assertIn("ENOSPC", r["manifest"]["interruption_reason"])
 
+    def test_disk_csv_append_edquot_is_treated_as_breach(self):
+        # FIX 1 (follow-up): a quota-capped filesystem fails EDQUOT while free_gb
+        # still reports global space OK. EDQUOT is storage-fatal -> exit 7, and
+        # the reason names the errno.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=100000, disk_free_gb=500.0, disk_check_every=0,
+                               append_error=OSError(errno.EDQUOT, "Disk quota exceeded"))
+            self.assertEqual(r["exit_code"], 7)
+            self.assertTrue(r["manifest"]["interrupted_early"])
+            self.assertIn("EDQUOT", r["manifest"]["interruption_reason"])
+
     def test_disk_csv_transient_append_error_warns_once_and_continues(self):
         # FIX 1(c): a transient write error (EACCES) with the floor OK does not
         # abort the run and is logged ONCE (no per-check spam over a 48h run).

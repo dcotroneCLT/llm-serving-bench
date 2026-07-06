@@ -54,8 +54,10 @@ Retry policy (requirement 3):
 
 Resumability (requirement 4):
   campaign_state.json records per-run status (pending|running|completed|failed|
-  interrupted|host_conflict|insufficient_space), written atomically (write-tmp +
-  rename). --resume skips completed runs and re-queues every non-completed run
+  interrupted|host_conflict|insufficient_space|precondition_failed), written
+  atomically (write-tmp + rename). The last three are the persisted labels for
+  the non-retryable launch_cell fatals (NONRETRYABLE_EXIT_CODES). --resume skips
+  completed runs and re-queues every non-completed run
   (interrupted/failed/fatal-precondition runs re-enter the policy). The operator
   can stop and restart across days.
 
@@ -842,8 +844,9 @@ class Campaign:
                 return EXIT_INTERRUPTED
             except CampaignFatal as f:
                 log(f"CAMPAIGN FATAL on {f.run_key}: {f.detail}")
-                log("stopping the campaign. Resolve the host precondition (ownership "
-                    "or free space), then --resume.")
+                log("stopping the campaign. Resolve the precondition (host ownership, "
+                    "free space, image-pin mismatch, or a non-fresh run_dir -- see the "
+                    "run's per-attempt child log), then --resume.")
                 return EXIT_CAMPAIGN_FATAL
 
             # Inter-run cooldown before the next run (skip after the last one).

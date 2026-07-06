@@ -611,6 +611,16 @@ ENDPOINT_DEAD_MIN_ROWS = 5        # need at least this many rows before declarin
 DISK_CHECK_EVERY_S = 300              # ~5 min (a multiple of HEALTH_CHECK_EVERY_S)
 DEFAULT_MIN_FREE_GB_MID_RUN = 10.0    # below the pre-run gate so a tight start is not instant death
 DISK_USAGE_FIELDS = ["ts_unix", "runs_root_free_gb", "docker_root_free_gb", "run_dir_size_mb"]
+
+# A disk_usage.csv write failing with one of these errnos means the STORAGE is
+# failing (out of space / over quota / read-only remount / I/O error), which
+# free_gb() can miss -- a quota-capped fs fails EDQUOT while global free space
+# still reads OK. Escalate these to the disk-floor fatal path. Other errors
+# (e.g. EACCES permission/config) are transient: warn once and keep running.
+STORAGE_FATAL_ERRNOS = frozenset(
+    getattr(errno, _name) for _name in ("ENOSPC", "EDQUOT", "EROFS", "EIO")
+    if hasattr(errno, _name)
+)
 # R3-3: a monitor that is alive but no longer producing new ticks (wedged) is a
 # dead monitor. If the latest aggregate tick's ts_unix has not ADVANCED for this
 # many seconds (measured on the launcher's MONOTONIC clock, ts_unix used only for
@@ -2049,20 +2059,23 @@ def main() -> None:
                 # channel and must never mask or downgrade a disk-floor breach.
                 breach = disk_watchdog_reason(
                     args.runs_root, docker_root, args.min_free_gb_mid_run)
-                # Best-effort trend row. A full runs-root (ENOSPC) is itself
-                # breach evidence -- the exact scenario the watchdog exists for --
-                # so an ENOSPC write failure escalates even if the free_gb probe
-                # read nominally OK (reserved blocks / a race). Any other error
-                # (e.g. EACCES) is transient: warn ONCE and keep running.
+                # Best-effort trend row. A STORAGE_FATAL_ERRNOS write failure
+                # (out of space / over quota / read-only / I/O error) is itself
+                # breach evidence -- the exact scenario the watchdog exists for,
+                # and one free_gb() can miss (e.g. a quota-capped fs fails EDQUOT
+                # while global free space still reads OK) -- so it escalates even
+                # if the free_gb probe read nominally OK. Any other error (e.g.
+                # EACCES permission/config) is transient: warn ONCE and continue.
                 try:
                     append_disk_usage_row(
                         run_dir / "disk_usage.csv",
                         disk_usage_snapshot(args.runs_root, docker_root, run_dir, time.time()))
                 except OSError as e:
-                    if e.errno == errno.ENOSPC and breach is None:
-                        breach = (f"disk_floor: runs-root out of space -- "
-                                  f"disk_usage.csv write failed ENOSPC ({run_dir})")
-                    elif not disk_csv_warned:
+                    if e.errno in STORAGE_FATAL_ERRNOS and breach is None:
+                        code = errno.errorcode.get(e.errno, str(e.errno))
+                        breach = (f"disk_floor: storage write failure {code} -- "
+                                  f"disk_usage.csv append failed on runs-root ({run_dir})")
+                    elif e.errno not in STORAGE_FATAL_ERRNOS and not disk_csv_warned:
                         log(f"WARNING: could not write disk_usage.csv: {e!r} (continuing)")
                         disk_csv_warned = True
                 if breach is not None:
