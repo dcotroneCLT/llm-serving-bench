@@ -147,7 +147,9 @@ def _single_cell_yaml(tmp: Path) -> Path:
 
 class LaunchCellWiring(unittest.TestCase):
     def _run_main(self, tmp: Path, client_poll, mono_step, duration_s,
-                  ledger_stuck=None, teardown_raises=False, record_raises=None):
+                  ledger_stuck=None, teardown_raises=False, record_raises=None,
+                  disk_free_gb=None, disk_check_every=None,
+                  health_reason=None, health_every=None):
         events: list[str] = []
         run_dir = tmp / "runs" / "test_e1_r01"
 
@@ -159,7 +161,8 @@ class LaunchCellWiring(unittest.TestCase):
         lf.primary_gpu.return_value = 0
         lf.manifest_sections.return_value = {}
         lf.manifest_baseline_sections.return_value = {}
-        lf.health_check.return_value = None
+        # health_reason=None -> engine stays healthy; a string -> unhealthy every check.
+        lf.health_check.return_value = health_reason
         if teardown_raises:
             def _boom():
                 events.append("teardown")
@@ -198,6 +201,7 @@ class LaunchCellWiring(unittest.TestCase):
             repo_root=REPO, hf_cache_host=Path(""), campaign_id="test", attempt=1,
             component_pids=tmp / "pids.json", gpu_device_override=None,
             duration_s_override=duration_s, min_free_gb=20.0,
+            min_free_gb_mid_run=10.0,
             calibration_file=None, allow_lower_bound_calibration=False,
         )
 
@@ -217,13 +221,20 @@ class LaunchCellWiring(unittest.TestCase):
                  make_lifecycle=mock.DEFAULT, host_info=mock.DEFAULT, git_sha=mock.DEFAULT,
                  spawn_monitors=mock.DEFAULT, materialize_client_config=mock.DEFAULT,
                  spawn_client=mock.DEFAULT, summarize_client_csvs=mock.DEFAULT,
-                 stop_subprocess=mock.DEFAULT, reaper=reaper_mock,
+                 stop_subprocess=mock.DEFAULT, reaper=reaper_mock, free_gb=mock.DEFAULT,
              ) as m, \
+             mock.patch.object(lc, "DISK_CHECK_EVERY_S",
+                               disk_check_every if disk_check_every is not None else lc.DISK_CHECK_EVERY_S), \
+             mock.patch.object(lc, "HEALTH_CHECK_EVERY_S",
+                               health_every if health_every is not None else lc.HEALTH_CHECK_EVERY_S), \
              mock.patch.object(lc.time, "sleep", lambda *_: None), \
              mock.patch.object(lc.time, "monotonic", fake_monotonic), \
              mock.patch.object(lc.time, "time", lambda: 1000.0):
             m["require_free_space"].return_value = None
             m["docker_root_dir"].return_value = tmp
+            # Free space seen by the mid-run watchdog + the disk_usage.csv row.
+            # Default is comfortably above the floor so existing tests are healthy.
+            m["free_gb"].return_value = disk_free_gb if disk_free_gb is not None else 500.0
             m["load_image_pin"].return_value = {"image_tag": "img:tag", "digest": "sha256:d",
                                                 "source_tag": "s", "pinned_at": "2026"}
             m["verify_image_digest"].return_value = None
@@ -239,7 +250,10 @@ class LaunchCellWiring(unittest.TestCase):
                 lc.main()
             except SystemExit as e:
                 exit_code["code"] = e.code
-        return {"events": events, "exit_code": exit_code["code"], "run_dir": run_dir, "stops": stops}
+        manifest_path = run_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        return {"events": events, "exit_code": exit_code["code"], "run_dir": run_dir,
+                "stops": stops, "manifest": manifest}
 
     def test_clean_teardown_wiring_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,6 +282,54 @@ class LaunchCellWiring(unittest.TestCase):
         self.assertIn("record", events)
         self.assertIn("deregister", events)
         self.assertEqual(r["exit_code"], 2)
+        # early_exit interruption class is recorded in the manifest.
+        self.assertTrue(r["manifest"]["interrupted_early"])
+        self.assertTrue(r["manifest"]["interruption_reason"].startswith("early_exit"))
+
+    def test_mid_run_disk_floor_breach_exits_7_and_tears_down(self):
+        # SC-2 mid-run watchdog: free space below the floor -> graceful teardown,
+        # exit 7 (campaign-fatal), interruption_reason recorded, trend row written.
+        # File assertions stay INSIDE the tempdir block (it is deleted on exit).
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=100000, disk_free_gb=1.0, disk_check_every=0)
+            self.assertEqual(r["exit_code"], 7)
+            self.assertTrue(r["manifest"]["interrupted_early"])
+            self.assertTrue(r["manifest"]["interruption_reason"].startswith("disk_floor"))
+            # Graceful teardown still ran (deregister after teardown).
+            self.assertIn("teardown", r["events"])
+            self.assertIn("deregister", r["events"])
+            # Trend row(s) written.
+            csv_path = r["run_dir"] / "disk_usage.csv"
+            self.assertTrue(csv_path.exists())
+            rows = csv_path.read_text().splitlines()
+            self.assertEqual(rows[0], "ts_unix,runs_root_free_gb,docker_root_free_gb,run_dir_size_mb")
+            self.assertGreaterEqual(len(rows), 2)  # header + at least one measurement
+
+    def test_healthy_disk_completes_and_logs_trend(self):
+        # Healthy path unchanged: the disk check fires (csv written) but does not
+        # abort; the run ends on the duration deadline with exit 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=3, disk_free_gb=500.0, disk_check_every=0)
+            self.assertEqual(r["exit_code"], 0)
+            self.assertNotIn("interruption_reason", r["manifest"])  # clean run byte-compat
+            csv_path = r["run_dir"] / "disk_usage.csv"
+            self.assertTrue(csv_path.exists())
+            data_rows = csv_path.read_text().splitlines()[1:]
+            self.assertTrue(data_rows)
+            # runs_root_free_gb column reflects the measured value.
+            self.assertEqual(data_rows[0].split(",")[1], "500.0")
+
+    def test_health_failure_reason_recorded(self):
+        # A different interruption class: N consecutive engine-health failures.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=100000, health_reason="engine down",
+                               health_every=0)
+        self.assertEqual(r["exit_code"], 2)
+        self.assertTrue(r["manifest"]["interrupted_early"])
+        self.assertTrue(r["manifest"]["interruption_reason"].startswith("health:"))
 
     def test_reap_gate_fatal_refuses_to_start(self):
         # R1-4: an unkillable recorded orphan (ledger entry survives reap) is

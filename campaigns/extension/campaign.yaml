@@ -50,6 +50,13 @@ est_run_overhead_s: 3600
 # --min-free-gb so each run re-checks at start.
 min_free_gb: 50
 
+# SC-2 mid-run disk watchdog floor (GB), passed to launch_cell as
+# --min-free-gb-mid-run. During the run, launch_cell re-measures free space on
+# the runs-root and the REAL docker data-root every ~5 min and aborts (exit 7 =>
+# campaign-fatal, no retry) if either drops below this. Set below min_free_gb so
+# a run that started near the pre-run gate is not killed on the first check.
+min_free_gb_mid_run: 25
+
 # Global default for accepting a non-saturated ("lower bound") calibration.
 # Off: a non-saturated ceiling makes the DoW fraction-of-ceiling rate factor
 # meaningless. Per-cell entries may override this.

@@ -501,6 +501,9 @@ class Campaign:
         self.inter_run_cooldown_s = int(campaign.get("inter_run_cooldown_s", 0))
         self.est_run_overhead_s = int(campaign.get("est_run_overhead_s", 0))
         self.min_free_gb = float(campaign.get("min_free_gb", 20.0))
+        # SC-2 mid-run disk watchdog floor, passed to launch_cell. Defaults below
+        # the pre-run gate so a run that started near it is not killed instantly.
+        self.min_free_gb_mid_run = float(campaign.get("min_free_gb_mid_run", 10.0))
 
         # Signal state. current_proc is set only while a child is alive.
         self.current_proc: Optional[subprocess.Popen] = None
@@ -579,6 +582,7 @@ class Campaign:
             "--campaign-id", self.campaign_id,
             "--attempt", str(attempt),
             "--min-free-gb", str(self.min_free_gb),
+            "--min-free-gb-mid-run", str(self.min_free_gb_mid_run),
         ]
         if spec.calibration_file:
             cmd += ["--calibration-file", spec.calibration_file]

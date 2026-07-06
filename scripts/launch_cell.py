@@ -202,6 +202,65 @@ def require_free_space(paths: list[Optional[Path]], min_gb: float, label: str = 
                 f"Free space (docker image prune; move data-root to /home) or lower --min-free-gb.", rc=7)
 
 
+def dir_size_mb(path: Path) -> float:
+    """Total size of files under `path`, in MB. Best-effort: unreadable entries
+    are skipped so a mid-run measurement can never abort the run."""
+    total = 0
+    for root, _dirs, files in os.walk(str(path)):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fn))
+            except OSError:
+                continue
+    return total / (1024 ** 2)
+
+
+def disk_watchdog_reason(runs_root: Path, docker_root: Optional[Path],
+                         min_free_gb: float) -> Optional[str]:
+    """Return a short breach reason if the runs-root OR the docker data-root
+    filesystem is below `min_free_gb`, else None.
+
+    Fail-CLOSED, exactly like the pre-run gate: a filesystem that cannot be
+    stat'd is treated as a breach (an unknown disk is precisely when to stop).
+    The docker data-root is resolved via docker_root_dir() by the caller and
+    never hardcoded to /var/lib."""
+    checks = [("runs-root", runs_root)]
+    if docker_root is not None:
+        checks.append(("docker-root", docker_root))
+    for label, p in checks:
+        g = free_gb(p)
+        if g is None:
+            return f"disk_floor: cannot stat {label} ({p})"
+        if g < min_free_gb:
+            return f"disk_floor: {label} {g:.1f}GB < {min_free_gb:.1f}GB ({p})"
+    return None
+
+
+def disk_usage_snapshot(runs_root: Path, docker_root: Optional[Path],
+                        run_dir: Path, now_unix: float) -> dict:
+    """One row of disk-trend data for run_dir/disk_usage.csv. Additive and
+    reader-free: nothing consumes this file at runtime; the long test's curve
+    informs the deferred gzip-at-archive decision (SC-2 point 4)."""
+    runs_free = free_gb(runs_root)
+    docker_free = free_gb(docker_root) if docker_root is not None else None
+    return {
+        "ts_unix": round(now_unix, 3),
+        "runs_root_free_gb": round(runs_free, 2) if runs_free is not None else "",
+        "docker_root_free_gb": round(docker_free, 2) if docker_free is not None else "",
+        "run_dir_size_mb": round(dir_size_mb(run_dir), 1),
+    }
+
+
+def append_disk_usage_row(csv_path: Path, row: dict) -> None:
+    """Append one row to run_dir/disk_usage.csv, writing the header once."""
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(DISK_USAGE_FIELDS)
+        w.writerow([row[k] for k in DISK_USAGE_FIELDS])
+
+
 def render(template: str, **subs: str) -> str:
     """Substitute {placeholder} tokens in a template string."""
     out = template
@@ -543,6 +602,14 @@ HEALTH_CHECK_EVERY_S = 30
 HEALTH_FAIL_CONSECUTIVE = 3
 ENDPOINT_DEAD_WINDOW_S = 300      # ~5 min rolling window for endpoint-dead detection
 ENDPOINT_DEAD_MIN_ROWS = 5        # need at least this many rows before declaring death
+
+# Mid-run disk watchdog (SC-2). The preprint campaign died of disk exhaustion
+# on the docker data-root during a multi-day run -- a failure the pre-run gate
+# cannot catch. The supervision loop re-measures free space on this slower
+# cadence (statvfs is cheap) and aborts if either filesystem breaches the floor.
+DISK_CHECK_EVERY_S = 300              # ~5 min (a multiple of HEALTH_CHECK_EVERY_S)
+DEFAULT_MIN_FREE_GB_MID_RUN = 10.0    # below the pre-run gate so a tight start is not instant death
+DISK_USAGE_FIELDS = ["ts_unix", "runs_root_free_gb", "docker_root_free_gb", "run_dir_size_mb"]
 # R3-3: a monitor that is alive but no longer producing new ticks (wedged) is a
 # dead monitor. If the latest aggregate tick's ts_unix has not ADVANCED for this
 # many seconds (measured on the launcher's MONOTONIC clock, ts_unix used only for
@@ -1650,6 +1717,16 @@ def main() -> None:
              "runs-root or the docker data-root is below this (GB).",
     )
     p.add_argument(
+        "--min-free-gb-mid-run",
+        type=float,
+        default=DEFAULT_MIN_FREE_GB_MID_RUN,
+        help="SC-2 mid-run disk watchdog floor: during the run, abort (graceful "
+             "teardown, exit 7 -> campaign-fatal, no retry) if free space on the "
+             "runs-root or the docker data-root drops below this (GB). Defaults "
+             "below --min-free-gb so a run that started near the pre-run gate is "
+             "not killed on the first mid-run check.",
+    )
+    p.add_argument(
         "--calibration-file",
         type=Path,
         default=None,
@@ -1701,8 +1778,10 @@ def main() -> None:
     log(f"run_dir={run_dir}")
 
     # SC-2 #1: pre-run free-space gate (runs-root for CSVs, docker data-root for
-    # images + 48h container logs).
-    require_free_space([args.runs_root, docker_root_dir()], args.min_free_gb, label=run_id)
+    # images + 48h container logs). Resolve the REAL docker data-root once and
+    # reuse it for the mid-run watchdog below (never hardcode /var/lib).
+    docker_root = docker_root_dir()
+    require_free_space([args.runs_root, docker_root], args.min_free_gb, label=run_id)
 
     # 2. Verify image pin.
     pin = load_image_pin(args.repo_root / cell["engine"]["digest_pin_file"])
@@ -1901,6 +1980,11 @@ def main() -> None:
     client_summary: dict[str, Any] = {}
     health_fail_streak = 0
     last_health_mono = started_mono
+    last_disk_mono = started_mono
+    # Set to 7 by the mid-run disk watchdog so the run exits with the free-space
+    # code the campaign treats as CAMPAIGN-FATAL (disk does not free itself, so a
+    # retry would burn an attempt for nothing), overriding the generic rc=2.
+    exit_code_override: Optional[int] = None
     try:
         while not interrupted:
             time.sleep(5)
@@ -1952,6 +2036,24 @@ def main() -> None:
                     interrupted = True
                     interruption_reason = interruption_reason or (
                         f"client_all_fail_window: {dead_rows} rows, 0 ok in {ENDPOINT_DEAD_WINDOW_S}s")
+                    break
+
+            # Mid-run disk watchdog (~every DISK_CHECK_EVERY_S), independent of the
+            # health cadence. Applies to BOTH lifecycles (the supervision loop is
+            # shared). Append a trend row, then abort if either filesystem breached
+            # the mid-run floor. exit 7 makes the campaign treat it as fatal.
+            if now_mono - last_disk_mono >= DISK_CHECK_EVERY_S:
+                last_disk_mono = now_mono
+                append_disk_usage_row(
+                    run_dir / "disk_usage.csv",
+                    disk_usage_snapshot(args.runs_root, docker_root, run_dir, time.time()))
+                breach = disk_watchdog_reason(
+                    args.runs_root, docker_root, args.min_free_gb_mid_run)
+                if breach is not None:
+                    log(f"FATAL: mid-run disk floor breached: {breach}; tearing down")
+                    interrupted = True
+                    interruption_reason = interruption_reason or breach
+                    exit_code_override = 7
                     break
     finally:
         # 13. Graceful teardown.
@@ -2043,7 +2145,11 @@ def main() -> None:
         log(f"done. duration={manifest['duration_seconds_actual']:.0f}s "
             f"interrupted={interrupted} teardown_errors={len(teardown_errors)}")
 
-    # Non-zero exit if the run was interrupted OR any teardown step failed.
+    # A mid-run disk-floor breach exits 7 (campaign-fatal) regardless of teardown
+    # outcome; otherwise non-zero if the run was interrupted OR a teardown step
+    # failed, else clean 0.
+    if exit_code_override is not None:
+        sys.exit(exit_code_override)
     sys.exit(0 if (not interrupted and not teardown_errors) else 2)
 
 

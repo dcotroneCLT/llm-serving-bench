@@ -386,8 +386,13 @@ echo "${BOLD}== Section A: campaign-wide ==${RESET}"
 # it was moved to /home, so check the REAL DockerRootDir (`docker info`).
 RUNS_ROOT_GB=$(disk_free_gb "$RUNS_ROOT")
 DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)
-[ -z "$DOCKER_ROOT" ] && DOCKER_ROOT=/var/lib/docker
-DOCKER_ROOT_GB=$(disk_free_gb "$DOCKER_ROOT")
+# Do NOT fall back to /var/lib/docker: on this box the data-root moved to /home,
+# so a guess would gate on the wrong filesystem. An unresolved root is a WARN.
+if [ -n "$DOCKER_ROOT" ]; then
+    DOCKER_ROOT_GB=$(disk_free_gb "$DOCKER_ROOT")
+else
+    DOCKER_ROOT_GB=""
+fi
 if ! is_int "$RUNS_ROOT_GB"; then
     record WARN "A.disk.runs_root" "could not read free space for $RUNS_ROOT"
 elif [ "$RUNS_ROOT_GB" -lt "$HEALTH_MIN_RUNS_ROOT_GB" ]; then
@@ -395,7 +400,9 @@ elif [ "$RUNS_ROOT_GB" -lt "$HEALTH_MIN_RUNS_ROOT_GB" ]; then
 else
     record PASS "A.disk.runs_root" "free=${RUNS_ROOT_GB}GB at $RUNS_ROOT"
 fi
-if ! is_int "$DOCKER_ROOT_GB"; then
+if [ -z "$DOCKER_ROOT" ]; then
+    record WARN "A.disk.docker_root" "could not resolve docker data-root (docker info -f '{{.DockerRootDir}}'); refusing to guess /var/lib"
+elif ! is_int "$DOCKER_ROOT_GB"; then
     record WARN "A.disk.docker_root" "could not read free space for $DOCKER_ROOT"
 elif [ "$DOCKER_ROOT_GB" -lt "$HEALTH_WARN_DOCKER_ROOT_GB" ]; then
     # Below WARN line — append a one-line docker storage snapshot and a
