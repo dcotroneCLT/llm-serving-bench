@@ -13,6 +13,7 @@ in the style of tests/test_phase_*.py. They cover:
 
 Run: python3 -m unittest tests.test_phase_b_campaign
 """
+import io
 import json
 import signal
 import sys
@@ -430,12 +431,15 @@ class PreflightCalibration(unittest.TestCase):
 
 
 class FakePopenFactory:
-    def __init__(self, rc):
+    def __init__(self, rc, out_lines=None):
         self.rc = rc
         self.cmd = None
         self.waited = False
+        # Emulate a child whose merged stdout/stderr is a PIPE. None means "no
+        # pipe" (the plumbing path where _stream_child_output is a no-op).
+        self.stdout = io.StringIO("".join(out_lines)) if out_lines else None
 
-    def __call__(self, cmd, stdout=None, stderr=None):
+    def __call__(self, cmd, stdout=None, stderr=None, **kwargs):
         self.cmd = cmd
         return self
 
@@ -459,9 +463,46 @@ class LaunchCellPlumbing(unittest.TestCase):
             self.assertIn("2", fake.cmd)
             self.assertIn("--calibration-file", fake.cmd)
             self.assertIn("--allow-lower-bound-calibration", fake.cmd)
-            # launch_cell.log created under the run_dir.
-            run_dir = c.runs_root / "testc_a_r01"
-            self.assertTrue((run_dir / "launch_cell.log").exists())
+            # Per-attempt capture file created under state/logs (NOT run_dir,
+            # which must stay fresh for launch_cell's freshness guard), and
+            # recorded on the run status for diagnostics.
+            attempt_log = c.state_path.parent / "logs" / "testc_a_r01_attempt2.log"
+            self.assertTrue(attempt_log.exists())
+            self.assertEqual(c.state.runs["a_r01"].log_path, str(attempt_log))
+
+    def test_child_output_streamed_and_captured_on_failure(self):
+        # Regression for the child-output capture gap: a failing child's stdout
+        # must reach BOTH the live terminal (sys.stdout) and the per-attempt
+        # capture file, and the failure must be traceable to that file.
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = make_spec("a")
+            c = make_campaign(tmp, [spec])
+            child_lines = [
+                "[launch_cell] starting engine\n",
+                "[launch_cell] FATAL container crashed\n",
+            ]
+            c._popen = FakePopenFactory(rc=5, out_lines=child_lines)
+
+            terminal = io.StringIO()
+            real_stdout = sys.stdout
+            sys.stdout = terminal
+            try:
+                rc = c._launch_cell_rc(spec, attempt=1)
+            finally:
+                sys.stdout = real_stdout
+
+            self.assertEqual(rc, 5)
+            # Child lines were streamed to the live terminal in real time.
+            streamed = terminal.getvalue()
+            for line in child_lines:
+                self.assertIn(line, streamed)
+            # ...and durably captured to the per-attempt file.
+            attempt_log = c.state_path.parent / "logs" / "testc_a_r01_attempt1.log"
+            captured = attempt_log.read_text()
+            for line in child_lines:
+                self.assertIn(line, captured)
+            # The failure is traceable to the capture file (campaign log ref).
+            self.assertIn(str(attempt_log), streamed)
 
 
 # --------------------------------------------------------------------------

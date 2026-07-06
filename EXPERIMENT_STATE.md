@@ -8,7 +8,62 @@ Last updated: 2026-07-05 (ET).
 
 ---
 
-## ⏸️ RESUME HERE (2026-07-05) — repass gate GREEN, PHASE B unblocked
+## ⏸️ RESUME HERE (2026-07-06) — PHASE B items 2+4 and reliability batches R1-R3 DONE and box-validated
+
+**Where we are.** After the repass gate went green (see the 2026-07-05 block
+below), PHASE B advanced and a three-round external reliability review was
+absorbed. Everything below is committed, unit-tested (113+ tests green) and
+validated on cci-csgpu11:
+
+- **PHASE B item 2 (typed lifecycle)** DONE: `EngineLifecycle` in
+  `launch_cell.py` (`single_container` byte-compatible / `dynamo_disagg`
+  driving the committed deploy scripts). Box-validated: unattended bring-up
+  -> GATE PASS -> clean teardown, VRAM quiescence on both GPUs.
+- **PHASE B item 4 (reaper + ledger)** DONE: reap-before-bringup,
+  record-after-spawn, deregister-on-end, locked atomic ledger. Box-validated:
+  live synthetic orphan killed pre-bringup; ledger cleared on a real crashed
+  run; deregister on clean end.
+- **Reliability batches R1-R3** (from three external review rounds, each
+  finding re-verified by the implementer before fixing): R1 = engine runtime
+  health checks (container liveness, /v1/models re-check, client all-fail
+  window; deliberately NO drop-rate threshold), early signal handlers incl.
+  SIGHUP, full dyn_* stale sweep, verified sudo kills, teardown that never
+  masks finalization (teardown_errors). R2 = spawn-to-record window closed,
+  launcher_pid/create_time in ledger entries (reap only if launcher dead,
+  refuse start if alive), runtime membership check (recent ticks:
+  membership_complete + n_pids_unexpected==0 + leader create_time anchor),
+  client latencies on monotonic anchors (CSV schema unchanged). R3 =
+  run-slot flock held for the whole run (atomic serial-run claim, exit 9 on
+  contention), host-wide orphan sweep gated on the lock, membership tick
+  freshness (120s monotonic stall bound) + strict parsing, client drain
+  grace + fail-loud write-after-close, stale child_pids.json cleanup.
+- **Box validation of the above (2026-07-06 night), all PASS:** TEST A
+  concurrent launch refused by the flock (exit 9) with the victim run
+  undisturbed; TEST B stray decoy process detected via n_pids_unexpected
+  (3 consecutive health strikes) -> loud abort exit 2, clean teardown, empty
+  ledger; TEST C `docker kill dyn_decode_1` mid-run -> loud abort exit 2
+  within ~90s. Plus a clean 25-min positive run (GATE PASS, no health-check
+  false positives).
+
+**Deliberately rejected in review triage (documented decisions):** client
+error/drop-rate thresholds (drops are a stress-workload signal, e3 ran at
+14-16% dropped in a stationary regime); monitor CSV timestamp/schema changes
+(byte-compat; NTP-step risk handled as a TTV assumption -- PENDING: confirm
+the box slews, chrony absent, check timedatectl/timesyncd); ledger
+heartbeats/multi-slot support (campaign is strictly serial by design); full
+cgroup identity validation (leader create_time anchor suffices given runtime
+health checks).
+
+**NEXT STEP (resume here):** PHASE B item 3 -- serialize `campaign.py`
+(strictly serial scheduling on the launch_cell production path, no parallel
+slots) -> item 5 mid-run disk watchdog -> LONG TEST on the production path.
+Reviews are CLOSED for the long test; further findings go to the pre-campaign
+backlog. Also pending: manifest `interruption_reason` micro-fix (prompt
+already drafted), NTP slew evidence from the box.
+
+---
+
+## RESUME (2026-07-05, historical) — repass gate GREEN, PHASE B unblocked
 
 **Gate result (2026-07-05, box, wosar env):** `deploy/dynamo/repass_gate2.sh`
 OVERALL: PASS -- all eight checks green (pip_pin, bringup, validator incl.

@@ -600,25 +600,67 @@ class Campaign:
             log(f"archived pre-existing run_dir for {spec.run_key}: {archived}")
         return run_dir
 
+    def _stream_child_output(self, proc, capture) -> None:
+        """Fan the child's merged stdout/stderr, line by line in real time, to
+        BOTH the terminal+campaign log (via sys.stdout, which main() tees into
+        the campaign log) and the per-attempt capture file.
+
+        Without this the child's lines -- the primary evidence when a run fails
+        -- would land only in a file the operator has to go hunting for, and
+        never reach the live terminal or the durable campaign log.
+
+        Blocks until the child closes its pipe (EOF), which is what we want on a
+        strictly serial campaign. A SIGTERM forwarded by handle_signal() makes
+        launch_cell tear down and close the pipe, ending this loop; wait() then
+        returns. readline() is auto-retried across the signal (PEP 475), so the
+        handler runs without corrupting the stream."""
+        out = getattr(proc, "stdout", None)
+        if out is None:
+            return
+        for line in iter(out.readline, ""):
+            capture.write(line)
+            capture.flush()
+            # launch_cell already prefixes its lines with "[launch_cell] ...",
+            # so the source stays attributable interleaved with campaign lines.
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
     def _launch_cell_rc(self, spec: RunSpec, attempt: int) -> int:
         """Spawn launch_cell for one run and wait for it to fully exit. Returns
         the child exit code. All docker/subprocess/fs side effects live here so
         the retry/resume/signal logic above stays unit-testable."""
         run_dir = self._prepare_run_dir(spec, attempt)
         run_dir.mkdir(parents=True, exist_ok=True)
-        launch_log = run_dir / "launch_cell.log"
-        self._status(spec).log_path = str(launch_log)
+        # Per-attempt capture file lives beside the campaign log (state/logs),
+        # NOT inside run_dir: launch_cell's assert_run_dir_fresh only tolerates
+        # a pre-created launch_cell.log, so a per-attempt name or a logs/ subdir
+        # there would trip its freshness guard. state/logs also survives the
+        # run_dir archival that _prepare_run_dir does on each attempt.
+        log_dir = self.state_path.parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        attempt_log = log_dir / f"{run_dir.name}_attempt{attempt}.log"
+        self._status(spec).log_path = str(attempt_log)
 
         cmd = self._build_cmd(spec, attempt)
         log(f"starting {spec.run_key} attempt={attempt}")
         log(f"cmd: {' '.join(cmd)}")
+        log(f"child output -> {attempt_log}")
 
-        with open(launch_log, "ab", buffering=0) as log_f:
-            self.current_proc = self._popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+        with open(attempt_log, "a", buffering=1) as capture:
+            self.current_proc = self._popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
             try:
+                self._stream_child_output(self.current_proc, capture)
                 rc = self.current_proc.wait()
             finally:
                 self.current_proc = None
+        if rc != 0:
+            log(f"{spec.run_key} attempt={attempt} rc={rc}; child log: {attempt_log}")
         return rc
 
     def _dispatch(self, spec: RunSpec) -> int:
