@@ -97,6 +97,43 @@ class HostWideSweep(unittest.TestCase):
         self.assertTrue(any("could NOT kill" in ln for ln in lines), lines)
 
 
+# --- R3-5: stale child_pids.json cleanup --------------------------------------
+class StaleChildPidsCleanup(unittest.TestCase):
+    def _seed_recovered(self, runs_root, run_id="lost"):
+        run_dir = runs_root / run_id
+        run_dir.mkdir(parents=True)
+        cp = run_dir / "child_pids.json"
+        cp.write_text('{"run_id": "%s", "run_dir": "%s", "monitors_pid": 4242, '
+                      '"client_pid": 4243, "launcher_pid": 999999999, '
+                      '"launcher_create_time": 1.0}' % (run_id, run_dir))
+        return cp
+
+    def test_recovered_dead_file_cleaned_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_root = Path(tmp)
+            cp = self._seed_recovered(runs_root)
+            # No live orphans (pids not ours) -> clean dead -> file removed.
+            with mock.patch.object(reaper, "_is_ours", return_value=None):
+                lines = reaper.reap_orphans(runs_root, current_run_id="new")
+            self.assertTrue(any("removed stale child_pids.json" in ln for ln in lines), lines)
+            self.assertFalse(cp.exists(), "stale child_pids.json should be removed")
+            # A second reap does not re-recover / re-log it (file is gone).
+            lines2 = reaper.reap_orphans(runs_root, current_run_id="new")
+            self.assertFalse(any("recovered run lost" in ln for ln in lines2), lines2)
+
+    def test_unkillable_recovered_file_retained_as_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_root = Path(tmp)
+            cp = self._seed_recovered(runs_root)
+            # A live orphan we cannot kill -> keep the file (evidence) + retain ledger.
+            with mock.patch.object(reaper, "_is_ours", return_value="python run_client.py --run lost"), \
+                 mock.patch.object(reaper, "_kill_pgid", return_value=False):
+                lines = reaper.reap_orphans(runs_root, current_run_id="new")
+            self.assertTrue(any("could NOT kill" in ln for ln in lines), lines)
+            self.assertTrue(cp.exists(), "unkillable-case child_pids.json must be kept")
+            self.assertEqual(reaper.ledger_run_ids(runs_root), ["lost"])
+
+
 # --- R3-3: membership freshness + strictness ----------------------------------
 def _args(tmp):
     return types.SimpleNamespace(repo_root=REPO, component_pids=Path(tmp) / "pids.json")

@@ -48,7 +48,9 @@ alive launcher is an active run -- its entry is retained and the caller refuses 
 start. Entries written by older code (no launcher fields) are treated as
 launcher-dead (reapable). As a second line of defense, reap also recovers runs
 from run_dir/child_pids.json (written before the ledger upsert) so a launcher that
-died between the client spawn and the ledger write still gets its client reaped.
+died between the client spawn and the ledger write still gets its client reaped. A
+recovered file confirmed dead (no live orphan) is then removed so completed runs
+are not re-scanned/re-logged forever; it is kept when a reap failed (evidence).
 
 Atomic serial-run guard: acquire_run_slot() takes a non-blocking exclusive flock
 on <runs_root>/.run_slot.lock, held for the whole run, so two launchers starting
@@ -414,6 +416,7 @@ def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[
             child_files = sorted(runs_root.glob("*/child_pids.json"))
         except OSError:
             child_files = []
+        recovered_files: dict[str, Path] = {}  # run_id -> its child_pids.json (recovered)
         for cp in child_files:
             try:
                 e = json.loads(cp.read_text())
@@ -422,6 +425,7 @@ def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[
             rid = e.get("run_id", "")
             if rid and rid not in by_id:
                 by_id[rid] = e
+                recovered_files[rid] = cp
                 out.append(f"[reaper] recovered run {rid} from {cp.name} (not in ledger)")
         if not by_id:
             out.append("[reaper] no recorded runs; nothing to reap")
@@ -429,6 +433,7 @@ def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[
 
         retained: list[dict] = []
         for run_id, r in by_id.items():
+            retained_this = False
             # R2-2: never reap a run whose launcher is genuinely alive -- that is
             # an active run (an accidental concurrent start), not an orphan. Retain
             # it so the caller refuses to start over it.
@@ -436,28 +441,40 @@ def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[
                 out.append(f"[reaper] run {run_id}: launcher pid={r.get('launcher_pid')} is ALIVE; "
                            f"NOT reaping (active run / accidental concurrent start)")
                 retained.append(r)
-                continue
-            run_dir = Path(r.get("run_dir", ""))
-            killed = 0
-            unkillable = 0
-            for pid in _candidate_pids(run_dir, r.get("monitors_pid"), r.get("client_pid")):
-                cl = _is_ours(pid, run_id)
-                if cl is None:
-                    continue
-                if _kill_pgid(pid):
-                    killed += 1
-                    out.append(f"[reaper] killed orphan pid={pid} run={run_id}: {cl[:80]}")
-                else:
-                    unkillable += 1
-                    out.append(f"[reaper] FATAL: could NOT kill live orphan pid={pid} "
-                               f"run={run_id}: {cl[:80]}; ledger entry RETAINED")
-            if unkillable:
-                # Keep the entry: a live orphan we could not kill must never be
-                # dropped from the record. The caller treats a retained entry as
-                # fatal for the next run.
-                retained.append(r)
-            elif killed == 0:
-                out.append(f"[reaper] run {run_id}: no live orphans")
+                retained_this = True
+            else:
+                run_dir = Path(r.get("run_dir", ""))
+                killed = 0
+                unkillable = 0
+                for pid in _candidate_pids(run_dir, r.get("monitors_pid"), r.get("client_pid")):
+                    cl = _is_ours(pid, run_id)
+                    if cl is None:
+                        continue
+                    if _kill_pgid(pid):
+                        killed += 1
+                        out.append(f"[reaper] killed orphan pid={pid} run={run_id}: {cl[:80]}")
+                    else:
+                        unkillable += 1
+                        out.append(f"[reaper] FATAL: could NOT kill live orphan pid={pid} "
+                                   f"run={run_id}: {cl[:80]}; ledger entry RETAINED")
+                if unkillable:
+                    # Keep the entry: a live orphan we could not kill must never be
+                    # dropped from the record. The caller treats a retained entry as
+                    # fatal for the next run.
+                    retained.append(r)
+                    retained_this = True
+                elif killed == 0:
+                    out.append(f"[reaper] run {run_id}: no live orphans")
+            # R3-5: a RECOVERED run confirmed dead with no live orphans leaves a
+            # stale child_pids.json that would be re-scanned and re-logged on every
+            # future launch. Remove it. KEEP it when the entry was retained (active
+            # launcher, or an unkillable orphan = evidence).
+            if run_id in recovered_files and not retained_this:
+                try:
+                    recovered_files[run_id].unlink()
+                    out.append(f"[reaper] removed stale child_pids.json for completed run {run_id}")
+                except OSError:
+                    pass
         # Cleaned runs are dropped; active-launcher and unkillable-orphan runs
         # remain (the current run re-adds itself via record_children after spawn).
         return retained
