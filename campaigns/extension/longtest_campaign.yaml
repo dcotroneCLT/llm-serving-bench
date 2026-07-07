@@ -1,0 +1,84 @@
+# LONG TEST campaign -- the final gate before the ~57-run DoW campaign.
+#
+# Drives scripts/campaign.py (STRICTLY SERIAL). Two runs, in order:
+#   1. longtest_dynamo_disagg -- the box-validated Dynamo cell for the full 48h
+#      production duration at the low (0.30 x ceiling) DoW rate. Proves an
+#      unattended multi-day run of the production launch path.
+#   2. val_vllm -- a short single-container run with no calibration. This is
+#      DELIBERATE: it proves the serial hand-off AFTER a 48h run (teardown, VRAM
+#      quiescence, inter-run cooldown, then an OPPOSITE-lifecycle bring-up) --
+#      the exact cycle the DoW campaign repeats ~57 times.
+#
+# Launch it unattended with scripts/run_longtest.sh (inside tmux); watch it with
+# scripts/longtest_status.sh from any second SSH session.
+
+campaign_id: extension_longtest
+
+# Strict-serial marker. campaign.py REFUSES to run unless mode == "serial".
+mode: serial
+
+description: |
+  WoSAR 2026 extension LONG TEST: a 48h Dynamo-disagg production-duration run
+  followed by a short vLLM hand-off run, on the launch_cell production path.
+  Final dress rehearsal before the full ~57-run DoW campaign.
+
+# One replica of each cell (this is a rehearsal, not a replication).
+replicas_per_cell: 1
+order: cell_at_a_time
+
+# Extra cooldown AFTER launch_cell has fully exited (teardown + VRAM quiescence
+# already happen inside launch_cell) before the next run starts. Longer than the
+# DoW default so the 48h -> short hand-off has generous settling margin.
+inter_run_cooldown_s: 600
+
+# Per-run overhead added to each cell's duration_s for the pre-flight estimate
+# only (startup + teardown + cooldown). Does not affect execution.
+est_run_overhead_s: 3600
+
+# Pre-flight free-space gate on runs_root (GB). Also passed to launch_cell as
+# --min-free-gb so each run re-checks at start.
+min_free_gb: 50
+
+# SC-2 mid-run disk watchdog floor (GB), passed to launch_cell as
+# --min-free-gb-mid-run. During the run, launch_cell re-measures free space on
+# the runs-root and the REAL docker data-root every ~5 min and aborts (exit 7 =>
+# campaign-fatal, no retry) if either drops below this.
+min_free_gb_mid_run: 25
+
+# Global default for accepting a non-saturated ("lower bound") calibration.
+# Off: a non-saturated ceiling makes the fraction-of-ceiling rate meaningless.
+allow_lower_bound_calibration: false
+
+# Retry policy: one automatic re-attempt on an ordinary launch_cell failure.
+# launch_cell exit 6/7/8/9 (NONRETRYABLE_EXIT_CODES) are host/precondition
+# fatals -- campaign.py stops the whole campaign loudly instead of retrying.
+retry_policy:
+  max_retries: 1
+
+# Runs root. Each (cell, replica) gets <runs_root>/<campaign_id>_<cell_id>_r<NN>/.
+runs_root: /home/dcotrone/wosar/runs
+
+# Paths passed to launch_cell.
+paths:
+  hf_cache_host: /home/dcotrone/wosar/hf_cache
+  repo_root: /home/dcotrone/wosar/llm-serving-bench
+
+# Campaign state + logs, relative to this file. DISTINCT from the DoW campaign's
+# state/campaign_state.json so the long test cannot collide with or clobber it.
+state_file: state/longtest_campaign_state.json
+
+# Ordered cell list.
+cells:
+  # 1. The 48h Dynamo-disagg run. calibration_required: a missing or invalid
+  #    calibration fails PRE-FLIGHT (before run 1), never at hour 47. The
+  #    calibration JSON is produced by scripts/run_longtest.sh (calibrate_rate.py
+  #    at --fraction 0.30) into the path below, resolved relative to this file.
+  - id: longtest_dynamo_disagg
+    yaml: cells/longtest_dynamo_disagg.yaml
+    calibration_file: state/calibration/longtest_dynamo_disagg.json
+    calibration_required: true
+
+  # 2. Short vLLM hand-off run (no calibration -- fixed low rate in the cell).
+  - id: val_vllm
+    yaml: cells/val_vllm.yaml
+    calibration_required: false

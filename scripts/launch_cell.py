@@ -262,6 +262,24 @@ def append_disk_usage_row(csv_path: Path, row: dict) -> None:
         w.writerow([row[k] for k in DISK_USAGE_FIELDS])
 
 
+def heartbeat_line(elapsed_s: float, duration_s: float, client_summary: dict,
+                   runs_root_free_gb: Optional[float], health_note: str) -> str:
+    """Build the one-line unattended progress heartbeat. Formatting-only (no I/O)
+    so it is unit-testable; the caller supplies the elapsed monotonic delta, the
+    client summary from summarize_client_csvs (the existing cumulative reader),
+    and free_gb(runs_root)."""
+    elapsed_h = elapsed_s / 3600.0
+    total_h = duration_s / 3600.0
+    pct = (elapsed_s / duration_s * 100.0) if duration_s > 0 else 0.0
+    total = client_summary.get("total", 0)
+    ok = client_summary.get("ok", 0)
+    dropped = client_summary.get("dropped", 0)
+    free = f"{runs_root_free_gb:.1f}" if runs_root_free_gb is not None else "unknown"
+    return (f"progress: elapsed {elapsed_h:.1f}h / {total_h:.1f}h ({pct:.0f}%), "
+            f"client total={total} ok={ok} dropped={dropped}, "
+            f"runs-root free {free} GB, health {health_note}")
+
+
 def render(template: str, **subs: str) -> str:
     """Substitute {placeholder} tokens in a template string."""
     out = template
@@ -609,6 +627,7 @@ ENDPOINT_DEAD_MIN_ROWS = 5        # need at least this many rows before declarin
 # cannot catch. The supervision loop re-measures free space on this slower
 # cadence (statvfs is cheap) and aborts if either filesystem breaches the floor.
 DISK_CHECK_EVERY_S = 300              # ~5 min (a multiple of HEALTH_CHECK_EVERY_S)
+HEARTBEAT_EVERY_S = 1800              # 30 min unattended progress line (reuses the loop's monotonic cadence)
 DEFAULT_MIN_FREE_GB_MID_RUN = 10.0    # below the pre-run gate so a tight start is not instant death
 DISK_USAGE_FIELDS = ["ts_unix", "runs_root_free_gb", "docker_root_free_gb", "run_dir_size_mb"]
 
@@ -1992,6 +2011,8 @@ def main() -> None:
     health_fail_streak = 0
     last_health_mono = started_mono
     last_disk_mono = started_mono
+    last_heartbeat_mono = started_mono
+    last_health_note = "OK"  # most recent health verdict, shown in the heartbeat line
     disk_csv_warned = False  # log a non-fatal disk_usage.csv write failure only once
     # Set to 7 by the mid-run disk watchdog so the run exits with the free-space
     # code the campaign treats as CAMPAIGN-FATAL (disk does not free itself, so a
@@ -2026,8 +2047,10 @@ def main() -> None:
                 reason = lifecycle.health_check()
                 if reason is None:
                     health_fail_streak = 0
+                    last_health_note = "OK"
                 else:
                     health_fail_streak += 1
+                    last_health_note = reason
                     log(f"WARNING: engine health check failed "
                         f"({health_fail_streak}/{HEALTH_FAIL_CONSECUTIVE}): {reason}")
                     if health_fail_streak >= HEALTH_FAIL_CONSECUTIVE:
@@ -2084,6 +2107,19 @@ def main() -> None:
                     interruption_reason = interruption_reason or breach
                     exit_code_override = 7
                     break
+
+            # Unattended progress heartbeat (~every HEARTBEAT_EVERY_S). Reuses the
+            # loop's monotonic cadence (no new timer), summarize_client_csvs (the
+            # existing cumulative CSV reader -- client_all_fail_window only yields
+            # a rolling all-fail count, not total/ok/dropped), and the child ->
+            # campaign stdout stream (no second transport): the log() line reaches
+            # the tmux pane AND the campaign per-attempt log.
+            if now_mono - last_heartbeat_mono >= HEARTBEAT_EVERY_S:
+                last_heartbeat_mono = now_mono
+                log(heartbeat_line(
+                    now_mono - started_mono, float(duration_s),
+                    summarize_client_csvs(run_dir / "client"),
+                    free_gb(args.runs_root), last_health_note))
     finally:
         # 13. Graceful teardown.
         if interrupted:

@@ -373,3 +373,35 @@ It ends with a single summary; the gate is green only when OVERALL is PASS:
 | `verify_scoping` | smaps USS of all dynamo PIDs matches the recorded-pgid aggregate within tolerance (COMPLETE) |
 | `fail_loud_negative` | bring-up against a bogus model EXITS NON-ZERO (does not proceed) |
 | `disk_root` | the disk check resolves `DockerRootDir`, not `/var/lib` |
+
+## Long test (final gate before the DoW campaign)
+
+The long test is the unattended dress rehearsal for the ~57-run DoW campaign:
+a 48h Dynamo-disagg production-duration run at the low (0.30 x ceiling) DoW
+rate, followed by a short vLLM hand-off run that proves the serial cycle
+(teardown -> VRAM quiescence -> cooldown -> opposite-lifecycle bring-up).
+
+Launch it inside tmux and walk away; `scripts/run_longtest.sh` runs the whole
+chain (guard -> calibration -> dry-run -> serial campaign -> verdict) and stops
+hard on any failure. Calibration brings the Dynamo stack up via the `deploy/`
+scripts, runs `calibrate_rate.py` at fraction 0.30, and tears it down; a
+non-`ok` calibration is a HARD STOP (never a silent fallback to an uncalibrated
+rate). The mid-run disk watchdog and 30-min heartbeat run inside `launch_cell`.
+
+```bash
+tmux new -s longtest
+bash scripts/run_longtest.sh            # add --recalibrate to force a fresh sweep
+```
+
+Watch progress from a second SSH session (read-only, never touches the run):
+
+```bash
+bash scripts/longtest_status.sh
+```
+
+The runner tees everything to `campaigns/extension/state/logs/longtest_<UTC>.log`
+and is safely re-runnable after an interruption (it detects an existing state
+file and `--resume`s). On exit it prints the per-run status, the campaign exit
+code (0 ok / 4 interrupted / 5 fatal), and the exact
+`validate_extension_run.py` / `validation_check.py` / `aging_trends.py`
+commands to run next.

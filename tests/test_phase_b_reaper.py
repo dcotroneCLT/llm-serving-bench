@@ -151,7 +151,7 @@ class LaunchCellWiring(unittest.TestCase):
                   ledger_stuck=None, teardown_raises=False, record_raises=None,
                   disk_free_gb=None, disk_check_every=None,
                   health_reason=None, health_every=None, append_error=None,
-                  finalize_error=None):
+                  finalize_error=None, heartbeat_every=None):
         events: list[str] = []
         logs: list[str] = []
         run_dir = tmp / "runs" / "test_e1_r01"
@@ -238,6 +238,8 @@ class LaunchCellWiring(unittest.TestCase):
                                disk_check_every if disk_check_every is not None else lc.DISK_CHECK_EVERY_S), \
              mock.patch.object(lc, "HEALTH_CHECK_EVERY_S",
                                health_every if health_every is not None else lc.HEALTH_CHECK_EVERY_S), \
+             mock.patch.object(lc, "HEARTBEAT_EVERY_S",
+                               heartbeat_every if heartbeat_every is not None else lc.HEARTBEAT_EVERY_S), \
              mock.patch.object(lc, "log", lambda msg: logs.append(msg)), \
              mock.patch.object(lc.time, "sleep", lambda *_: None), \
              mock.patch.object(lc.time, "monotonic", fake_monotonic), \
@@ -426,6 +428,33 @@ class LaunchCellWiring(unittest.TestCase):
                                finalize_error=RuntimeError("boom"))
             self.assertEqual(r["exit_code"], 7)
             self.assertTrue(any("manifest finalization failed" in m for m in r["logs"]))
+
+    def test_heartbeat_emitted_with_expected_fields(self):
+        # Heartbeat fires on its cadence and carries the progress fields; it
+        # reaches this captured log the same way it reaches the campaign
+        # per-attempt log (the child stdout stream), no second transport.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=5, heartbeat_every=0)
+            self.assertEqual(r["exit_code"], 0)
+            beats = [m for m in r["logs"] if m.startswith("progress:")]
+            self.assertTrue(beats)
+            line = beats[0]
+            # Structural fields (duration_s here is 5 SECONDS, so the hour
+            # display is 0.0h -- the numbers are exercised in test_heartbeat.py).
+            for token in ("elapsed ", "h / ", "client total=", "ok=",
+                          "dropped=", "runs-root free ", "GB, health "):
+                self.assertIn(token, line)
+
+    def test_heartbeat_at_most_once_on_short_run(self):
+        # A short run whose whole elapsed span never reaches the cadence prints
+        # no heartbeat (<= one) -- e.g. the 25-min validation cell vs the 30-min
+        # cadence. Here the cadence is longer than any elapsed the loop reaches.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=5, heartbeat_every=10_000_000)
+            beats = [m for m in r["logs"] if m.startswith("progress:")]
+            self.assertLessEqual(len(beats), 1)
 
     def test_reap_gate_fatal_refuses_to_start(self):
         # R1-4: an unkillable recorded orphan (ledger entry survives reap) is

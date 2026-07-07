@@ -756,6 +756,30 @@ class MainGuards(unittest.TestCase):
         with self.assertRaises(camp.PreflightError):
             camp.load_campaign(legacy)
 
+    def test_longtest_campaign_loads_and_enforces_contract(self):
+        # The LONG TEST campaign must parse under the serial orchestrator, order
+        # the two runs, require calibration on the 48h Dynamo cell, and use a
+        # DISTINCT state_file so it cannot collide with the DoW campaign.
+        yaml_path = REPO / "campaigns" / "extension" / "longtest_campaign.yaml"
+        if not yaml_path.exists():
+            self.skipTest("longtest campaign not present")
+        campaign = camp.load_campaign(yaml_path)
+        self.assertEqual(campaign["mode"], "serial")
+        self.assertEqual(campaign["campaign_id"], "extension_longtest")
+
+        sched = camp.build_schedule(campaign, yaml_path)
+        self.assertEqual([s.cell_id for s in sched],
+                         ["longtest_dynamo_disagg", "val_vllm"])
+        by_cell = {s.cell_id: s for s in sched}
+        # 48h Dynamo cell: calibration REQUIRED (fails pre-flight, not at hour 47).
+        self.assertTrue(by_cell["longtest_dynamo_disagg"].calibration_required)
+        self.assertFalse(by_cell["val_vllm"].calibration_required)
+
+        # Distinct state_file from the DoW extension campaign.
+        dow = camp.load_campaign(REPO / "campaigns" / "extension" / "campaign.yaml")
+        self.assertNotEqual(campaign.get("state_file"), dow.get("state_file"))
+        self.assertEqual(campaign.get("state_file"), "state/longtest_campaign_state.json")
+
 
 if __name__ == "__main__":
     unittest.main()
