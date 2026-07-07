@@ -79,15 +79,39 @@ clean), but this is exactly the class of degradation the DoW prefix-repeat
 factor will stress for 48h. If it recurs at non-trivial rates, 48h runs will
 burn whole retry budgets; keep an eye on per-cell attempt budgeting.
 
-**NEXT STEP (resume here):** PHASE B item 5 -- mid-run disk watchdog on the
-launch_cell supervision path (runs-root + real DockerRootDir, graceful
-teardown below floor, campaign-fatal semantics) -> LONG TEST on the
-production path. Reviews are CLOSED for the long test; further findings go
-to the pre-campaign backlog. Residual small items: manifest
-`interruption_reason` micro-fix (prompt drafted, not yet run), NTP slew
-evidence from the box (chrony absent; need `timedatectl`), campaign Ctrl-C
-interrupt+resume never manually exercised on the box (covered by synthetic
-SIGTERM test + the real retry; will be exercised in the long-test dry run).
+**PHASE B item 5 (mid-run disk watchdog) DONE and box-validated (2026-07-07).**
+Watchdog in the shared supervision loop (5-min cadence, both lifecycles):
+runs-root + real DockerRootDir vs --min-free-gb-mid-run (campaign yaml 25GB,
+below the 50GB pre-run gate); breach -> graceful teardown, manifest
+interruption_reason, exit 7 (campaign-fatal, no retry burned). Trend rows in
+run_dir/disk_usage.csv feed the deferred gzip decision. Static-check audit
+fixed smoke_test.sh (gated the wrong filesystem) and campaign_health.sh
+(/var/lib fallback -> WARN). A three-pass external review then hardened the
+exit-code contract end to end: trend-CSV write failures can no longer mask a
+breach; STORAGE_FATAL_ERRNOS={ENOSPC,EDQUOT,EROFS,EIO} all escalate to 7;
+the finalization tail is wrapped so a decided exit code survives any
+finalization exception (a manifest lost to a full disk is acceptable, the
+exit code is the contract); rc=6 covers non-retryable preconditions as
+status "precondition_failed"; NONRETRYABLE_EXIT_CODES={6,7,8,9} is the
+single source of truth with a drift test. Box validation: positive run exit
+0 with silent watchdog + populated disk_usage.csv; negative (impossible
+floor) exit 7 with reason in the manifest; validation_check fixed to honor
+manifest warmup_discard_s (was: hardcoded 1800/3600 heuristic zeroing short
+runs) and PASSes the val_vllm run at +15.9 MB/h RSS, p<0.01.
+
+**NTP question CLOSED (TTV assumption, documented):** the box runs
+systemd-timesyncd, `timedatectl` reports synchronized=yes / NTP active.
+Steady-state corrections are gradual slews; monitor CSVs stay on wall-clock
+ts_unix (byte-compat), client latencies are monotonic since R2-4. Recorded
+as a threat-to-validity assumption; revisit only if the box is ever seen
+stepping time mid-run.
+
+**NEXT STEP (resume here): the LONG TEST on the production path** -- the
+final gate before per-cell calibration and the ~57-run 48h DoW campaign.
+Reviews are CLOSED (three passes, findings converged from blocker to exotic
+errnos); further findings go to the pre-campaign backlog. Bookkeeping still
+owed to this file: summaries of review-fix commits 2322c09 (F1-F8) and
+ad18f22 (interruption_reason) from the implementer, for the record.
 
 ---
 
