@@ -31,6 +31,44 @@ localhost, and so the host `ps`/`/proc` sees the `python -m dynamo.*` processes
 | CUDA | Dynamo/Triton 13.x; standalone 12.9 (cu129). Both OK on driver 580.x |
 | Model | Qwen/Qwen2.5-7B-Instruct, ctx 8192, BF16 |
 
+## Triton + vLLM cell (extension, third system)
+
+The Triton arm of the extension campaign runs through the SAME validated
+`single_container` `launch_cell` path as standalone vLLM — no Dynamo-style
+multi-container lifecycle. Its cell is
+`campaigns/extension/cells/val_triton.yaml`, pinned to
+`nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3`
+(`engines/triton_vllm/image_pin_ext.json`, SC-1: vLLM 0.20.1). It serves
+Qwen2.5-7B-Instruct (ctx 8192) from the checked-in vLLM-backend
+`engines/triton_vllm/model_repository` (mounted at `/models`, model name
+`qwen`), tracks the Triton python child via the `triton_child` pid strategy, and
+reads readiness on Triton's `/v2/health/ready` (NOT `/v1/models` — the vLLM
+backend serves the KServe v2 routes). Host ports are **8600 HTTP / 8601 gRPC /
+8602 metrics** (→ container 8000/8001/8002), distinct from val_vllm (8500) and
+val_dynamo_disagg (8400) so the serial cycle never collides. Note: 26.05 ships
+vLLM 0.20.1, which is V1-only, so there is **no** `VLLM_USE_V1` toggle (unlike
+the 25.09 baseline e2/a2 cells).
+
+Verify flags against the image before the first run (Dynamo bring-up discipline);
+`tritonserver --help` does not touch the GPU:
+
+```bash
+docker run --rm nvcr.io/nvidia/tritonserver:26.05-vllm-python-py3 tritonserver --help | less
+```
+
+Validation run (20-min STEP 1, single GPU):
+
+```bash
+python3 scripts/launch_cell.py \
+    --cell-yaml campaigns/extension/cells/val_triton.yaml \
+    --replica 1 --runs-root ~/wosar/runs --repo-root ~/wosar/llm-serving-bench \
+    --hf-cache-host ~/wosar/hf_cache --campaign-id extension
+# end-to-end smoke once it is ready:
+curl -sS http://localhost:8600/v2/models/qwen/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text_input":"Reply with one word: hello","parameters":{"max_tokens":16}}'
+```
+
 ## 0. Verify the vLLM version (the whole point of the pin)
 
 The ground truth that all three systems share vLLM 0.20.1 (remote release notes

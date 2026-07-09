@@ -1,0 +1,117 @@
+# STEP 1 validation cell: Triton Inference Server + vLLM backend, vLLM 0.20.1,
+# single GPU. The THIRD and last extension system through the harness (Dynamo
+# and standalone vLLM are already validated). Confirms on real hardware that the
+# single-container monitor/client/manifest/analysis path is byte-compatible for
+# the Triton engine block after the WS2/WS3/WS4/WS5 changes.
+#
+# Layout mirrors val_vllm.yaml (extension single_container lifecycle); the engine
+# block is the Triton-specific one from the baseline cell (campaigns/wosar2026/
+# cells/e2.yaml), re-pinned to the LOCKED extension image (SC-1: vLLM 0.20.1,
+# tritonserver 26.05). See docs/extension_pin_constraint.md -- never bump.
+#
+# Run it via scripts/attach_run.py against a hand-started tritonserver container,
+# or via scripts/launch_cell.py which manages the container directly (default
+# single_container lifecycle, same as standalone vLLM).
+#
+# PID strategy note (inherited from the baseline Triton cell). Container PID 1 is
+# `tritonserver`, but the engine state (KV cache, scheduler, generation loop)
+# lives in a Python child the Triton vLLM backend spawns. proc_monitor must track
+# that child, not tritonserver, else RSS/FD/thread slopes under-estimate the leak;
+# find_engine_pid.py walks the descendants and picks the one matching the regex.
+#
+# Engine-version note (DIFFERS from the baseline e2/a2 assumption). Triton 25.09
+# defaulted to vLLM V0 and forced V1 via VLLM_USE_V1=1. Triton 26.05 ships vLLM
+# 0.20.1, which is V1-ONLY (V0 was removed upstream), so there is NO VLLM_USE_V1
+# env here and no V0 fallback to guard against. The triton_vllm protocol adapter
+# already handles the V1 SSE framing.
+
+cell_id: val_triton
+short_label: triton_vllm_020
+description: |
+  NVIDIA Triton Inference Server (26.05) with the vLLM Python backend serving
+  Qwen2.5-7B-Instruct from a local model_repository, vLLM 0.20.1, on one L40S.
+  V1 engine (the only engine in vLLM 0.20.1). STEP 1 validation of the
+  single-container path for the Triton hosting layer.
+
+engine:
+  image_repo: nvcr.io/nvidia/tritonserver
+  image_tag: 26.05-vllm-python-py3
+  digest_pin_file: engines/triton_vllm/image_pin_ext.json
+  container_name_template: "val_triton_r{replica}"
+
+  # tritonserver command. Args after the image (the NGC tritonserver image's
+  # default command is a shell, so tritonserver must be invoked explicitly).
+  command:
+    - tritonserver
+    - --model-repository=/models
+    - --log-verbose=1
+
+  env:
+    HF_HOME: /root/.cache/huggingface
+
+  shm_size: 8g
+  gpu_device: 0
+  # Host ports 8600-2, distinct from the other extension cells (val_vllm 8500,
+  # val_dynamo_disagg 8400) so a serial cycle never collides on host ports.
+  port_mapping:
+    - "8600:8000"       # HTTP
+    - "8601:8001"       # gRPC
+    - "8602:8002"       # Prometheus metrics
+  volumes:
+    # The vLLM-backend model_repository is materialized (checked in) for
+    # Qwen/Qwen2.5-7B-Instruct at ctx 8192, BF16, tp=1, gpu_mem 0.9 in
+    # engines/triton_vllm/model_repository/qwen/{config.pbtxt,1/model.json}.
+    # Same mechanism the baseline Triton cell uses: mount it read-through at
+    # /models rather than templating it per run.
+    - "{repo_root}/engines/triton_vllm/model_repository:/models"
+    - "{hf_cache_host}:/root/.cache/huggingface"
+  # Container json-file log rotation (SC-2) is applied unconditionally by
+  # build_docker_run_cmd (--log-opt max-size=50m --log-opt max-file=3); no
+  # per-cell knob is needed for it.
+
+  readyz:
+    # Triton readiness endpoint on the HTTP port -- returns 200 only when the
+    # model is fully loaded (NOT /v1/models; Triton's vLLM backend serves the
+    # KServe v2 routes, not the OpenAI ones).
+    url: "http://localhost:8600/v2/health/ready"
+    timeout_s: 900     # vLLM warmup inside Triton can take longer than standalone
+
+  pid_strategy:
+    type: triton_child
+    # Regex matched against the cmdline of descendants of tritonserver. The
+    # Triton Python backend stub launches a python process that imports the
+    # vLLM EngineCore; matching either keyword identifies the memory-holding PID.
+    process_pattern: "EngineCore|triton_python_backend_stub"
+
+monitors:
+  gpu_index_inherits_from_engine: true
+  proc:
+    label: triton_vllm_020
+    period_s: 5
+  gpu:
+    period_s: 1
+  system:
+    period_s: 5
+  rotation_s: 60
+
+workload:
+  client_config_overrides:
+    protocol: triton_vllm
+    base_url: "http://localhost:8600"
+    model: qwen                       # name of the model in model_repository
+    target_rate_rps: 1.0              # small fixed rate for the 20-min validation
+    concurrency_cap: 64
+    streaming_prob: 0.7
+    request_timeout_s: 600
+    # Exercise BOTH new client features so validation proves they take effect.
+    prefix_repeat_fraction: 0.8
+    shared_prefix_len: 512
+    arrival_mode: bursty
+    burst_factor: 4.0
+    burst_on_seconds: 5.0
+    seed_template: "{replica}"
+
+# Short validation window (not 48h).
+duration_s: 1200
+warmup_discard_s: 120
+post_run_cooldown_s: 120

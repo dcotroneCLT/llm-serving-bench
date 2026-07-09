@@ -106,12 +106,40 @@ ts_unix (byte-compat), client latencies are monotonic since R2-4. Recorded
 as a threat-to-validity assumption; revisit only if the box is ever seen
 stepping time mid-run.
 
-**NEXT STEP (resume here): the LONG TEST on the production path** -- the
-final gate before per-cell calibration and the ~57-run 48h DoW campaign.
-Reviews are CLOSED (three passes, findings converged from blocker to exotic
-errnos); further findings go to the pre-campaign backlog. Bookkeeping still
-owed to this file: summaries of review-fix commits 2322c09 (F1-F8) and
-ad18f22 (interruption_reason) from the implementer, for the record.
+**LONG TEST: PASS (2026-07-09). PHASE B and hardware validation CLOSED.**
+48h Dynamo-disagg production run + serial val_vllm hand-off, driven end to
+end by scripts/run_longtest.sh inside tmux (calibration at 0.30 x ceiling ->
+dry-run -> serial campaign), campaign exit 0, both runs COMPLETED at attempt
+1, ZERO human interventions over ~50h. Evidence: GATE PASS incl. no_orphans
+on the 48h run; zero warnings/sample_errors/non-OK heartbeats; disk curve
+complete (573/576 five-min samples), run_dir 105 MB at 48h, 0.39 GB total on
+runs-root -> **gzip decision CLOSED: not needed** (SC-2 point 4 retired).
+val_vllm hand-off PASS at +15.7 MB/h RSS (replicating +15.9 MB/h from two
+days earlier). Residual noted honestly: the mid-window verify_scoping was
+not run (operator away); scoping completeness rests on the short-run
+verifications plus n_pids_unexpected==0 per-tick across the full 48h.
+
+**First full-window Dynamo aging observation (paper-relevant):** engine
+aggregate USS=RSS=PSS growing at +7.6 MB/h (Sen CI [7.07, 8.03] MB/h,
+q~0), VMS +6.2 MB/h, system mem +9.1 MB/h, over 48h at 0.30 x ceiling
+(~0.23 rps realized, 40k+ requests, 1 error). GPU-side indicators flat.
+~365 MB of monotone growth per 48h window in the most modern disaggregated
+stack: RQ1 signal present on the extension platform.
+
+**NEXT STEP (resume here): pre-campaign phase.** In order:
+1. Triton+vLLM path: the third system has NOT yet been exercised in the
+   extension harness (Dynamo + standalone are). Build/validate the Triton
+   cell (single-container lifecycle, byte-compat expectations) + a short
+   validation gate run.
+2. Per-cell calibration (30%/85% of a conservative ceiling) with the
+   validated calibrate_rate path; keep calibration topology in sync with
+   cell topology.
+3. Populate the DoW campaign yaml (Res V 16-run + 3 center points across
+   the 5 workload factors x 3 systems, ~57 runs, strictly serial) and
+   dry-run it.
+Backlog (non-blocking): longtest_status.sh must fail loudly when run
+outside the wosar env (today it prints truncated paths); summaries of
+review-fix commits 2322c09/ad18f22 still owed to this file.
 
 ---
 
