@@ -18,9 +18,10 @@ replication baseline:
 
 - Model: `Qwen/Qwen2.5-7B-Instruct`, BF16.
 - Serving systems compared: Dynamo-disagg, Triton+vLLM, vLLM-standalone.
-- Full campaign: ~57 runs of 48h each; the descriptor currently ships two
-  STEP-1 validation cells so the serial path can be exercised end-to-end
-  before the 48h DoW cells and per-cell calibration are appended.
+- Full campaign: ~57 runs of 48h each; the descriptor currently ships three
+  STEP-1 validation cells (one per serving system) so the serial path can be
+  exercised end-to-end before the 48h DoW cells and per-cell calibration are
+  appended.
 - Warmup discard: first 1h excluded from slope and figure normalization.
 - Topology: **one serial queue**, no parallel GPU slots — the
   measurement-isolation constraint forbids concurrency (the dynamo_disagg

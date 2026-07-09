@@ -279,11 +279,18 @@ class ScheduledInCanonicalCampaign(unittest.TestCase):
         sched = self.camp.build_schedule(campaign, self.yaml_path)
         cell_ids = [s.cell_id for s in sched]
         self.assertIn("val_triton", cell_ids)
-        # All three validation systems present (no calibration required on any).
-        self.assertEqual(set(cell_ids),
-                         {"val_vllm", "val_dynamo_disagg", "val_triton"})
+        # SUBSET, not equality: the 48h DoW cells get APPENDED to this same
+        # queue later (see campaign.yaml + EXPERIMENT_STATE.md next step), so a
+        # correct fuller campaign must not turn this test red.
+        validation = {"val_vllm", "val_dynamo_disagg", "val_triton"}
+        self.assertTrue(
+            validation.issubset(set(cell_ids)),
+            f"validation cells missing from schedule: {sorted(validation - set(cell_ids))}")
         by_cell = {s.cell_id: s for s in sched}
-        self.assertFalse(by_cell["val_triton"].calibration_required)
+        # The validation cells use a fixed low rate -> no calibration required.
+        for cid in validation:
+            self.assertFalse(by_cell[cid].calibration_required,
+                             f"{cid} unexpectedly requires calibration")
 
 
 if __name__ == "__main__":

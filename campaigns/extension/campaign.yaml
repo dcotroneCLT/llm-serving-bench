@@ -26,8 +26,9 @@ mode: serial
 
 description: |
   WoSAR 2026 extension: workload DoW screening, one serial queue on the
-  launch_cell production path. Two STEP-1 validation cells here; extend with
-  the 48h DoW cells + per-cell calibration for the full ~57-run campaign.
+  launch_cell production path. Three STEP-1 validation cells here (one per
+  serving system); extend with the 48h DoW cells + per-cell calibration for
+  the full ~57-run campaign.
 
 # Number of replicas per cell (the DoW uses 3; the validation pass uses 1).
 replicas_per_cell: 1
