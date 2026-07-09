@@ -127,10 +127,12 @@ q~0), VMS +6.2 MB/h, system mem +9.1 MB/h, over 48h at 0.30 x ceiling
 stack: RQ1 signal present on the extension platform.
 
 **NEXT STEP (resume here): pre-campaign phase.** In order:
-1. Triton+vLLM path: the third system has NOT yet been exercised in the
-   extension harness (Dynamo + standalone are). Build/validate the Triton
-   cell (single-container lifecycle, byte-compat expectations) + a short
-   validation gate run.
+1. Triton+vLLM path: the third system's cell is now ADDED
+   (campaigns/extension/cells/val_triton.yaml, single-container lifecycle,
+   byte-compat verified off-box; wired into campaign.yaml's validation
+   queue). NEXT: hardware validation on the box -- confirm tritonserver
+   26.05 CLI flags via `tritonserver --help`, run the short validation gate,
+   and fill/confirm the image digest at pull time.
 2. Per-cell calibration (30%/85% of a conservative ceiling) with the
    validated calibrate_rate path; keep calibration topology in sync with
    cell topology.

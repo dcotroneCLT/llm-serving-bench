@@ -12,11 +12,11 @@
 # The measurement-isolation constraint forbids any concurrency: the dynamo_disagg
 # cells occupy both GPUs anyway, and the other systems must not share the host.
 #
-# This file starts with the two STEP-1 validation cells so the serial path can
-# be exercised end-to-end before the 48h DoW cells + per-cell calibration files
-# are added. To grow it to the full campaign, append one `cells:` entry per
-# 48h cell yaml with its calibration_file (see the calibration block below),
-# and set `calibration_required: true` on each.
+# This file starts with the three STEP-1 validation cells (one per serving
+# system) so the serial path can be exercised end-to-end before the 48h DoW
+# cells + per-cell calibration files are added. To grow it to the full campaign,
+# append one `cells:` entry per 48h cell yaml with its calibration_file (see the
+# calibration block below), and set `calibration_required: true` on each.
 
 campaign_id: extension_dow
 
@@ -95,7 +95,7 @@ state_file: state/campaign_state.json
 #                          PRE-FLIGHT (before run 1), not at run N=37
 #   allow_lower_bound_calibration: per-cell override of the global default
 #
-# The two validation cells below use a small fixed rate (no calibration), so
+# The three validation cells below use a small fixed rate (no calibration), so
 # calibration_required is false. The 48h DoW cells MUST set it true, e.g.:
 #   - id: dow_dynamo_c01
 #     yaml: cells/dow_dynamo_c01.yaml
@@ -107,4 +107,7 @@ cells:
     calibration_required: false
   - id: val_dynamo_disagg
     yaml: cells/val_dynamo_disagg.yaml
+    calibration_required: false
+  - id: val_triton
+    yaml: cells/val_triton.yaml
     calibration_required: false

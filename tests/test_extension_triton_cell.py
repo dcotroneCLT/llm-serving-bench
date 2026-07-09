@@ -22,16 +22,39 @@ Run: python3 -m unittest tests.test_extension_triton_cell
 """
 import importlib.util
 import json
+import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
 REPO = Path(__file__).resolve().parent.parent
 CELLS = REPO / "campaigns" / "extension" / "cells"
 TRITON_CELL = CELLS / "val_triton.yaml"
+
+
+def _host_ports(cell: dict) -> set[int]:
+    """Every host-facing port a cell claims: the host side of each
+    engine.port_mapping ("HOST:CONTAINER"), plus the ports embedded in the
+    readiness URL and the client base_url. Extracting all three means a future
+    cell that declares NO port_mapping (e.g. an attach-only cell) but still binds
+    a host port via its URLs cannot silently reuse one of ours undetected."""
+    eng = cell.get("engine", {})
+    ports: set[int] = set()
+    for pm in eng.get("port_mapping", []):
+        host = str(pm).split(":")[0]
+        if host.isdigit():
+            ports.add(int(host))
+    for url in (eng.get("readyz", {}).get("url"),
+                cell.get("workload", {}).get("client_config_overrides", {}).get("base_url")):
+        if url:
+            p = urlsplit(url).port
+            if p is not None:
+                ports.add(int(p))
+    return ports
 
 
 def _load_launch_cell():
@@ -102,6 +125,16 @@ class ImagePinSC1(unittest.TestCase):
         )
         pin = json.loads((REPO / eng["digest_pin_file"]).read_text())
         self.assertEqual(pin.get("vllm_version"), "0.20.1")
+
+    def test_digest_recorded_and_no_stale_todo(self):
+        # launch_cell dies at run start if the pin has no digest; and a stale
+        # "_digest_TODO" ("fill the digest before any run") alongside a real
+        # digest is contradictory. Require a recorded digest and no TODO marker.
+        cell = _load_cell(TRITON_CELL)
+        pin = json.loads((REPO / cell["engine"]["digest_pin_file"]).read_text())
+        self.assertTrue(str(pin.get("digest", "")).startswith("sha256:"),
+                        f"digest not recorded: {pin.get('digest')!r}")
+        self.assertNotIn("_digest_TODO", pin)
 
 
 class TritonEngineBlock(unittest.TestCase):
@@ -208,19 +241,49 @@ class DistinctFromOtherExtensionCells(unittest.TestCase):
         self.assertEqual(names["val_triton"], "val_triton_r{replica}")
 
     def test_host_ports_do_not_collide_with_other_cells(self):
-        triton_hosts = {pm.split(":")[0]
-                        for pm in _load_cell(TRITON_CELL)["engine"]["port_mapping"]}
+        triton_hosts = _host_ports(_load_cell(TRITON_CELL))
         # val_vllm 8500, val_dynamo_disagg 8400 -- none may overlap 8600-2.
+        # _host_ports also reads readyz.url / base_url, so val_dynamo_disagg
+        # (no port_mapping, 8400 only in its URLs) is still covered.
         for p in TRITON_CELL.parent.glob("val_*.yaml"):
             if p.name == "val_triton.yaml":
                 continue
-            other = _load_cell(p).get("engine", {})
-            other_hosts = {pm.split(":")[0]
-                           for pm in other.get("port_mapping", [])}
-            # val_dynamo readyz uses 8400 but declares no port_mapping; check the url too.
+            other_hosts = _host_ports(_load_cell(p))
             self.assertEqual(triton_hosts & other_hosts, set(),
-                             f"host-port collision with {p.name}")
-        self.assertEqual(triton_hosts, {"8600", "8601", "8602"})
+                             f"host-port collision with {p.name}: {triton_hosts & other_hosts}")
+        self.assertEqual(triton_hosts, {8600, 8601, 8602})
+
+    def test_host_ports_helper_reads_urls_when_no_port_mapping(self):
+        # Guard the guard: prove _host_ports catches a portless cell. val_dynamo
+        # declares no port_mapping yet must still surface its 8400 URL port.
+        dyn = _load_cell(CELLS / "val_dynamo_disagg.yaml")
+        self.assertNotIn("port_mapping", dyn.get("engine", {}))
+        self.assertIn(8400, _host_ports(dyn))
+
+
+class ScheduledInCanonicalCampaign(unittest.TestCase):
+    """P2: the cell must actually be dispatched by `campaign.py --start`, not just
+    exist on disk. Load the canonical extension campaign through the real
+    orchestrator and assert val_triton is in the ordered validation queue."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO / "scripts"))
+        import campaign as camp  # noqa: E402
+        self.camp = camp
+        self.yaml_path = REPO / "campaigns" / "extension" / "campaign.yaml"
+        if not self.yaml_path.exists():
+            self.skipTest("canonical extension campaign not present")
+
+    def test_val_triton_is_scheduled(self):
+        campaign = self.camp.load_campaign(self.yaml_path)
+        sched = self.camp.build_schedule(campaign, self.yaml_path)
+        cell_ids = [s.cell_id for s in sched]
+        self.assertIn("val_triton", cell_ids)
+        # All three validation systems present (no calibration required on any).
+        self.assertEqual(set(cell_ids),
+                         {"val_vllm", "val_dynamo_disagg", "val_triton"})
+        by_cell = {s.cell_id: s for s in sched}
+        self.assertFalse(by_cell["val_triton"].calibration_required)
 
 
 if __name__ == "__main__":
