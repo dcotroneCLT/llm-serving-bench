@@ -164,6 +164,21 @@ def free_gb(path: Path) -> Optional[float]:
         return None
 
 
+def free_inodes(path: Path) -> Optional[int]:
+    """Free inodes (statvfs f_favail) at `path`, or None if it cannot be stat'd.
+    NEVER fabricates a value. A filesystem reporting zero total inodes (some
+    tmpfs / overlay backends do not do inode accounting) returns None so the gate
+    SKIPS it rather than tripping a meaningless floor -- distinct from a real
+    stat failure, which the free_gb() side of the watchdog already fails-closed."""
+    try:
+        st = os.statvfs(str(path))
+    except OSError:
+        return None
+    if getattr(st, "f_files", 0) == 0:
+        return None  # inode-less filesystem: inode accounting not meaningful
+    return int(st.f_favail)
+
+
 def docker_root_dir() -> Optional[Path]:
     """The Docker data-root volume (where images/layers/container logs live)."""
     try:
@@ -217,14 +232,20 @@ def dir_size_mb(path: Path) -> float:
 
 
 def disk_watchdog_reason(runs_root: Path, docker_root: Optional[Path],
-                         min_free_gb: float) -> Optional[str]:
+                         min_free_gb: float,
+                         min_free_inodes: Optional[int] = None) -> Optional[str]:
     """Return a short breach reason if the runs-root OR the docker data-root
-    filesystem is below `min_free_gb`, else None.
+    filesystem is below `min_free_gb` free space -- or, when min_free_inodes is
+    given, below that many free inodes (statvfs f_favail) -- else None.
 
-    Fail-CLOSED, exactly like the pre-run gate: a filesystem that cannot be
-    stat'd is treated as a breach (an unknown disk is precisely when to stop).
-    The docker data-root is resolved via docker_root_dir() by the caller and
-    never hardcoded to /var/lib."""
+    Fail-CLOSED on free space, exactly like the pre-run gate: a filesystem that
+    cannot be stat'd is a breach (an unknown disk is precisely when to stop). The
+    inode floor (hardening item 4c) exists because ~8k small files/run x 57 runs
+    makes inode exhaustion a real failure mode a byte-free-space gate cannot see;
+    same exit-7 semantics. An inode-less filesystem (free_inodes -> None while the
+    byte probe succeeded) is skipped, not failed -- the byte side already
+    fails-closed on a truly unstat-able path. The docker data-root is resolved via
+    docker_root_dir() by the caller and never hardcoded to /var/lib."""
     checks = [("runs-root", runs_root)]
     if docker_root is not None:
         checks.append(("docker-root", docker_root))
@@ -234,6 +255,11 @@ def disk_watchdog_reason(runs_root: Path, docker_root: Optional[Path],
             return f"disk_floor: cannot stat {label} ({p})"
         if g < min_free_gb:
             return f"disk_floor: {label} {g:.1f}GB < {min_free_gb:.1f}GB ({p})"
+        if min_free_inodes is not None:
+            inodes = free_inodes(p)
+            if inodes is not None and inodes < min_free_inodes:
+                return (f"inode_floor: {label} {inodes} free inodes < "
+                        f"{min_free_inodes} required ({p})")
     return None
 
 
@@ -629,6 +655,10 @@ ENDPOINT_DEAD_MIN_ROWS = 5        # need at least this many rows before declarin
 DISK_CHECK_EVERY_S = 300              # ~5 min (a multiple of HEALTH_CHECK_EVERY_S)
 HEARTBEAT_EVERY_S = 1800              # 30 min unattended progress line (reuses the loop's monotonic cadence)
 DEFAULT_MIN_FREE_GB_MID_RUN = 10.0    # below the pre-run gate so a tight start is not instant death
+# Mid-run inode floor (SC-2 / hardening item 4c). ~8k small files/run x 57 runs
+# makes inode exhaustion a real failure mode a byte-free-space floor cannot see.
+# Comfortably above one run's file count so a run cannot exhaust it by itself.
+DEFAULT_MIN_INODES_FREE_MID_RUN = 100000
 DISK_USAGE_FIELDS = ["ts_unix", "runs_root_free_gb", "docker_root_free_gb", "run_dir_size_mb"]
 
 # A disk_usage.csv write failing with one of these errnos means the STORAGE is
@@ -854,6 +884,94 @@ def proc_prefix_for_cell(cell: dict) -> str:
 
 class CalibrationError(Exception):
     """A calibration file cannot be accepted for a production run."""
+
+
+# Default max age for a calibration before it must be re-taken (campaign yaml
+# `calibration_max_age_days` overrides). A month-1 ceiling silently driving a
+# month-3 run is exactly the staleness this gate exists to stop.
+DEFAULT_CALIBRATION_MAX_AGE_DAYS = 14
+
+
+def gpu_name_and_driver() -> tuple[Optional[str], Optional[str]]:
+    """(gpu_name, driver_version) from nvidia-smi, or (None, None) if it cannot
+    be read. Used to build the CURRENT calibration signature; a value we cannot
+    determine is left None and simply not compared (never fabricated)."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None, None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, None
+    first = r.stdout.strip().splitlines()[0]
+    name, _, drv = first.partition(",")
+    return (name.strip() or None), (drv.strip() or None)
+
+
+def current_calibration_signature(hostname: Optional[str], gpu_name: Optional[str],
+                                  driver_version: Optional[str], image_tag: Optional[str],
+                                  image_digest: Optional[str]) -> dict:
+    """The host/image signature of the CURRENT run, compared against the one the
+    calibration recorded. Keyed identically to calibrate_rate's provenance."""
+    return {
+        "hostname": hostname,
+        "gpu_name": gpu_name,
+        "driver_version": driver_version,
+        "image_tag": image_tag,
+        "image_digest": image_digest,
+    }
+
+
+def calibration_age_days(calib: dict, now_unix: float) -> Optional[float]:
+    """Age of the calibration in days from its provenance.calibrated_at_unix, or
+    None if there is no usable timestamp."""
+    prov = calib.get("provenance") or {}
+    ts = prov.get("calibrated_at_unix")
+    if ts is None:
+        return None
+    try:
+        return (now_unix - float(ts)) / 86400.0
+    except (TypeError, ValueError):
+        return None
+
+
+def check_calibration_provenance(calib: dict, current_sig: dict,
+                                 max_age_days: Optional[float], now_unix: float) -> None:
+    """Refuse (raise CalibrationError) a calibration that is STALE (older than
+    max_age_days) or whose recorded host/image signature does not match the
+    current one. Same fail-loud intent as a missing REQUIRED calibration.
+
+    A calibration with no provenance block cannot have its age or signature
+    verified -- it is refused (its calibrated_at is unknowable, so it could be
+    arbitrarily old). Signature fields the CURRENT side cannot determine (e.g.
+    gpu_name when nvidia-smi is absent) are skipped, but every field present on
+    BOTH sides must match: any drift is a stale calibration."""
+    prov = calib.get("provenance")
+    if not isinstance(prov, dict) or prov.get("calibrated_at_unix") is None:
+        raise CalibrationError(
+            "calibration has no provenance.calibrated_at_unix (pre-hardening or "
+            "hand-edited): its age and host/image signature cannot be verified. "
+            "Re-run scripts/calibrate_rate.py to record provenance.")
+    age = calibration_age_days(calib, now_unix)
+    if age is not None and max_age_days is not None and age > float(max_age_days):
+        raise CalibrationError(
+            f"calibration is {age:.1f} days old (> calibration_max_age_days="
+            f"{max_age_days}); re-calibrate before this run.")
+    mism = []
+    for key, cur in current_sig.items():
+        if cur is None:
+            continue
+        rec = prov.get(key)
+        if rec is None:
+            continue
+        if str(rec) != str(cur):
+            mism.append(f"{key}: calibrated={rec!r} current={cur!r}")
+    if mism:
+        raise CalibrationError(
+            "calibration host/image signature does not match the current one ("
+            + "; ".join(mism) + "); re-calibrate on this host/image.")
 
 
 def resolve_calibrated_rate(calib: dict, allow_lower_bound: bool) -> float:
@@ -1757,6 +1875,16 @@ def main() -> None:
              "not killed on the first mid-run check.",
     )
     p.add_argument(
+        "--min-inodes-free-mid-run",
+        type=int,
+        default=DEFAULT_MIN_INODES_FREE_MID_RUN,
+        help="SC-2 mid-run inode floor (hardening item 4c): during the run, abort "
+             "(graceful teardown, exit 7 -> campaign-fatal, no retry) if free inodes "
+             "on the runs-root or the docker data-root drop below this. ~8k "
+             "files/run x 57 runs makes inode exhaustion real; a byte-free floor "
+             "cannot see it. Filesystems without inode accounting are skipped.",
+    )
+    p.add_argument(
         "--calibration-file",
         type=Path,
         default=None,
@@ -1764,6 +1892,14 @@ def main() -> None:
              "rate_calibrated_rps overrides the cell's target_rate_rps and the "
              "ceiling/fraction/rate are recorded in the manifest. The rate is "
              "fixed for the whole run (no mid-run re-calibration).",
+    )
+    p.add_argument(
+        "--calibration-max-age-days",
+        type=float,
+        default=DEFAULT_CALIBRATION_MAX_AGE_DAYS,
+        help="Staleness gate: refuse a --calibration-file older than this many "
+             "days (non-retryable precondition, exit 6). Also refuses one whose "
+             "recorded host/image signature does not match the current run's.",
     )
     p.add_argument(
         "--allow-lower-bound-calibration",
@@ -1963,6 +2099,19 @@ def main() -> None:
             calib = json.loads(args.calibration_file.read_text())
         except (OSError, json.JSONDecodeError) as e:
             die(f"could not read calibration file {args.calibration_file}: {e}")
+        # Staleness / host / image gate BEFORE the rate is accepted: a stale or
+        # cross-host/cross-image calibration cannot be fixed by a retry, so it is
+        # a non-retryable precondition (exit 6 -> campaign-fatal), not a run
+        # failure. Build the current signature from what this run KNOWS (host,
+        # pinned image) plus best-effort GPU/driver.
+        gpu_name, driver_version = gpu_name_and_driver()
+        current_sig = current_calibration_signature(
+            socket.gethostname(), gpu_name, driver_version, image_full, pinned_digest)
+        try:
+            check_calibration_provenance(
+                calib, current_sig, args.calibration_max_age_days, time.time())
+        except CalibrationError as e:
+            die(f"calibration provenance gate: {e} (file: {args.calibration_file})", rc=6)
         try:
             rate_cal = resolve_calibrated_rate(calib, args.allow_lower_bound_calibration)
         except CalibrationError as e:
@@ -1978,6 +2127,13 @@ def main() -> None:
             "rate_calibrated_rps": float(rate_cal),
             "status": calib.get("status"),
             "allow_lower_bound_override": bool(args.allow_lower_bound_calibration),
+            # Provenance echoed into the run manifest for audit (WHEN/WHERE/against
+            # WHICH image the ceiling was measured); the gate above already
+            # verified it against this run's host/image and max age.
+            "provenance": calib.get("provenance"),
+            "age_days_at_launch": (
+                round(calibration_age_days(calib, time.time()), 2)
+                if calibration_age_days(calib, time.time()) is not None else None),
         }
         log(f"calibration applied: ceiling={calib.get('ceiling_rps')} rps -> "
             f"target_rate_rps={rate_cal} (fraction {calib.get('fraction')})")
@@ -2081,7 +2237,8 @@ def main() -> None:
                 # Compute the breach verdict FIRST. The trend CSV is a side
                 # channel and must never mask or downgrade a disk-floor breach.
                 breach = disk_watchdog_reason(
-                    args.runs_root, docker_root, args.min_free_gb_mid_run)
+                    args.runs_root, docker_root, args.min_free_gb_mid_run,
+                    min_free_inodes=args.min_inodes_free_mid_run)
                 # Best-effort trend row. A STORAGE_FATAL_ERRNOS write failure
                 # (out of space / over quota / read-only / I/O error) is itself
                 # breach evidence -- the exact scenario the watchdog exists for,

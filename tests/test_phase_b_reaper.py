@@ -151,7 +151,7 @@ class LaunchCellWiring(unittest.TestCase):
                   ledger_stuck=None, teardown_raises=False, record_raises=None,
                   disk_free_gb=None, disk_check_every=None,
                   health_reason=None, health_every=None, append_error=None,
-                  finalize_error=None, heartbeat_every=None):
+                  finalize_error=None, heartbeat_every=None, free_inodes_val=None):
         events: list[str] = []
         logs: list[str] = []
         run_dir = tmp / "runs" / "test_e1_r01"
@@ -212,7 +212,16 @@ class LaunchCellWiring(unittest.TestCase):
             component_pids=tmp / "pids.json", gpu_device_override=None,
             duration_s_override=duration_s, min_free_gb=20.0,
             min_free_gb_mid_run=10.0,
-            calibration_file=None, allow_lower_bound_calibration=False,
+            # Hardening item 4c: the mid-run inode floor. Default it comfortably
+            # below the real free-inode count of the tempdir so the existing
+            # healthy-path tests never trip it; the inode-floor test injects a
+            # low free_inodes() value to force a breach.
+            min_inodes_free_mid_run=lc.DEFAULT_MIN_INODES_FREE_MID_RUN,
+            # Hardening item 1: calibration staleness gate max-age. Present so the
+            # calibration path (when a --calibration-file is supplied) can read it;
+            # these wiring tests pass calibration_file=None so it is not exercised.
+            calibration_file=None, calibration_max_age_days=14.0,
+            allow_lower_bound_calibration=False,
         )
 
         # A monotonic counter that steps by mono_step each call.
@@ -232,7 +241,7 @@ class LaunchCellWiring(unittest.TestCase):
                  spawn_monitors=mock.DEFAULT, materialize_client_config=mock.DEFAULT,
                  spawn_client=mock.DEFAULT, summarize_client_csvs=mock.DEFAULT,
                  stop_subprocess=mock.DEFAULT, reaper=reaper_mock, free_gb=mock.DEFAULT,
-                 append_disk_usage_row=mock.DEFAULT,
+                 free_inodes=mock.DEFAULT, append_disk_usage_row=mock.DEFAULT,
              ) as m, \
              mock.patch.object(lc, "DISK_CHECK_EVERY_S",
                                disk_check_every if disk_check_every is not None else lc.DISK_CHECK_EVERY_S), \
@@ -249,6 +258,11 @@ class LaunchCellWiring(unittest.TestCase):
             # Free space seen by the mid-run watchdog + the disk_usage.csv row.
             # Default is comfortably above the floor so existing tests are healthy.
             m["free_gb"].return_value = disk_free_gb if disk_free_gb is not None else 500.0
+            # Free inodes seen by the mid-run inode floor (item 4c). Default is far
+            # above the floor so the byte-space and healthy-path tests are unaffected;
+            # the inode-floor test injects a value below it to force a breach.
+            m["free_inodes"].return_value = (
+                free_inodes_val if free_inodes_val is not None else 10_000_000)
             # Trend-CSV append: raise the injected error, else use the real writer.
             if append_error is not None:
                 m["append_disk_usage_row"].side_effect = append_error
@@ -324,6 +338,22 @@ class LaunchCellWiring(unittest.TestCase):
             rows = csv_path.read_text().splitlines()
             self.assertEqual(rows[0], "ts_unix,runs_root_free_gb,docker_root_free_gb,run_dir_size_mb")
             self.assertGreaterEqual(len(rows), 2)  # header + at least one measurement
+
+    def test_mid_run_inode_floor_breach_exits_7_and_tears_down(self):
+        # Item 4c end-to-end: byte-space is comfortably OK, but free inodes drop
+        # below the floor -> the SAME campaign-fatal exit 7 / graceful teardown as
+        # a byte breach, with an inode_floor interruption_reason. This closes the
+        # exhaustion mode a byte-free-space floor cannot see (~8k small files/run).
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run_main(Path(tmp), client_poll=None, mono_step=1.0,
+                               duration_s=100000, disk_free_gb=500.0,
+                               free_inodes_val=1000, disk_check_every=0)
+            self.assertEqual(r["exit_code"], 7)
+            self.assertTrue(r["manifest"]["interrupted_early"])
+            self.assertTrue(r["manifest"]["interruption_reason"].startswith("inode_floor"))
+            # Graceful teardown still ran (deregister after teardown).
+            self.assertIn("teardown", r["events"])
+            self.assertIn("deregister", r["events"])
 
     def test_healthy_disk_completes_and_logs_trend(self):
         # Healthy path unchanged: the disk check fires (csv written) but does not

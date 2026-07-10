@@ -58,10 +58,26 @@ min_free_gb: 50
 # a run that started near the pre-run gate is not killed on the first check.
 min_free_gb_mid_run: 25
 
+# SC-2 mid-run INODE floor (hardening item 4c), passed to launch_cell as
+# --min-inodes-free-mid-run. ~8k small files/run x 57 runs makes inode
+# exhaustion a real failure mode that a byte-free-space floor cannot see. During
+# the run, launch_cell aborts (exit 7 => campaign-fatal, no retry) if free inodes
+# on the runs-root or the docker data-root drop below this. Filesystems without
+# inode accounting are skipped.
+min_inodes_free_mid_run: 200000
+
 # Global default for accepting a non-saturated ("lower bound") calibration.
 # Off: a non-saturated ceiling makes the DoW fraction-of-ceiling rate factor
 # meaningless. Per-cell entries may override this.
 allow_lower_bound_calibration: false
+
+# Calibration staleness gate (requirement 1). A calibration file older than this
+# many days -- or one whose recorded host/GPU/driver/image signature no longer
+# matches this box -- is REFUSED with the same fail-loud semantics as a missing
+# REQUIRED calibration. Checked at pre-flight for every queued run AND again at
+# dispatch time (a run at queue position 30 starts weeks after pre-flight, so a
+# month-1 ceiling could otherwise silently drive a month-3 run).
+calibration_max_age_days: 14
 
 # Retry policy: one automatic re-attempt (with --attempt incremented) on an
 # ordinary launch_cell failure, then the run is marked FAILED and the queue

@@ -45,9 +45,20 @@ min_free_gb: 50
 # campaign-fatal, no retry) if either drops below this.
 min_free_gb_mid_run: 25
 
+# SC-2 mid-run INODE floor (hardening item 4c), passed to launch_cell as
+# --min-inodes-free-mid-run: abort (exit 7 => campaign-fatal) if free inodes on
+# the runs-root or docker data-root drop below this. ~8k files/run makes inode
+# pressure real; a byte-free floor cannot see it. Inode-less filesystems skipped.
+min_inodes_free_mid_run: 200000
+
 # Global default for accepting a non-saturated ("lower bound") calibration.
 # Off: a non-saturated ceiling makes the fraction-of-ceiling rate meaningless.
 allow_lower_bound_calibration: false
+
+# Calibration staleness gate (requirement 1). Refuse a calibration older than
+# this many days, or one whose recorded host/image signature no longer matches
+# this box. Checked at pre-flight and again at dispatch.
+calibration_max_age_days: 14
 
 # Retry policy: one automatic re-attempt on an ordinary launch_cell failure.
 # launch_cell exit 6/7/8/9 (NONRETRYABLE_EXIT_CODES) are host/precondition

@@ -25,6 +25,21 @@ echo "[longtest-status] $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUNS_ROOT="$(python3 -c "import yaml; print(yaml.safe_load(open('$CAMPAIGN_YAML'))['runs_root'])" 2>/dev/null || true)"
 CAMPAIGN_ID="$(python3 -c "import yaml; print(yaml.safe_load(open('$CAMPAIGN_YAML')).get('campaign_id',''))" 2>/dev/null || true)"
 
+# --- operator alert (item 5): surface state/ALERT.json if the campaign left one ---
+ALERT_FILE="$STATE_DIR/ALERT.json"
+section "operator alert"
+if [ -f "$ALERT_FILE" ]; then
+    python3 -c "
+import json
+a = json.load(open('$ALERT_FILE'))
+print(f\"  ** {a.get('event','?')} on {a.get('run_key') or '-'} at {a.get('ts','?')}\")
+print(f\"     reason: {a.get('reason','?')}\")
+print(f\"     next:   {a.get('next_command','?')}\")
+" 2>/dev/null || note "ALERT.json present but unreadable ($ALERT_FILE)"
+else
+    note "no ALERT.json (no campaign-fatal / failure / interrupt recorded)"
+fi
+
 # --- per-run status ---
 section "campaign state"
 if [ -f "$STATE_FILE" ]; then

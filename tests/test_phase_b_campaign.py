@@ -15,17 +15,39 @@ Run: python3 -m unittest tests.test_phase_b_campaign
 """
 import io
 import json
+import os
 import signal
+import socket
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import campaign as camp  # noqa: E402
+
+
+def fresh_provenance(**overrides):
+    """A calibration provenance block that PASSES the staleness/host gate on this
+    box: taken 'now' on this hostname, no image recorded (so image is not
+    compared). Item 1 makes provenance part of a valid calibration file."""
+    prov = {
+        "calibrated_at_unix": time.time(),
+        "calibrated_at_iso": "now",
+        "hostname": socket.gethostname(),
+        "gpu_name": None,
+        "driver_version": None,
+        "image_tag": None,
+        "image_digest": None,
+        "client_config_hash": None,
+    }
+    prov.update(overrides)
+    return prov
 
 
 # --------------------------------------------------------------------------
@@ -285,7 +307,10 @@ class RunLoopOrderingCooldown(unittest.TestCase):
 
 
 class ResumePartialState(unittest.TestCase):
-    def test_pending_specs_skips_completed(self):
+    # Item 2 drift test: failed is TERMINAL, so a failed run is NOT re-queued on
+    # --resume (only completed AND failed are skipped; failed used to be re-run,
+    # burning fresh attempts). interrupted is the genuinely-unfinished case.
+    def test_pending_specs_skips_completed_and_failed(self):
         with tempfile.TemporaryDirectory() as tmp:
             specs = [make_spec("a"), make_spec("b"), make_spec("c")]
             state = camp.State(campaign_id="testc")
@@ -293,15 +318,17 @@ class ResumePartialState(unittest.TestCase):
             state.runs["b_r01"] = camp.RunStatus(status="failed", attempts=2)
             state.runs["c_r01"] = camp.RunStatus(status="interrupted", attempts=1)
             c = make_campaign(tmp, specs, state=state)
-            self.assertEqual([s.run_key for s in c.pending_specs()], ["b_r01", "c_r01"])
+            # failed b_r01 is terminal -> only the interrupted run is re-queued.
+            self.assertEqual([s.run_key for s in c.pending_specs()], ["c_r01"])
 
-    def test_resume_reruns_failed_and_interrupted_only(self):
+    def test_resume_reruns_interrupted_but_not_failed(self):
         with tempfile.TemporaryDirectory() as tmp:
             specs = [make_spec("a"), make_spec("b"), make_spec("c")]
             # Persist a partial state to disk, then reload it (real resume path).
             state = camp.State(campaign_id="testc")
             state.runs["a_r01"] = camp.RunStatus(status="completed", attempts=1)
             state.runs["b_r01"] = camp.RunStatus(status="failed", attempts=2)
+            state.runs["c_r01"] = camp.RunStatus(status="interrupted", attempts=1)
             sp = Path(tmp) / "state" / "campaign_state.json"
             sp.parent.mkdir(parents=True, exist_ok=True)
             sp.write_text(json.dumps(state.to_dict()))
@@ -310,12 +337,83 @@ class ResumePartialState(unittest.TestCase):
             c = make_campaign(tmp, specs, state=reloaded)
             launcher = ScriptedLauncher({})
             c._launch_cell_rc = launcher
-            self.assertEqual(c.run(), camp.EXIT_OK)
+            # b_r01 stays failed (terminal) -> the drained queue is not clean.
+            self.assertEqual(c.run(), camp.EXIT_COMPLETED_WITH_FAILURES)
             dispatched = [k for k, _ in launcher.calls]
             self.assertNotIn("a_r01", dispatched)   # already completed
-            self.assertEqual(dispatched, ["b_r01", "c_r01"])
-            # b_r01 attempts continue from where it left off (cumulative provenance).
-            self.assertEqual(launcher.calls[0], ("b_r01", 3))
+            self.assertNotIn("b_r01", dispatched)   # failed is TERMINAL, not re-run
+            self.assertEqual(dispatched, ["c_r01"])
+            # interrupted c_r01 continues its PERSISTED attempt count (was 1 -> 2).
+            self.assertEqual(launcher.calls[0], ("c_r01", 2))
+            self.assertEqual(c.state.runs["b_r01"].status, "failed")
+
+
+# --------------------------------------------------------------------------
+# Item 2: durable, honest retry accounting
+# --------------------------------------------------------------------------
+
+
+class DurableRetryAccounting(unittest.TestCase):
+    def test_clean_campaign_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a"), make_spec("b")])
+            c._launch_cell_rc = ScriptedLauncher({})  # all succeed
+            self.assertEqual(c.run(), camp.EXIT_OK)
+
+    def test_drained_queue_with_failure_exits_10(self):
+        # A run that exhausts its retry budget leaves the queue drained but NOT
+        # clean: exit 10, distinct from 0, so an unattended campaign is honest.
+        with tempfile.TemporaryDirectory() as tmp:
+            specs = [make_spec("a"), make_spec("b")]
+            c = make_campaign(tmp, specs)
+            c._launch_cell_rc = ScriptedLauncher({"a_r01": [1, 1]})  # a always fails
+            self.assertEqual(c.run(), camp.EXIT_COMPLETED_WITH_FAILURES)
+            self.assertEqual(c.state.runs["a_r01"].status, "failed")
+            self.assertEqual(c.state.runs["b_r01"].status, "completed")
+
+    def test_persisted_attempts_cap_total_launches_across_resume(self):
+        # A run interrupted once (attempts=1 persisted) then resumed and failing
+        # must NOT get a fresh max_retries budget: total launches are capped at
+        # max_retries+1 by the PERSISTED attempt count, not a session counter.
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = make_spec("a")
+            state = camp.State(campaign_id="testc")
+            state.runs["a_r01"] = camp.RunStatus(status="interrupted", attempts=1)
+            c = make_campaign(tmp, [spec], state=state)  # max_retries=1 -> cap 2
+            launcher = ScriptedLauncher({"a_r01": [1]})  # one more launch, fails
+            c._launch_cell_rc = launcher
+            self.assertEqual(c._run_with_retry(spec), "failed")
+            # Exactly ONE more launch was allowed (attempt 2), then terminal.
+            self.assertEqual(launcher.calls, [("a_r01", 2)])
+            self.assertEqual(c.state.runs["a_r01"].attempts, 2)
+
+    def test_rerun_failed_resets_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a"), make_spec("b")])
+            c.state.runs["a_r01"] = camp.RunStatus(status="failed", attempts=2, last_rc=1)
+            c.state.runs["b_r01"] = camp.RunStatus(status="completed", attempts=1)
+            n = c.reset_failed_for_rerun(persist=False)
+            self.assertEqual(n, 1)
+            st = c.state.runs["a_r01"]
+            self.assertEqual((st.status, st.attempts, st.last_rc), ("pending", 0, None))
+            # A reset failed run is re-queued again; a completed one is not.
+            self.assertIn("a_r01", [s.run_key for s in c.pending_specs()])
+            self.assertNotIn("b_r01", [s.run_key for s in c.pending_specs()])
+
+    def test_rerun_failed_requires_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            y = Path(tmp) / "c.yaml"
+            (Path(tmp) / "cells").mkdir(parents=True, exist_ok=True)
+            (Path(tmp) / "cells" / "a.yaml").write_text("cell_id: a\nduration_s: 100\n")
+            y.write_text(
+                "campaign_id: testc\nmode: serial\n"
+                f"runs_root: {Path(tmp) / 'runs'}\n"
+                "replicas_per_cell: 1\nmin_free_gb: 0.0\n"
+                f"paths:\n  hf_cache_host: {Path(tmp) / 'hf'}\n  repo_root: {Path(tmp) / 'repo'}\n"
+                "cells:\n  - id: a\n    yaml: cells/a.yaml\n"
+            )
+            rc = camp.main(["--campaign-yaml", str(y), "--start", "--rerun-failed"])
+            self.assertEqual(rc, camp.EXIT_USAGE)
 
 
 # --------------------------------------------------------------------------
@@ -434,7 +532,8 @@ class PreflightCalibration(unittest.TestCase):
     def test_lower_bound_override_accepts_non_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
             f = self._calib(tmp, "c.json",
-                            {"status": "did_not_saturate", "rate_calibrated_rps": 5.0})
+                            {"status": "did_not_saturate", "rate_calibrated_rps": 5.0,
+                             "provenance": fresh_provenance()})
             spec = make_spec("a", calibration_file=f, calibration_required=True,
                              allow_lb=True)
             c = make_campaign(tmp, [spec])
@@ -445,7 +544,8 @@ class PreflightCalibration(unittest.TestCase):
     def test_valid_ok_calibration_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             f = self._calib(tmp, "c.json",
-                            {"status": "ok", "rate_calibrated_rps": 12.5})
+                            {"status": "ok", "rate_calibrated_rps": 12.5,
+                             "provenance": fresh_provenance()})
             spec = make_spec("a", calibration_file=f, calibration_required=True)
             c = make_campaign(tmp, [spec])
             c.preflight()  # must not raise
@@ -779,6 +879,98 @@ class MainGuards(unittest.TestCase):
         dow = camp.load_campaign(REPO / "campaigns" / "extension" / "campaign.yaml")
         self.assertNotEqual(campaign.get("state_file"), dow.get("state_file"))
         self.assertEqual(campaign.get("state_file"), "state/longtest_campaign_state.json")
+
+
+# --------------------------------------------------------------------------
+# Item 5: ALERT.json operator-notification hook
+# --------------------------------------------------------------------------
+
+
+class AlertHook(unittest.TestCase):
+    # The four events the hook fires on (write_alert docstring / call sites).
+    FOUR_EVENTS = ("campaign_fatal", "failed_after_retry", "interrupted",
+                   "completed_with_failures")
+
+    def test_write_alert_emits_json_for_each_of_the_four_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            for event in self.FOUR_EVENTS:
+                c.write_alert(event, "a_r01", f"reason for {event}")
+                alert = json.loads(c._alert_path().read_text())
+                self.assertEqual(alert["event"], event)
+                self.assertEqual(alert["run_key"], "a_r01")
+                self.assertEqual(alert["campaign_id"], "testc")
+                self.assertEqual(alert["reason"], f"reason for {event}")
+                self.assertIn("ts", alert)
+                self.assertIn("next_command", alert)
+
+    def test_next_command_requires_rerun_failed_only_for_failure_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            # A drained-with-failure / exhausted-retry incident needs the explicit
+            # opt-in (failed is TERMINAL); a fatal / interrupt just resumes.
+            for event in ("failed_after_retry", "completed_with_failures"):
+                self.assertIn("--rerun-failed", c._next_command(event), event)
+            for event in ("campaign_fatal", "interrupted"):
+                self.assertNotIn("--rerun-failed", c._next_command(event), event)
+                self.assertIn("--resume", c._next_command(event), event)
+
+    def test_alert_write_is_atomic_no_tmp_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            c.write_alert("campaign_fatal", "a_r01", "boom")
+            # The os.replace leaves no *.json.tmp turd behind.
+            leftovers = list(c._alert_path().parent.glob("*.tmp"))
+            self.assertEqual(leftovers, [])
+
+    def test_notify_hook_invoked_with_alert_path_when_env_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            with mock.patch.dict(os.environ, {"CAMPAIGN_NOTIFY_CMD": "/bin/echo"}), \
+                 mock.patch.object(camp.subprocess, "run") as run:
+                c.write_alert("interrupted", "a_r01", "sigterm")
+            self.assertEqual(run.call_count, 1)
+            called_argv = run.call_args[0][0]
+            self.assertEqual(called_argv[0], "/bin/echo")
+            self.assertEqual(called_argv[1], str(c._alert_path()))
+
+    def test_notify_hook_failure_is_swallowed_and_alert_still_written(self):
+        # A hung / missing / failing notifier must NEVER change the outcome: the
+        # ALERT.json is still written and write_alert returns normally.
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            with mock.patch.dict(os.environ, {"CAMPAIGN_NOTIFY_CMD": "/bin/echo"}), \
+                 mock.patch.object(camp.subprocess, "run",
+                                   side_effect=OSError("boom")):
+                c.write_alert("campaign_fatal", "a_r01", "boom")  # must not raise
+            self.assertTrue(c._alert_path().exists())
+
+    def test_no_notify_when_env_unset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            env = {k: v for k, v in os.environ.items() if k != "CAMPAIGN_NOTIFY_CMD"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(camp.subprocess, "run") as run:
+                c.write_alert("interrupted", "a_r01", "x")
+            run.assert_not_called()
+
+    def test_write_alert_never_raises_on_unwritable_dir(self):
+        # The hook is best-effort: an OSError writing the file is logged and
+        # swallowed, not propagated (it must not abort the campaign shutdown).
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            with mock.patch.object(camp.Path, "write_text",
+                                   side_effect=OSError("read-only fs")):
+                c.write_alert("campaign_fatal", "a_r01", "boom")  # must not raise
+
+    def test_clear_alert_removes_file_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            c.write_alert("interrupted", "a_r01", "x")
+            self.assertTrue(c._alert_path().exists())
+            c.clear_alert()
+            self.assertFalse(c._alert_path().exists())
+            c.clear_alert()  # already gone -> no raise
 
 
 if __name__ == "__main__":

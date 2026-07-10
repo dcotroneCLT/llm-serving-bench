@@ -126,19 +126,26 @@ q~0), VMS +6.2 MB/h, system mem +9.1 MB/h, over 48h at 0.30 x ceiling
 ~365 MB of monotone growth per 48h window in the most modern disaggregated
 stack: RQ1 signal present on the extension platform.
 
-**NEXT STEP (resume here): pre-campaign phase.** In order:
-1. Triton+vLLM path: the third system's cell is now ADDED
-   (campaigns/extension/cells/val_triton.yaml, single-container lifecycle,
-   byte-compat verified off-box; wired into campaign.yaml's validation
-   queue). NEXT: hardware validation on the box -- confirm tritonserver
-   26.05 CLI flags via `tritonserver --help`, run the short validation gate,
-   and fill/confirm the image digest at pull time.
-2. Per-cell calibration (30%/85% of a conservative ceiling) with the
+**ALL THREE SYSTEMS VALIDATED on the extension harness (2026-07-09).** The
+three-cell serial validation campaign (val_vllm -> val_dynamo_disagg ->
+val_triton) completed with all runs rc=0 at attempt 1. Triton specifics:
+readyz (/v2/health/ready) in 68s, pid_strategy=triton_child resolved the
+vLLM EngineCore under the Python backend stub, 1178/1178 client ok,
+validation_check PASS. Pin SC-1 ground-truthed on the box: tritonserver
+26.05 ships vLLM 0.20.1+7124b12a.nv26.5 (Triton Server 2.69.0), digest as
+frozen 2026-06-29. Early cross-system contrast worth remembering: Triton
+RSS slope +0.59 MB/h vs standalone +15.7 MB/h vs Dynamo aggregate +7.6 MB/h
+(validation-length windows; the DoW will measure this properly).
+
+**NEXT STEP (resume here): pre-campaign phase, two items left.**
+1. Per-cell calibration (30%/85% of a conservative ceiling) with the
    validated calibrate_rate path; keep calibration topology in sync with
-   cell topology.
-3. Populate the DoW campaign yaml (Res V 16-run + 3 center points across
-   the 5 workload factors x 3 systems, ~57 runs, strictly serial) and
-   dry-run it.
+   cell topology (dynamo cells calibrate against the same 1+1 stack the
+   run uses).
+2. Populate the DoW campaign yaml (Res V 16-run + 3 center points across
+   the 5 workload factors x 3 systems, ~57 runs, strictly serial; see
+   paper/PAPER_UPDATE_PLAN.md "2026-06-12: EXPERIMENTAL PLAN -- DoW") and
+   dry-run it. The 48h DoW cells MUST set calibration_required: true.
 Backlog (non-blocking): longtest_status.sh must fail loudly when run
 outside the wosar env (today it prints truncated paths); summaries of
 review-fix commits 2322c09/ad18f22 still owed to this file.

@@ -41,6 +41,7 @@ import pymannkendall as mk
 from scipy.stats import theilslopes
 
 from aging_io import truthy_series
+from ecc_check import ecc_verdict
 
 
 HARD_FAIL = 2
@@ -308,6 +309,18 @@ def check(run_dir: Path) -> int:
     # 7. Interrupted flag
     if interrupted:
         log(f"[SOFT] run was marked interrupted_early=True (likely SIGINT/SIGTERM)")
+        rc = max(rc, SOFT_FAIL)
+
+    # 8. GPU ECC drift (item 4b): an uncorrected-ECC increment during the run is a
+    # HARD data-integrity failure (silent memory corruption); a corrected-ECC
+    # increment is a SOFT early-degradation signal.
+    log(f"--- GPU ECC drift ---")
+    ecc, ecc_msgs = ecc_verdict(run_dir)
+    for m in ecc_msgs:
+        log(m)
+    if ecc == "fail":
+        rc = max(rc, HARD_FAIL)
+    elif ecc == "warn":
         rc = max(rc, SOFT_FAIL)
 
     # Verdict

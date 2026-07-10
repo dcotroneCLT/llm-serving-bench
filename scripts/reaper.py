@@ -387,6 +387,49 @@ def deregister_run(runs_root: Path, run_id: str) -> list[str]:
     return _mutate_ledger(runs_root, _remove)
 
 
+def launcher_alive_for(runs_root, run_id: str) -> bool:
+    """Read-only: True iff the ledger holds an entry for run_id whose launcher
+    process is genuinely still alive (pid AND create_time match). A run with no
+    ledger entry (crashed before its record, or already deregistered) -> False.
+
+    Used by the campaign's stale-running recovery (hardening item 3) to tell a
+    run stranded by a host restart from one whose launcher is still live."""
+    runs, _ = _read_ledger(_ledger_path(Path(runs_root)))
+    for e in runs:
+        if e.get("run_id") == run_id:
+            return _launcher_alive(e)
+    return False
+
+
+def recorded_children_alive(runs_root, run_id: str) -> bool:
+    """Read-only: True iff any child recorded for run_id (in the ledger AND/OR in
+    a run_dir/child_pids.json written before the ledger upsert) is still a live
+    process that is ours (run-id + OUR_SCRIPTS match, PID-reuse-safe via
+    _is_ours). Kills nothing -- it only observes, for the stale-running recovery
+    decision (item 3): a recovery must refuse while any recorded child breathes."""
+    runs_root = Path(runs_root)
+    entries: list[dict] = []
+    runs, _ = _read_ledger(_ledger_path(runs_root))
+    entries.extend(e for e in runs if e.get("run_id") == run_id)
+    try:
+        child_files = sorted(runs_root.glob("*/child_pids.json"))
+    except OSError:
+        child_files = []
+    for cp in child_files:
+        try:
+            e = json.loads(cp.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if e.get("run_id") == run_id:
+            entries.append(e)
+    for e in entries:
+        run_dir = Path(e.get("run_dir", ""))
+        for pid in _candidate_pids(run_dir, e.get("monitors_pid"), e.get("client_pid")):
+            if _is_ours(pid, run_id) is not None:
+                return True
+    return False
+
+
 def reap_orphans(runs_root: Path, current_run_id: Optional[str] = None) -> list[str]:
     """Kill survivors of runs recorded in the ledger, then clear it (locked,
     atomic). Returns log lines. Safe to call at the start of a run BEFORE its own

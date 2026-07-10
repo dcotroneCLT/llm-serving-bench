@@ -56,6 +56,57 @@ class DiskWatchdogReason(unittest.TestCase):
         self.assertEqual(fg.call_count, 1)
 
 
+class InodeFloor(unittest.TestCase):
+    # Item 4c: the mid-run watchdog also gates on free inodes (statvfs f_favail).
+    def test_no_inode_floor_when_arg_omitted(self):
+        # Space is fine; inodes are never probed unless a floor is passed.
+        with mock.patch.object(lc, "free_gb", return_value=500.0), \
+             mock.patch.object(lc, "free_inodes") as fi:
+            self.assertIsNone(lc.disk_watchdog_reason(Path("/runs"), None, 10.0))
+        fi.assert_not_called()
+
+    def test_inode_breach_detected(self):
+        with mock.patch.object(lc, "free_gb", return_value=500.0), \
+             mock.patch.object(lc, "free_inodes", return_value=1000):
+            reason = lc.disk_watchdog_reason(Path("/runs"), None, 10.0,
+                                             min_free_inodes=100000)
+        self.assertIsNotNone(reason)
+        self.assertTrue(reason.startswith("inode_floor"))
+        self.assertIn("runs-root", reason)
+
+    def test_inode_ok_passes(self):
+        with mock.patch.object(lc, "free_gb", return_value=500.0), \
+             mock.patch.object(lc, "free_inodes", return_value=5_000_000):
+            self.assertIsNone(lc.disk_watchdog_reason(Path("/runs"), None, 10.0,
+                                                      min_free_inodes=100000))
+
+    def test_inode_none_skips_that_fs(self):
+        # An inode-less filesystem (free_inodes -> None) is skipped, not failed:
+        # the byte-space side already fails-closed on a truly unstat-able path.
+        with mock.patch.object(lc, "free_gb", return_value=500.0), \
+             mock.patch.object(lc, "free_inodes", return_value=None):
+            self.assertIsNone(lc.disk_watchdog_reason(Path("/runs"), None, 10.0,
+                                                      min_free_inodes=100000))
+
+    def test_space_breach_takes_precedence_over_inode_check(self):
+        # A byte-space breach returns before inodes are ever probed.
+        with mock.patch.object(lc, "free_gb", return_value=1.0), \
+             mock.patch.object(lc, "free_inodes") as fi:
+            reason = lc.disk_watchdog_reason(Path("/runs"), None, 10.0,
+                                             min_free_inodes=100000)
+        self.assertTrue(reason.startswith("disk_floor"))
+        fi.assert_not_called()
+
+    def test_free_inodes_real_dir_is_positive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = lc.free_inodes(Path(tmp))
+            # Either a real positive count, or None on an inode-less backing fs.
+            self.assertTrue(n is None or n > 0)
+
+    def test_free_inodes_missing_path_is_none(self):
+        self.assertIsNone(lc.free_inodes(Path("/no/such/path/xyz")))
+
+
 class DirSizeMb(unittest.TestCase):
     def test_sums_nested_files(self):
         with tempfile.TemporaryDirectory() as tmp:

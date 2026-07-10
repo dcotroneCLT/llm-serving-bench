@@ -173,6 +173,24 @@ PY
     CLIENT_CFG="$CALIB_WORK/client_config.yaml"
     [ -f "$CLIENT_CFG" ] || die "failed to materialize client config for calibration"
 
+    # Record the calibrated image tag+digest in the calibration provenance so the
+    # run-time staleness gate can verify the ceiling was measured against the SAME
+    # image (the pin is launch_cell's source of truth for the digest).
+    IMAGE_TAG="$(python3 -c "import yaml; e=yaml.safe_load(open('$CELL_YAML'))['engine']; print(e['image_repo']+':'+e['image_tag'])" 2>/dev/null || true)"
+    IMAGE_DIGEST="$(python3 - "$REPO_ROOT" "$CELL_YAML" <<'PY' 2>/dev/null || true
+import json, sys, yaml
+from pathlib import Path
+repo_root, cell_yaml = Path(sys.argv[1]), Path(sys.argv[2])
+eng = yaml.safe_load(cell_yaml.read_text())["engine"]
+pin_rel = eng.get("digest_pin_file")
+if pin_rel:
+    p = Path(pin_rel)
+    if not p.is_absolute():
+        p = repo_root / pin_rel
+    print(json.loads(p.read_text()).get("digest", ""))
+PY
+)"
+
     log "calibrate_rate.py: rates=$RATES fraction=0.30 -> $CALIB_JSON"
     set +e
     python3 "$REPO_ROOT/scripts/calibrate_rate.py" \
@@ -184,6 +202,8 @@ PY
         --fraction 0.30 \
         --cell-id longtest_dynamo_disagg \
         --system dynamo_disagg \
+        --image-tag "$IMAGE_TAG" \
+        --image-digest "$IMAGE_DIGEST" \
         --output "$CALIB_JSON" \
         --sweep-dir "$CALIB_WORK/sweep"
     CAL_RC=$?
@@ -228,10 +248,11 @@ set -e
 # --------------------------------------------------------------------------
 banner "PHASE e: verdict"
 case "$CAMPAIGN_RC" in
-    0) MEANING="OK (all runs completed)" ;;
+    0) MEANING="OK (every scheduled run completed)" ;;
     4) MEANING="INTERRUPTED (signal; state persisted, re-run to resume)" ;;
     5) MEANING="CAMPAIGN-FATAL (non-retryable precondition: disk / host / image-pin)" ;;
     3) MEANING="PRE-FLIGHT ERROR (should have stopped in phase c)" ;;
+    10) MEANING="COMPLETED_WITH_FAILURES (queue drained but >=1 run FAILED; inspect, then --resume --rerun-failed)" ;;
     *) MEANING="unexpected (see campaign log)" ;;
 esac
 log "campaign exit code: $CAMPAIGN_RC -- $MEANING"

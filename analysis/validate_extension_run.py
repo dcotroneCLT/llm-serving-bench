@@ -32,6 +32,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ecc_check import ecc_verdict  # noqa: E402
+
 
 def _read_csvs(run_dir: Path, prefix: str) -> list[dict]:
     rows: list[dict] = []
@@ -245,6 +248,12 @@ def main() -> None:
 
     print("\n[4] Analysis pipeline end-to-end:")
     oka, ma = check_analysis(args.run_dir, args.repo_root); print("\n".join(ma)); results.append(("analysis", oka))
+
+    # [5] GPU ECC drift (item 4b): uncorrected increment -> gate FAIL; corrected
+    # increment -> WARN (printed, does not fail the gate).
+    print("\n[5] GPU ECC drift:")
+    ecc, mecc = ecc_verdict(args.run_dir); print("\n".join(mecc))
+    results.append(("ecc", ecc != "fail"))
 
     print("\n== GATE SUMMARY ==")
     allok = True

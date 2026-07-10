@@ -56,10 +56,20 @@ Resumability (requirement 4):
   campaign_state.json records per-run status (pending|running|completed|failed|
   interrupted|host_conflict|insufficient_space|precondition_failed), written
   atomically (write-tmp + rename). The last three are the persisted labels for
-  the non-retryable launch_cell fatals (NONRETRYABLE_EXIT_CODES). --resume skips
-  completed runs and re-queues every non-completed run
-  (interrupted/failed/fatal-precondition runs re-enter the policy). The operator
-  can stop and restart across days.
+  the non-retryable launch_cell fatals (NONRETRYABLE_EXIT_CODES).
+
+Durable, honest retry accounting (hardening item 2):
+  * failed is TERMINAL. --resume skips completed AND failed runs; it re-queues
+    only the genuinely-unfinished ones (interrupted / host_conflict /
+    insufficient_space / precondition_failed / running). To retry a failed run
+    the operator must pass --rerun-failed, which explicitly resets that run's
+    attempt budget (attempts -> 0, status -> pending) and logs it.
+  * the retry decision counts PERSISTED attempts (RunStatus.attempts, which
+    survives every --resume), not a session-local counter. A run can therefore
+    never exceed max_retries+1 total launches across any number of resumes.
+  * a campaign that drains its queue with ANY failed run exits
+    EXIT_COMPLETED_WITH_FAILURES (10), not 0. Exit 0 STRICTLY means every
+    scheduled run completed.
 
 Signals (requirement 5):
   SIGTERM/SIGINT/SIGHUP forward SIGTERM to the current launch_cell child (which
@@ -83,8 +93,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -107,11 +119,24 @@ import launch_cell  # noqa: E402
 # Exit codes (campaign.py's own) and the launch_cell contract codes.
 # ---------------------------------------------------------------------------
 
-EXIT_OK = 0
+EXIT_OK = 0               # STRICT: every scheduled run completed (no failures)
 EXIT_USAGE = 2            # argparse-style usage error
 EXIT_PREFLIGHT = 3        # pre-flight failed (calibration/config/free space)
 EXIT_INTERRUPTED = 4      # stopped by a signal
 EXIT_CAMPAIGN_FATAL = 5   # a child reported a non-retryable fatal (launch_cell.NONRETRYABLE_EXIT_CODES: 6/7/8/9)
+# The queue drained but one or more runs ended FAILED (retry budget exhausted).
+# Distinct from 0 so an unattended campaign cannot look clean when it is not:
+# exit 0 means every scheduled run completed; exit 10 means "finished, but with
+# failures -- inspect them". Not in launch_cell.NONRETRYABLE_EXIT_CODES (6/7/8/9)
+# and above them by design, so it never collides with a child fatal code.
+EXIT_COMPLETED_WITH_FAILURES = 10
+
+# TERMINAL run statuses are never re-queued by pending_specs(): a run either
+# completed, or FAILED after exhausting its (persisted) attempt budget. Every
+# other status (interrupted / host_conflict / insufficient_space /
+# precondition_failed / running) is a genuinely-unfinished run that --resume
+# re-queues. failed leaves this set only via the explicit --rerun-failed reset.
+TERMINAL_STATUSES = frozenset({"completed", "failed"})
 
 # launch_cell exit codes that are HOST/PRECONDITION fatals, not run failures:
 # retrying cannot fix them (something else owns the host, a filesystem is too
@@ -248,6 +273,84 @@ def run_dir_looks_active(run_dir: Path, container_name: Optional[str]) -> bool:
     )
 
 
+def stale_running_recovery_decision(
+    launcher_alive: bool,
+    slot_free: bool,
+    engine_container_running: bool,
+    any_child_alive: bool,
+) -> tuple[bool, str]:
+    """Reboot/power-loss recovery decision (hardening item 3), pure so the whole
+    decision table is unit-testable without docker/GPU/psutil.
+
+    A hard crash or power loss mid-run leaves a run persisted as 'running' with an
+    unfinished manifest; for a multi-container (dynamo_disagg) run,
+    run_dir_looks_active would then refuse it as host_conflict and strand the
+    campaign until a human intervenes. Recover such a run ONLY when EVERY liveness
+    signal says it is truly gone:
+      - the launcher process is dead (per the reaper ledger's launcher identity),
+      - the run-slot lock is free,
+      - no engine container of the run's lifecycle is running, and
+      - no recorded run child is alive.
+    ANY live signal -> refuse (the conservative branch): a genuinely-active run
+    (or an ambiguous one) must never be archived out from under a live launcher.
+    Returns (recover, reason)."""
+    if launcher_alive:
+        return False, "launcher process still alive (active run, not stale)"
+    if not slot_free:
+        return False, "run-slot lock held (another launcher owns the host)"
+    if engine_container_running:
+        return False, "an engine container of this lifecycle is still running"
+    if any_child_alive:
+        return False, "a recorded run child is still alive"
+    return True, "stale_after_host_restart"
+
+
+def read_cell_image_digests(schedule: "list[RunSpec]", repo_root: Path) -> dict:
+    """{image_tag: pinned_digest} across every cell in the schedule, from each
+    cell's engine.digest_pin_file. Best-effort per cell; a cell whose image /
+    pin cannot be read is simply omitted (the drift check compares only tags
+    present in BOTH baseline and current, so an omission is never a false drift)."""
+    out: dict[str, Optional[str]] = {}
+    for spec in schedule:
+        try:
+            cell = yaml.safe_load(Path(spec.cell_yaml).read_text())
+            eng = (cell or {}).get("engine", {})
+            repo, tag = eng.get("image_repo"), eng.get("image_tag")
+            if not (repo and tag):
+                continue
+            image_tag = f"{repo}:{tag}"
+            digest = None
+            pin_rel = eng.get("digest_pin_file")
+            if pin_rel:
+                pin_path = Path(pin_rel)
+                if not pin_path.is_absolute():
+                    pin_path = repo_root / pin_rel
+                digest = str(json.loads(pin_path.read_text()).get("digest") or "") or None
+            out[image_tag] = digest
+        except (OSError, yaml.YAMLError, json.JSONDecodeError, KeyError, TypeError, AttributeError):
+            continue
+    return out
+
+
+def environment_drift(baseline: dict, current: dict) -> Optional[str]:
+    """Return a human description of how the CURRENT environment differs from the
+    campaign baseline (item 4a), or None if they agree. A field either side could
+    not determine (None) is NOT compared -- only a genuine value change counts, so
+    a box that briefly cannot read nvidia-smi does not fake a driver drift."""
+    diffs: list[str] = []
+    for key in ("kernel", "driver_version"):
+        b, c = baseline.get(key), current.get(key)
+        if b is not None and c is not None and str(b) != str(c):
+            diffs.append(f"{key}: baseline={b!r} current={c!r}")
+    b_imgs = baseline.get("image_digests") or {}
+    c_imgs = current.get("image_digests") or {}
+    for tag, bdig in b_imgs.items():
+        cdig = c_imgs.get(tag)
+        if bdig is not None and cdig is not None and str(bdig) != str(cdig):
+            diffs.append(f"image {tag}: baseline={bdig} current={cdig}")
+    return "; ".join(diffs) if diffs else None
+
+
 def expected_container_name(cell_yaml: str, replica: int) -> Optional[str]:
     """The single container name a cell will use, or None for a multi-container
     lifecycle (dynamo_disagg) that declares no container_name_template."""
@@ -303,6 +406,10 @@ class RunStatus:
     last_ended_at: Optional[str] = None
     last_rc: Optional[int] = None
     log_path: Optional[str] = None
+    # Short machine reason for the LAST status transition, for unattended
+    # diagnostics (e.g. "stale_after_host_restart" set by the item-3 recovery).
+    # Optional and defaulted so older state files (without it) still load.
+    last_reason: Optional[str] = None
 
 
 @dataclass
@@ -310,13 +417,20 @@ class State:
     campaign_id: str
     started_at: str = field(default_factory=utc_iso)
     runs: dict[str, RunStatus] = field(default_factory=dict)
+    # Environment baseline captured at --start (item 4a): {kernel, driver_version,
+    # image_digests}. Persisted so every subsequent dispatch (across resumes) can
+    # fail campaign-fatal if the host drifted. None for pre-hardening state files.
+    baseline: Optional[dict] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "campaign_id": self.campaign_id,
             "started_at": self.started_at,
             "runs": {k: asdict(v) for k, v in self.runs.items()},
         }
+        if self.baseline is not None:
+            d["baseline"] = self.baseline
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "State":
@@ -324,6 +438,7 @@ class State:
             campaign_id=d["campaign_id"],
             started_at=d.get("started_at", utc_iso()),
             runs={k: RunStatus(**v) for k, v in d.get("runs", {}).items()},
+            baseline=d.get("baseline"),
         )
 
 
@@ -503,12 +618,22 @@ class Campaign:
             else yaml_dir.parent.parent
         )
         self.max_retries = int(campaign.get("retry_policy", {}).get("max_retries", 1))
+        # Staleness gate for calibration files (requirement 1). Checked at
+        # PRE-FLIGHT for every queued run AND again at dispatch time (a run at
+        # queue position 30 starts weeks after pre-flight).
+        self.calibration_max_age_days = float(
+            campaign.get("calibration_max_age_days",
+                         launch_cell.DEFAULT_CALIBRATION_MAX_AGE_DAYS))
         self.inter_run_cooldown_s = int(campaign.get("inter_run_cooldown_s", 0))
         self.est_run_overhead_s = int(campaign.get("est_run_overhead_s", 0))
         self.min_free_gb = float(campaign.get("min_free_gb", 20.0))
         # SC-2 mid-run disk watchdog floor, passed to launch_cell. Defaults below
         # the pre-run gate so a run that started near it is not killed instantly.
         self.min_free_gb_mid_run = float(campaign.get("min_free_gb_mid_run", 10.0))
+        # SC-2 mid-run INODE floor (item 4c), passed to launch_cell.
+        self.min_inodes_free_mid_run = int(
+            campaign.get("min_inodes_free_mid_run",
+                         launch_cell.DEFAULT_MIN_INODES_FREE_MID_RUN))
 
         # Signal state. current_proc is set only while a child is alive.
         self.current_proc: Optional[subprocess.Popen] = None
@@ -532,6 +657,64 @@ class Campaign:
 
     def _status(self, spec: RunSpec) -> RunStatus:
         return self.state.runs.setdefault(spec.run_key, RunStatus())
+
+    # -- operator notification hook (item 5) --------------------------------
+
+    def _alert_path(self) -> Path:
+        return self.state_path.parent / "ALERT.json"
+
+    def _next_command(self, event: str) -> str:
+        base = (f"python3 scripts/campaign.py --campaign-yaml {self.campaign_path} "
+                f"--resume")
+        # A failure needs an explicit opt-in to retry (failed is TERMINAL); a
+        # fatal / interrupt just resumes once the precondition is resolved.
+        if event in ("failed_after_retry", "completed_with_failures"):
+            return base + " --rerun-failed"
+        return base
+
+    def write_alert(self, event: str, run_key: str, reason: str) -> None:
+        """Operator notification hook (item 5). Atomically write state/ALERT.json
+        (ts, run_key, event, reason, next command) and, if CAMPAIGN_NOTIFY_CMD is
+        set in the environment, invoke it with the alert path as $1. The hook is
+        BEST-EFFORT and timeout-bounded: a failing / missing / hung notifier is
+        logged and swallowed, NEVER changing the campaign's outcome. Fired on
+        campaign-fatal, failed-after-retry, interrupted, and
+        completed_with_failures."""
+        alert = {
+            "ts": utc_iso(),
+            "campaign_id": self.campaign_id,
+            "event": event,
+            "run_key": run_key,
+            "reason": reason,
+            "next_command": self._next_command(event),
+        }
+        path = self._alert_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(alert, indent=2))
+            os.replace(tmp, path)
+            log(f"ALERT written: {path} (event={event} run={run_key or '-'})")
+        except OSError as e:
+            log(f"WARNING: could not write ALERT.json: {e!r} (continuing)")
+            return
+        cmd = os.environ.get("CAMPAIGN_NOTIFY_CMD")
+        if not cmd:
+            return
+        try:
+            subprocess.run([cmd, str(path)], timeout=30, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log(f"notify hook invoked: {cmd} {path}")
+        except Exception as e:  # noqa: BLE001 - notify must never affect the outcome
+            log(f"WARNING: CAMPAIGN_NOTIFY_CMD failed (ignored): {e!r}")
+
+    def clear_alert(self) -> None:
+        """Remove a stale ALERT.json: on a fresh --start, and on a clean
+        completion (the incident, if any, is resolved). Best-effort."""
+        try:
+            self._alert_path().unlink()
+        except OSError:
+            pass
 
     # -- signal handling ----------------------------------------------------
 
@@ -588,9 +771,11 @@ class Campaign:
             "--attempt", str(attempt),
             "--min-free-gb", str(self.min_free_gb),
             "--min-free-gb-mid-run", str(self.min_free_gb_mid_run),
+            "--min-inodes-free-mid-run", str(self.min_inodes_free_mid_run),
         ]
         if spec.calibration_file:
-            cmd += ["--calibration-file", spec.calibration_file]
+            cmd += ["--calibration-file", spec.calibration_file,
+                    "--calibration-max-age-days", str(self.calibration_max_age_days)]
         if spec.allow_lower_bound_calibration:
             cmd += ["--allow-lower-bound-calibration"]
         return cmd
@@ -710,7 +895,33 @@ class Campaign:
         """Run one spec under the retry policy. Returns 'completed' or 'failed'.
         Raises CampaignFatal on a non-retryable exit (6/7/8/9) or a pre-child
         active-run detection; CampaignInterrupted on signal."""
-        session_attempts = 0
+        # Requirement 1: re-check calibration staleness at DISPATCH, not just at
+        # pre-flight. A run at queue position 30 starts weeks after pre-flight;
+        # its calibration may have crossed the max-age line since. A stale/
+        # mismatched calibration is a non-retryable precondition (retrying cannot
+        # un-age it): stop the campaign loudly like the other precondition gates.
+        prov_ok, prov_msg = self.check_calibration_provenance(spec, time.time())
+        if not prov_ok:
+            self._mark_fatal(spec, LC_PRECONDITION)
+            raise CampaignFatal(
+                spec.run_key, LC_PRECONDITION,
+                f"calibration staleness gate at dispatch: {prov_msg}",
+            )
+        # Item 4a: the host environment must not drift mid-campaign. A driver /
+        # kernel / pinned-image change since the --start baseline is a
+        # campaign-fatal precondition -- an operator decision, never background
+        # noise silently spanning runs. Checked at EVERY dispatch (a run at queue
+        # position 30 starts long after the baseline was taken).
+        drift = self.check_environment_drift()
+        if drift is not None:
+            self._mark_fatal(spec, LC_PRECONDITION)
+            raise CampaignFatal(
+                spec.run_key, LC_PRECONDITION,
+                f"environment drift since the campaign baseline: {drift}. A "
+                "mid-campaign driver/kernel/image change must be an explicit "
+                "operator decision; stopping. Re-establish the baseline "
+                "deliberately (--start a fresh campaign) once the change is intended.",
+            )
         while True:
             if self._interrupted:
                 raise CampaignInterrupted()
@@ -749,26 +960,220 @@ class Campaign:
                     f"launch_cell exit {rc} ({human}).",
                 )
 
-            # Ordinary failure -> re-attempt once, then give up on this run.
-            session_attempts += 1
-            if session_attempts > self.max_retries:
-                self._status(spec).status = "failed"
+            # Ordinary failure. The retry decision counts PERSISTED attempts
+            # (status.attempts, bumped in _dispatch and surviving every --resume),
+            # NOT a session-local counter: a run gets at most max_retries+1 total
+            # launches across ANY number of resumes, so an interrupt-then-resume
+            # cycle can never silently hand it a fresh attempt budget (item 2).
+            status = self._status(spec)
+            if status.attempts >= self.max_retries + 1:
+                status.status = "failed"
+                status.last_reason = f"failed_after_retry rc={rc}"
                 self.persist_state()
-                log(f"{spec.run_key} FAILED after {session_attempts} attempt(s) rc={rc}")
+                log(f"{spec.run_key} FAILED after {status.attempts} attempt(s) rc={rc}")
+                self.write_alert("failed_after_retry", spec.run_key,
+                                 f"exhausted retry budget ({status.attempts} attempt(s)), last rc={rc}")
                 return "failed"
-            log(f"{spec.run_key} failed rc={rc}, retrying ({session_attempts}/{self.max_retries})")
+            log(f"{spec.run_key} failed rc={rc}, retrying "
+                f"(persisted attempt {status.attempts}/{self.max_retries + 1})")
 
     # -- pre-flight ---------------------------------------------------------
 
+    def _current_calibration_signature(self, spec: RunSpec) -> dict:
+        """The host/image signature of THIS box for `spec`, to compare against
+        the calibration's recorded provenance. hostname is always known; the
+        image tag+digest come from the cell yaml + its pin file (the same source
+        launch_cell uses); GPU name+driver are best-effort (None if no
+        nvidia-smi). Any read failure leaves image fields None -> not compared."""
+        image_tag = image_digest = None
+        try:
+            cell = yaml.safe_load(Path(spec.cell_yaml).read_text())
+            eng = (cell or {}).get("engine", {})
+            repo, tag = eng.get("image_repo"), eng.get("image_tag")
+            if repo and tag:
+                image_tag = f"{repo}:{tag}"
+            pin_rel = eng.get("digest_pin_file")
+            if pin_rel:
+                pin_path = Path(pin_rel)
+                if not pin_path.is_absolute():
+                    pin_path = self.repo_root / pin_rel
+                pin = json.loads(pin_path.read_text())
+                image_digest = (str(pin.get("digest") or "") or None)
+        except (OSError, yaml.YAMLError, json.JSONDecodeError, KeyError, TypeError, AttributeError):
+            pass
+        gpu_name, driver = launch_cell.gpu_name_and_driver()
+        return launch_cell.current_calibration_signature(
+            socket.gethostname(), gpu_name, driver, image_tag, image_digest)
+
+    def check_calibration_provenance(self, spec: RunSpec, now_unix: float) -> tuple[bool, str]:
+        """Return (ok, message) for a spec's calibration staleness / host / image
+        signature. Only meaningful when the spec has a calibration_file that
+        parses; a spec with no file is (True, 'no calibration'). Uses launch_cell's
+        gate so pre-flight, dispatch, and run time agree exactly."""
+        if not spec.calibration_file:
+            return True, "no calibration"
+        path = Path(spec.calibration_file)
+        if not path.exists():
+            # validate_calibration already reports the missing-file verdict.
+            return True, "file absent (reported by calibration check)"
+        try:
+            calib = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            return False, f"INVALID JSON: {e}"
+        current_sig = self._current_calibration_signature(spec)
+        try:
+            launch_cell.check_calibration_provenance(
+                calib, current_sig, self.calibration_max_age_days, now_unix)
+        except launch_cell.CalibrationError as e:
+            return False, f"STALE/MISMATCH: {e}"
+        age = launch_cell.calibration_age_days(calib, now_unix)
+        return True, (f"fresh (age={age:.1f}d)" if age is not None else "fresh")
+
     def pending_specs(self) -> list[RunSpec]:
-        """Specs that still need to run (everything not 'completed')."""
+        """Specs that still need to run: everything whose persisted status is not
+        TERMINAL. failed is TERMINAL (hardening item 2) -- it is NOT re-queued on
+        --resume, so a run can never silently burn fresh attempts across resumes.
+        The operator opts a failed run back in with --rerun-failed, which resets
+        its attempt budget explicitly (reset_failed_for_rerun)."""
         out = []
         for spec in self.schedule:
             st = self.state.runs.get(spec.run_key)
-            if st and st.status == "completed":
+            if st and st.status in TERMINAL_STATUSES:
                 continue
             out.append(spec)
         return out
+
+    def reset_failed_for_rerun(self, persist: bool = True) -> int:
+        """--rerun-failed: turn each FAILED run back into a fresh pending run
+        (attempts -> 0, status -> pending) so the queue re-runs it with a full
+        attempt budget. failed is otherwise TERMINAL. Returns the count reset and
+        logs each one (the reset is an explicit, audited operator decision)."""
+        reset = 0
+        for key, st in self.state.runs.items():
+            if st.status == "failed":
+                st.status = "pending"
+                st.attempts = 0
+                st.last_rc = None
+                reset += 1
+                log(f"--rerun-failed: reset {key} (was failed) -> pending, attempts=0")
+        if not reset:
+            log("--rerun-failed: no failed runs to reset")
+        elif persist:
+            self.persist_state()
+        return reset
+
+    # -- environment baseline + drift gate (item 4a) ------------------------
+
+    def capture_environment_baseline(self) -> dict:
+        """Snapshot {kernel, driver_version, image_digests} for THIS host now.
+        driver comes from nvidia-smi (best-effort None if absent); kernel from
+        platform.release(); image digests from every cell's pin file."""
+        _, driver = launch_cell.gpu_name_and_driver()
+        return {
+            "captured_at": utc_iso(),
+            "kernel": platform.release(),
+            "driver_version": driver,
+            "image_digests": read_cell_image_digests(self.schedule, self.repo_root),
+        }
+
+    def capture_and_store_baseline(self, persist: bool = True) -> None:
+        """Establish the campaign baseline (item 4a): captured once at --start (or
+        the first time a pre-hardening state file is resumed) and persisted so
+        every subsequent dispatch can gate against it across resumes."""
+        self.state.baseline = self.capture_environment_baseline()
+        b = self.state.baseline
+        log(f"environment baseline: kernel={b['kernel']!r} driver={b['driver_version']!r} "
+            f"images={len(b['image_digests'])} pinned")
+        if persist:
+            self.persist_state()
+
+    def check_environment_drift(self) -> Optional[str]:
+        """Compare the current host environment to the campaign baseline. Returns
+        a drift description or None. No baseline (pre-hardening state) -> no check
+        (and no nvidia-smi probe)."""
+        baseline = self.state.baseline
+        if not baseline:
+            return None
+        return environment_drift(baseline, self.capture_environment_baseline())
+
+    # -- reboot / power-loss recovery (item 3) ------------------------------
+
+    def _run_id(self, spec: RunSpec) -> str:
+        """The full run_id launch_cell / reaper key on (campaign-scoped), which is
+        distinct from spec.run_key (cell-scoped)."""
+        return f"{self.campaign_id}_{spec.cell_id}_r{spec.replica:02d}"
+
+    def _run_slot_free(self) -> bool:
+        """True iff the run-slot lock is currently free. Probes by acquiring and
+        immediately releasing (closing the fd releases the flock)."""
+        slot = reaper.acquire_run_slot(self.runs_root)
+        if slot is None:
+            return False
+        try:
+            slot.close()
+        except OSError:
+            pass
+        return True
+
+    def _engine_container_running_for(self, spec: RunSpec) -> bool:
+        """True iff an engine container for spec's lifecycle is currently running.
+        single_container: the expected container name; multi-container
+        (dynamo_disagg, no single name): any dyn_* container that is up."""
+        name = expected_container_name(spec.cell_yaml, spec.replica)
+        if name is not None:
+            return container_running(name)
+        return any(container_running(n) for n in launch_cell.all_dyn_containers())
+
+    def _stale_running_facts(self, spec: RunSpec, slot_free: bool) -> dict:
+        """Gather the four liveness signals for stale_running_recovery_decision."""
+        run_id = self._run_id(spec)
+        return {
+            "launcher_alive": reaper.launcher_alive_for(self.runs_root, run_id),
+            "slot_free": slot_free,
+            "engine_container_running": self._engine_container_running_for(spec),
+            "any_child_alive": reaper.recorded_children_alive(self.runs_root, run_id),
+        }
+
+    def recover_stale_running(self) -> None:
+        """For each run the state still marks 'running' at resume (only possible
+        after a hard crash / power loss -- a signal shutdown rewrites running ->
+        interrupted), decide via stale_running_recovery_decision whether it is a
+        stranded stale run (safe to recover) or a genuinely-active one (refuse).
+
+        On recover: archive the stale run_dir, mark the run interrupted with reason
+        'stale_after_host_restart', and let the normal queue re-run it under its
+        PERSISTED attempt budget. On refuse: leave it 'running' so _prepare_run_dir
+        still treats it as an active run (host_conflict) -- a human must resolve a
+        run that looks alive."""
+        running = [
+            s for s in self.schedule
+            if (st := self.state.runs.get(s.run_key)) is not None and st.status == "running"
+        ]
+        if not running:
+            return
+        slot_free = self._run_slot_free()
+        changed = False
+        for spec in running:
+            facts = self._stale_running_facts(spec, slot_free)
+            recover, reason = stale_running_recovery_decision(**facts)
+            if not recover:
+                log(f"stale-running check for {spec.run_key}: NOT recovering ({reason}); "
+                    f"leaving 'running' (a human must resolve if it is truly stuck)")
+                continue
+            run_dir = self.runs_root / self._run_id(spec)
+            archived = archive_existing_run_dir(run_dir, self._status(spec).attempts)
+            if archived is not None:
+                log(f"stale-running recovery: archived {run_dir} -> {archived}")
+            st = self._status(spec)
+            st.status = "interrupted"
+            st.last_reason = "stale_after_host_restart"
+            st.last_ended_at = utc_iso()
+            changed = True
+            log(f"stale-running recovery: {spec.run_key} -> interrupted "
+                f"(reason=stale_after_host_restart); re-queued under attempt budget "
+                f"(attempts={st.attempts}/{self.max_retries + 1})")
+        if changed:
+            self.persist_state()
 
     def preflight(self) -> None:
         """Print the schedule, calibration status, estimate, and free space.
@@ -778,6 +1183,19 @@ class Campaign:
         log(f"repo_root:   {self.repo_root}")
         log(f"runs_root:   {self.runs_root}")
         log(f"state_file:  {self.state_path}")
+
+        # Item 5: surface a prior incident's ALERT.json so the operator sees why
+        # the last run stopped BEFORE resuming (it is cleared on a clean finish).
+        alert_path = self._alert_path()
+        if alert_path.exists():
+            try:
+                a = json.loads(alert_path.read_text())
+                log(f"** PRIOR ALERT ({alert_path}): event={a.get('event')} "
+                    f"run={a.get('run_key')} ts={a.get('ts')}")
+                log(f"**   reason: {a.get('reason')}")
+                log(f"**   next:   {a.get('next_command')}")
+            except (OSError, json.JSONDecodeError) as e:
+                log(f"** PRIOR ALERT present at {alert_path} but unreadable: {e}")
         log(
             f"retry: max_retries={self.max_retries}  "
             f"cooldown={self.inter_run_cooldown_s}s  min_free={self.min_free_gb}GB"
@@ -789,6 +1207,7 @@ class Campaign:
 
         # Full schedule in order, with per-cell calibration status.
         calib_failures: list[str] = []
+        now_unix = time.time()
         total_est_s = 0
         for i, spec in enumerate(self.schedule, 1):
             st = self.state.runs.get(spec.run_key)
@@ -801,10 +1220,18 @@ class Campaign:
             ok, msg = validate_calibration(spec)
             if not ok:
                 calib_failures.append(f"{spec.run_key}: {msg}")
+            # Requirement 1: staleness / host / image gate on EVERY queued run,
+            # so a month-1 ceiling cannot silently drive a month-3 run. Skipped
+            # for a completed run (its rate is already burned into the manifest).
             will_run = not (st and st.status == "completed")
+            prov_msg = ""
             if will_run:
+                prov_ok, prov_msg = self.check_calibration_provenance(spec, now_unix)
+                if not prov_ok:
+                    calib_failures.append(f"{spec.run_key}: {prov_msg}")
                 total_est_s += spec.duration_s + self.est_run_overhead_s
-            log(f"  {i:3d}. {spec.run_key}{state_note}  calib={msg}")
+            log(f"  {i:3d}. {spec.run_key}{state_note}  calib={msg}"
+                + (f"  prov={prov_msg}" if prov_msg else ""))
 
         log(f"estimated remaining wallclock: {format_duration(total_est_s)} "
             f"(sum of duration_s + {self.est_run_overhead_s}s overhead per pending run)")
@@ -831,22 +1258,31 @@ class Campaign:
 
     def run(self) -> int:
         """Drive the queue serially. Returns the process exit code."""
+        # Item 3: before dispatching, recover any run stranded as 'running' by a
+        # host restart (archive + mark interrupted) so a crashed multi-container
+        # run does not deadlock the queue as a phantom host_conflict.
+        self.recover_stale_running()
         pending = self.pending_specs()
         for idx, spec in enumerate(pending):
             if self._interrupted:
                 log("interrupted before starting the next run")
                 self.persist_state()
+                self.write_alert("interrupted", spec.run_key,
+                                 "campaign received a stop signal before this run started")
                 return EXIT_INTERRUPTED
             try:
                 self._run_with_retry(spec)
             except CampaignInterrupted:
                 log("campaign interrupted; state persisted")
+                self.write_alert("interrupted", spec.run_key,
+                                 "campaign received a stop signal during this run")
                 return EXIT_INTERRUPTED
             except CampaignFatal as f:
                 log(f"CAMPAIGN FATAL on {f.run_key}: {f.detail}")
                 log("stopping the campaign. Resolve the precondition (host ownership, "
                     "free space, image-pin mismatch, or a non-fresh run_dir -- see the "
                     "run's per-attempt child log), then --resume.")
+                self.write_alert("campaign_fatal", f.run_key, f.detail)
                 return EXIT_CAMPAIGN_FATAL
 
             # Inter-run cooldown before the next run (skip after the last one).
@@ -857,12 +1293,23 @@ class Campaign:
                 if self._interrupted:
                     log("interrupted during cooldown; state persisted")
                     self.persist_state()
+                    self.write_alert("interrupted", spec.run_key,
+                                     "campaign received a stop signal during the inter-run cooldown")
                     return EXIT_INTERRUPTED
 
         log("campaign complete")
         failed = [k for k, s in self.state.runs.items() if s.status == "failed"]
         if failed:
-            log(f"NOTE: {len(failed)} run(s) ended FAILED: {sorted(failed)}")
+            # Exit 0 STRICTLY means every scheduled run completed. A drained queue
+            # that still carries a failed run exits EXIT_COMPLETED_WITH_FAILURES so
+            # an unattended campaign cannot look clean when it is not (item 2).
+            log(f"NOTE: {len(failed)} run(s) ended FAILED: {sorted(failed)}. "
+                f"Inspect them; re-queue with --resume --rerun-failed.")
+            self.write_alert("completed_with_failures", ",".join(sorted(failed)),
+                             f"{len(failed)} run(s) ended FAILED: {sorted(failed)}")
+            return EXIT_COMPLETED_WITH_FAILURES
+        # Clean completion: clear any stale ALERT.json from an earlier incident.
+        self.clear_alert()
         return EXIT_OK
 
 
@@ -889,10 +1336,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--start", action="store_true", help="Start fresh (delete existing state file).")
     p.add_argument("--resume", action="store_true", help="Resume from the state file.")
     p.add_argument("--dry-run", action="store_true", help="Run pre-flight (schedule + gates) and exit.")
+    p.add_argument("--rerun-failed", action="store_true",
+                   help="Reset FAILED runs (attempts->0, status->pending) so --resume "
+                        "re-queues them with a full attempt budget. failed is otherwise "
+                        "TERMINAL and skipped on --resume. Each reset is logged.")
     args = p.parse_args(argv)
 
     if args.start and args.resume:
         print("--start and --resume are mutually exclusive", file=sys.stderr)
+        return EXIT_USAGE
+    if args.rerun_failed and not args.resume:
+        print("--rerun-failed only applies to --resume (failed runs live in an "
+              "existing state file)", file=sys.stderr)
         return EXIT_USAGE
     if not (args.start or args.resume or args.dry_run):
         print("must specify --start, --resume, or --dry-run", file=sys.stderr)
@@ -939,6 +1394,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         log(f"campaign log: {log_path}")
 
     camp = Campaign(campaign, campaign_path, schedule, state, state_path)
+
+    # --rerun-failed: explicitly re-open TERMINAL failed runs before pre-flight so
+    # the schedule/estimate reflect them. Persist only for a real resume (not
+    # --dry-run, which must never write state).
+    if args.rerun_failed:
+        camp.reset_failed_for_rerun(persist=not args.dry_run)
+
+    # Item 4a: establish the environment baseline at --start (and, for a
+    # pre-hardening state file with none yet, the first real resume). --dry-run
+    # never writes state, so it only previews an in-memory baseline.
+    if not args.dry_run and camp.state.baseline is None:
+        camp.capture_and_store_baseline()
+
+    # Item 5: a fresh --start clears any stale ALERT.json from a prior campaign
+    # (a resume keeps it so pre-flight can surface the last incident).
+    if args.start and not args.dry_run:
+        camp.clear_alert()
 
     try:
         camp.preflight()

@@ -44,11 +44,14 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import hashlib
 import json
+import socket
 import statistics
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -203,6 +206,58 @@ def run_one_rate(
     return stats
 
 
+# ---------------------------------------------------------------------------
+# Calibration provenance (read by the staleness / host / image gate)
+# ---------------------------------------------------------------------------
+
+
+def _nvidia_gpu_name_driver() -> tuple[Optional[str], Optional[str]]:
+    """(gpu_name, driver_version) from nvidia-smi, or (None, None) if it cannot
+    be read (no GPU / nvidia-smi absent). Provenance is best-effort: a value we
+    cannot determine is recorded as null, never fabricated."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None, None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None, None
+    first = r.stdout.strip().splitlines()[0]
+    name, _, drv = first.partition(",")
+    return (name.strip() or None), (drv.strip() or None)
+
+
+def _sha256_file(path: Path) -> Optional[str]:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def build_provenance(config: Path, image_tag: Optional[str],
+                     image_digest: Optional[str], now_unix: float) -> dict:
+    """Provenance the staleness / host / image gate reads (launch_cell +
+    campaign pre-flight): WHEN the calibration was taken, on WHICH host / GPU /
+    driver, against WHICH image, and a hash of the client config swept. A
+    calibration whose host/image signature no longer matches the current one, or
+    which is older than the campaign's max age, must be refused with the same
+    fail-loud semantics as a missing REQUIRED calibration -- a month-1 ceiling
+    must never silently drive a month-3 run."""
+    gpu_name, driver = _nvidia_gpu_name_driver()
+    return {
+        "calibrated_at_unix": round(now_unix, 3),
+        "calibrated_at_iso": datetime.fromtimestamp(now_unix, timezone.utc).isoformat(timespec="seconds"),
+        "hostname": socket.gethostname(),
+        "gpu_name": gpu_name,
+        "driver_version": driver,
+        "image_tag": image_tag,
+        "image_digest": image_digest,
+        "client_config_hash": _sha256_file(config),
+    }
+
+
 def exit_code_for_status(status: str) -> int:
     """Single source of truth for the calibration verdict -> process exit code.
     0 ok; 3 no_stable_point (no ceiling at all); 4 did_not_saturate (ceiling is
@@ -227,6 +282,13 @@ def main() -> None:
     p.add_argument("--latency-climb-frac", type=float, default=0.20)
     p.add_argument("--cell-id", type=str, default="")
     p.add_argument("--system", type=str, default="")
+    p.add_argument("--image-tag", type=str, default=None,
+                   help="repo:tag of the calibrated engine image, recorded in the "
+                        "provenance block so the run-time gate can verify the "
+                        "calibration was taken against the SAME image.")
+    p.add_argument("--image-digest", type=str, default=None,
+                   help="sha256 of the calibrated engine image (from the image pin), "
+                        "recorded in provenance for the image-signature gate.")
     p.add_argument("--output", type=Path, required=True, help="Calibration JSON path (read by launch_cell --calibration-file).")
     p.add_argument("--sweep-dir", type=Path, default=None, help="Where to keep per-rate client CSVs (default: alongside --output).")
     args = p.parse_args()
@@ -283,6 +345,10 @@ def main() -> None:
         "ceiling_rps": None,
         "ceiling_offered_rps": None,
         "rate_calibrated_rps": None,
+        # Provenance for the staleness / host / image gate. Recorded on EVERY
+        # calibration (even a non-ok one) so a stale/mismatched file is caught
+        # regardless of its verdict.
+        "provenance": build_provenance(args.config, args.image_tag, args.image_digest, time.time()),
     }
     if ceiling is not None:
         out["ceiling_rps"] = ceiling["achieved_rps"]

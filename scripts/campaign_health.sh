@@ -5,7 +5,12 @@
 # no file is modified. Inspects only state files, CSVs, and docker/nvidia-smi.
 #
 # Run from any shell, any conda env:
-#   bash scripts/campaign_health.sh
+#   bash scripts/campaign_health.sh [--campaign-yaml PATH]
+#
+# --campaign-yaml selects the campaign to inspect (default: the extension/DoW
+# campaign). Runs root, state file, mitigations log, per-run globs, and the
+# docker name filter are ALL derived from it + its campaign_id -- there are no
+# hardcoded wosar2026 paths, so one script serves every campaign.
 #
 # Exit codes:
 #   0  OK     - everything within thresholds. Safe to leave running.
@@ -14,7 +19,7 @@
 #
 # Sections:
 #   A. Campaign-wide  (state file, disk, GPU pool, container count)
-#   B. Per-run health (looped over wosar2026_*_rNN in runs_root)
+#   B. Per-run health (looped over <campaign_id>_*_rNN in runs_root)
 #      B.1 Required output files
 #      B.2 Manifest content
 #      B.3 Container alive on correct GPU
@@ -93,16 +98,57 @@ HEALTH_MONITOR_WARMUP_S="${HEALTH_MONITOR_WARMUP_S:-120}"
 HEALTH_HARD_SAMPLE_ERR_PCT="${HEALTH_HARD_SAMPLE_ERR_PCT:-1}"
 HEALTH_RESPAWN_TOLERANCE_S="${HEALTH_RESPAWN_TOLERANCE_S:-90}"
 
-# ---------- Paths ----------
+# ---------- CLI ----------
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CAMPAIGN_YAML="$REPO_ROOT/campaigns/wosar2026/campaign.yaml"
-CAMPAIGN_RUNS_ROOT=$(awk -F': *' '/^runs_root:/ {print $2; exit}' "$CAMPAIGN_YAML" 2>/dev/null | tr -d '"' || true)
+# Default to the extension (DoW) campaign; --campaign-yaml overrides.
+CAMPAIGN_YAML="$REPO_ROOT/campaigns/extension/campaign.yaml"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --campaign-yaml) CAMPAIGN_YAML="${2:?--campaign-yaml requires a path}"; shift 2 ;;
+        --campaign-yaml=*) CAMPAIGN_YAML="${1#*=}"; shift ;;
+        -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
+    esac
+done
+if [ ! -f "$CAMPAIGN_YAML" ]; then
+    echo "campaign yaml not found: $CAMPAIGN_YAML" >&2
+    exit 2
+fi
+# Absolutize so CAMPAIGN_DIR-relative derivations (state_file, cells/) are stable
+# regardless of the caller's CWD.
+CAMPAIGN_YAML="$(cd "$(dirname "$CAMPAIGN_YAML")" && pwd)/$(basename "$CAMPAIGN_YAML")"
+CAMPAIGN_DIR="$(dirname "$CAMPAIGN_YAML")"
+
+# ---------- Paths (all derived from the campaign yaml) ----------
+yaml_top_scalar() {
+    # A top-level `key: value` scalar (campaign yaml keys are unindented). Pure
+    # awk so this works even where PyYAML is missing (campaign.py resolves the
+    # same keys; the values must agree).
+    local file="$1" key="$2"
+    awk -F': *' -v k="$key" '
+        $1==k { v=$2; sub(/[[:space:]]+#.*/,"",v); gsub(/^["'\'']|["'\'']$/,"",v); print v; exit }
+    ' "$file" 2>/dev/null
+}
+CAMPAIGN_ID=$(yaml_top_scalar "$CAMPAIGN_YAML" "campaign_id")
+if [ -z "$CAMPAIGN_ID" ]; then
+    echo "could not read campaign_id from $CAMPAIGN_YAML (is it a campaign descriptor?)" >&2
+    exit 2
+fi
+CAMPAIGN_RUNS_ROOT=$(yaml_top_scalar "$CAMPAIGN_YAML" "runs_root")
 RUNS_ROOT="${RUNS_ROOT:-${CAMPAIGN_RUNS_ROOT:-$HOME/wosar/runs}}"
-STATE_FILE="$REPO_ROOT/campaigns/wosar2026/state/campaign_state.json"
-# Append-only log of manual operator interventions during the campaign.
+# state_file is relative to the campaign yaml, exactly as campaign.py resolves it
+# ((campaign_path.parent / state_file)); default matches campaign.py's default.
+STATE_REL=$(yaml_top_scalar "$CAMPAIGN_YAML" "state_file")
+STATE_REL="${STATE_REL:-state/campaign_state.json}"
+case "$STATE_REL" in
+    /*) STATE_FILE="$STATE_REL" ;;
+    *)  STATE_FILE="$CAMPAIGN_DIR/$STATE_REL" ;;
+esac
+STATE_DIR="$(dirname "$STATE_FILE")"
+# Append-only log of manual operator interventions, beside the state file.
 # Written only by scripts/log_mitigation.sh (fixed taxonomy of 6 categories);
 # this script only reads the tail to surface recent interventions in REPORT.
-MITIGATIONS_LOG="${MITIGATIONS_LOG:-$REPO_ROOT/campaigns/wosar2026/state/mitigations.log}"
+MITIGATIONS_LOG="${MITIGATIONS_LOG:-$STATE_DIR/mitigations.log}"
 # Inspection mode: pointed at an archive (RUNS_ROOT overridden away from the
 # campaign default). State file absence is expected, not a hard failure.
 if [ -n "${CAMPAIGN_RUNS_ROOT:-}" ] && [ "$RUNS_ROOT" != "$CAMPAIGN_RUNS_ROOT" ]; then
@@ -179,8 +225,12 @@ stat_mtime() {
 }
 
 run_cell_from_name() {
+    # <campaign_id>_<cell_id>_rNN. cell_id itself may contain underscores (e.g.
+    # val_dynamo_disagg), so strip the known campaign_id prefix and _rNN suffix
+    # rather than assuming a single-token cell_id.
     local name="$1"
-    if [[ "$name" =~ ^wosar2026_([^_]+)_r[0-9][0-9]$ ]]; then
+    local rest="${name#"${CAMPAIGN_ID}"_}"
+    if [[ "$rest" =~ ^(.+)_r[0-9][0-9]$ ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
     fi
 }
@@ -193,8 +243,11 @@ run_replica_from_name() {
 }
 
 cell_yaml() {
+    # Cell yamls live in <campaign_dir>/cells/<cell_id>.yaml (the convention both
+    # the wosar2026 and extension campaigns follow). Used only for manifest-field
+    # fallbacks when a run's manifest.json is monitor-only.
     local cell_id="$1"
-    printf '%s/campaigns/wosar2026/cells/%s.yaml\n' "$REPO_ROOT" "$cell_id"
+    printf '%s/cells/%s.yaml\n' "$CAMPAIGN_DIR" "$cell_id"
 }
 
 yaml_scalar() {
@@ -461,6 +514,7 @@ try:
     for k, v in d.get("runs", {}).items():
         s = v.get("status", "?")
         by_status.setdefault(s, []).append(k)
+    print("STATE_CAMPAIGN_ID:" + str(d.get("campaign_id", "")))
     print("STATUS_SUMMARY:" + " ".join([f"{s}={len(v)}" for s,v in sorted(by_status.items())]))
     print("RUNNING_COUNT:" + str(len(by_status.get("running", []))))
     for k, v in d.get("runs", {}).items():
@@ -474,6 +528,16 @@ PY
         STATE_RUNNING_COUNT=$(printf '%s\n' "$state_summary" | grep "^RUNNING_COUNT:" | sed 's/RUNNING_COUNT://' || true)
         STATE_RUNNING_COUNT=${STATE_RUNNING_COUNT:-0}
         FAILED_RUNS=$(printf '%s\n' "$state_summary" | grep "^FAILED_RUN:" | sed 's/FAILED_RUN://' || true)
+        STATE_CAMPAIGN_ID=$(printf '%s\n' "$state_summary" | grep "^STATE_CAMPAIGN_ID:" | sed 's/STATE_CAMPAIGN_ID://' || true)
+        # Fail LOUD if the state file belongs to a different campaign than the
+        # yaml we were pointed at: continuing would inspect this campaign's runs
+        # against another campaign's checkpoint (the exact provenance-mixing
+        # campaign.py itself refuses at resume). A hard FAIL (exit 2), not a WARN.
+        if [ -n "$STATE_CAMPAIGN_ID" ] && [ "$STATE_CAMPAIGN_ID" != "$CAMPAIGN_ID" ]; then
+            record FAIL "A.state.campaign_id" "state file campaign_id='$STATE_CAMPAIGN_ID' != yaml campaign_id='$CAMPAIGN_ID' ($STATE_FILE). Wrong --campaign-yaml, a shared state_file, or a stale checkpoint."
+        else
+            record PASS "A.state.campaign_id" "matches yaml ($CAMPAIGN_ID)"
+        fi
         record PASS "A.state.summary" "${SUM:-empty}"
         if [ -n "$FAILED_RUNS" ]; then
             while IFS= read -r line; do
@@ -483,22 +547,63 @@ PY
     fi
 fi
 
-# A.3 container counts
+# A.3 container counts. Container names are NOT campaign-id-prefixed in general
+# (a cell's engine.container_name_template is free-form, e.g. "val_vllm_r{N}",
+# and dynamo_disagg cells use the dyn_ stack prefix). Derive the set of name
+# prefixes this campaign actually uses from its cells, so the count reflects
+# THIS campaign's containers without hardcoding wosar2026_.
+campaign_container_prefixes() {
+    C_YAML="$CAMPAIGN_YAML" C_DIR="$CAMPAIGN_DIR" python3 - <<'PY' 2>/dev/null
+import os
+try:
+    import yaml
+    from pathlib import Path
+    camp = yaml.safe_load(open(os.environ["C_YAML"], encoding="utf-8"))
+    cdir = Path(os.environ["C_DIR"])
+    prefixes = set()
+    for entry in camp.get("cells", []) or []:
+        rel = entry.get("yaml") if isinstance(entry, dict) else None
+        if not rel:
+            continue
+        try:
+            cell = yaml.safe_load(open(cdir / rel, encoding="utf-8"))
+        except Exception:
+            continue
+        eng = (cell or {}).get("engine", {}) or {}
+        tmpl = eng.get("container_name_template")
+        if tmpl:
+            prefixes.add(tmpl.split("{", 1)[0])
+        if eng.get("lifecycle") == "dynamo_disagg" or "topology" in eng:
+            prefixes.add("dyn_")
+    print("\n".join(sorted(p for p in prefixes if p)))
+except Exception:
+    pass
+PY
+}
+CONTAINER_PREFIXES=$(campaign_container_prefixes)
+# Fallback when the cells could not be parsed (e.g. PyYAML missing): the run-dir
+# prefix, which IS campaign_id-based, is the best available approximation.
+[ -n "$CONTAINER_PREFIXES" ] || CONTAINER_PREFIXES="${CAMPAIGN_ID}_"
 if ! command -v docker >/dev/null 2>&1; then
     record FAIL "A.docker.containers" "docker command not found"
     N_CONTAINERS=0
 else
-    N_CONTAINERS=$(docker ps --filter "name=wosar2026_" --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
+    # Count running containers whose name starts with any of this campaign's
+    # prefixes (a single awk pass over `docker ps` names).
+    N_CONTAINERS=$(docker ps --format '{{.Names}}' 2>/dev/null | awk -v pfx="$CONTAINER_PREFIXES" '
+        BEGIN { np=split(pfx, P, "\n") }
+        { for (i=1;i<=np;i++) if (P[i]!="" && index($0, P[i])==1) { n++; break } }
+        END { print n+0 }')
 fi
 if ! command -v docker >/dev/null 2>&1; then
     :
 elif [ "$INSPECT_MODE" -eq 1 ]; then
-    record PASS "A.docker.containers" "inspection mode: $N_CONTAINERS wosar2026 container(s) running (not gated against live state)"
+    record PASS "A.docker.containers" "inspection mode: $N_CONTAINERS ${CAMPAIGN_ID} container(s) running (not gated against live state)"
 elif [ "$N_CONTAINERS" -eq 0 ]; then
     if [ "${STATE_RUNNING_COUNT:-0}" -gt 0 ]; then
-        record WARN "A.docker.containers" "no wosar2026 container running while state has ${STATE_RUNNING_COUNT} running run(s); per-run checks decide if cooldown vs failure"
+        record WARN "A.docker.containers" "no ${CAMPAIGN_ID} container running while state has ${STATE_RUNNING_COUNT} running run(s); per-run checks decide if cooldown vs failure"
     else
-        record PASS "A.docker.containers" "no wosar2026 container running and state has no running runs"
+        record PASS "A.docker.containers" "no ${CAMPAIGN_ID} container running and state has no running runs"
     fi
 elif [ "$N_CONTAINERS" -gt 4 ]; then
     record WARN "A.docker.containers" "$N_CONTAINERS containers (expected up to 3 + sanity)"
@@ -540,10 +645,10 @@ echo "${BOLD}== Section B: per-run health ==${RESET}"
 # Build list of run dirs to inspect.
 RUN_DIRS=""
 if [ -d "$RUNS_ROOT" ]; then
-    RUN_DIRS=$(find "$RUNS_ROOT" -maxdepth 1 -type d -name 'wosar2026_*_r[0-9][0-9]' 2>/dev/null | sort || true)
+    RUN_DIRS=$(find "$RUNS_ROOT" -maxdepth 1 -type d -name "${CAMPAIGN_ID}_*_r[0-9][0-9]" 2>/dev/null | sort || true)
 fi
 if [ -z "$RUN_DIRS" ]; then
-    record FAIL "B.runs" "no wosar2026_*_rNN in $RUNS_ROOT"
+    record FAIL "B.runs" "no ${CAMPAIGN_ID}_*_rNN in $RUNS_ROOT"
 fi
 
 NOW_TS=$(date +%s)
