@@ -93,6 +93,17 @@ class CheckCalibrationProvenance(unittest.TestCase):
             lc.check_calibration_provenance(
                 {"status": "ok", "rate_calibrated_rps": 3.0}, self._sig(), 14, time.time())
 
+    def test_non_numeric_timestamp_refused(self):
+        # A present-but-non-numeric calibrated_at_unix ("bad") used to slip the
+        # staleness gate: calibration_age_days returned None, so the age check was
+        # skipped. Unverifiable provenance must raise, not pass.
+        now = time.time()
+        calib = _calib(now=now)
+        calib["provenance"]["calibrated_at_unix"] = "bad"
+        with self.assertRaises(lc.CalibrationError) as ctx:
+            lc.check_calibration_provenance(calib, self._sig(), 14, now)
+        self.assertIn("not numeric", str(ctx.exception))
+
     def test_hostname_mismatch_refused(self):
         now = time.time()
         calib = _calib(now=now, hostname="some-other-box")

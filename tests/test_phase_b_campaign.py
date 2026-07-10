@@ -934,6 +934,29 @@ class AlertHook(unittest.TestCase):
             self.assertEqual(called_argv[0], "/bin/echo")
             self.assertEqual(called_argv[1], str(c._alert_path()))
 
+    def test_notify_hook_accepts_command_with_arguments(self):
+        # P2/P3: CAMPAIGN_NOTIFY_CMD may carry its own arguments (shlex-split),
+        # not only a bare executable. The alert path is appended last.
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            with mock.patch.dict(os.environ, {"CAMPAIGN_NOTIFY_CMD": "notify-send -u low Campaign"}), \
+                 mock.patch.object(camp.subprocess, "run") as run:
+                c.write_alert("campaign_fatal", "a_r01", "boom")
+            argv = run.call_args[0][0]
+            self.assertEqual(argv[:-1], ["notify-send", "-u", "low", "Campaign"])
+            self.assertEqual(argv[-1], str(c._alert_path()))
+
+    def test_notify_hook_unbalanced_quotes_skipped_not_raised(self):
+        # A malformed command (unbalanced quotes) must not crash write_alert; the
+        # ALERT.json is still written and no subprocess is spawned.
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_campaign(tmp, [make_spec("a")])
+            with mock.patch.dict(os.environ, {"CAMPAIGN_NOTIFY_CMD": 'notify "unterminated'}), \
+                 mock.patch.object(camp.subprocess, "run") as run:
+                c.write_alert("interrupted", "a_r01", "x")  # must not raise
+            run.assert_not_called()
+            self.assertTrue(c._alert_path().exists())
+
     def test_notify_hook_failure_is_swallowed_and_alert_still_written(self):
         # A hung / missing / failing notifier must NEVER change the outcome: the
         # ALERT.json is still written and write_alert returns normally.

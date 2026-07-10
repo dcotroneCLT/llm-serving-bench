@@ -8,6 +8,7 @@ Off-box: `docker image inspect` is stubbed. Run:
 """
 import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -75,6 +76,45 @@ class VerifyImageDigest(unittest.TestCase):
         ):
             with self.assertRaises(DieCalled):
                 lc.verify_image_digest("repo/img:tag", "sha256:deadbeef")
+
+
+class ImagePinPreconditionExitCode(unittest.TestCase):
+    """P1: every image-pin failure is a NON-RETRYABLE precondition -> exit 6 (in
+    launch_cell.NONRETRYABLE_EXIT_CODES, which campaign.py treats as campaign-
+    fatal). A pin file that is missing / invalid JSON / wrong tag / digest-less
+    used to exit 1 or traceback, which the campaign scored as a run failure:
+    it burned a retry, marked the run failed, and let the queue proceed over a
+    global precondition."""
+
+    def _exit_code(self, fn):
+        with self.assertRaises(SystemExit) as ctx:
+            fn()
+        return ctx.exception.code
+
+    def test_missing_pin_file_exits_6(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "pin.json"  # never created
+            self.assertEqual(self._exit_code(lambda: lc.load_image_pin(missing)), 6)
+
+    def test_invalid_json_pin_exits_6(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "pin.json"
+            bad.write_text("{ not valid json ][")
+            self.assertEqual(self._exit_code(lambda: lc.load_image_pin(bad)), 6)
+
+    def test_absent_image_exit_code_is_6(self):
+        # verify_image_present on a not-present image is a precondition, not a
+        # generic rc=1 failure.
+        with mock.patch.object(
+            lc.subprocess, "run",
+            return_value=types.SimpleNamespace(returncode=1, stdout="", stderr="No such image"),
+        ):
+            self.assertEqual(
+                self._exit_code(lambda: lc.verify_image_present("repo/img:tag")), 6)
+
+    def test_all_pin_exit_codes_are_nonretryable(self):
+        # Cross-check: 6 is in the non-retryable set the campaign halts on.
+        self.assertIn(6, lc.NONRETRYABLE_EXIT_CODES)
 
 
 if __name__ == "__main__":

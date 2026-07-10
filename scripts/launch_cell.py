@@ -415,9 +415,18 @@ def summarize_client_csvs(client_dir: Path) -> dict[str, Any]:
 
 
 def load_image_pin(pin_path: Path) -> dict:
+    """Load and parse the image digest pin. A missing or unparseable pin file is
+    a non-retryable PRECONDITION (rc=6, campaign-fatal): retrying cannot conjure
+    or repair it, so it must halt the campaign rather than burn a retry and mark
+    the run failed while the queue proceeds."""
     if not pin_path.exists():
-        die(f"image pin file missing: {pin_path}. Run scripts/utils/pin_images.sh first.")
-    return json.loads(pin_path.read_text())
+        die(f"image pin file missing: {pin_path}. Run scripts/utils/pin_images.sh first.", rc=6)
+    try:
+        return json.loads(pin_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"image pin file {pin_path} is not readable/valid JSON: {e}. "
+            "Re-run scripts/utils/pin_images.sh.", rc=6)
+        return {}  # unreachable (die exits); keeps type-checkers happy
 
 
 def verify_image_present(image_tag: str) -> dict:
@@ -429,14 +438,14 @@ def verify_image_present(image_tag: str) -> dict:
         timeout=30,
     )
     if result.returncode != 0:
-        die(f"image not present locally: {image_tag}. Run scripts/utils/pin_images.sh.")
+        die(f"image not present locally: {image_tag}. Run scripts/utils/pin_images.sh.", rc=6)
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as e:
-        die(f"could not parse `docker image inspect {image_tag}`: {e}")
+        die(f"could not parse `docker image inspect {image_tag}`: {e}", rc=6)
         return {}  # unreachable (die exits); keeps type-checkers happy
     if not data:
-        die(f"image not present locally: {image_tag}. Run scripts/utils/pin_images.sh.")
+        die(f"image not present locally: {image_tag}. Run scripts/utils/pin_images.sh.", rc=6)
     return data[0]
 
 
@@ -954,6 +963,16 @@ def check_calibration_provenance(calib: dict, current_sig: dict,
             "calibration has no provenance.calibrated_at_unix (pre-hardening or "
             "hand-edited): its age and host/image signature cannot be verified. "
             "Re-run scripts/calibrate_rate.py to record provenance.")
+    # A present-but-non-numeric timestamp is UNVERIFIABLE provenance, not a pass:
+    # calibration_age_days returns None on a bad value, which would otherwise skip
+    # the age gate and silently accept a corrupt/hand-edited calibration.
+    try:
+        float(prov["calibrated_at_unix"])
+    except (TypeError, ValueError):
+        raise CalibrationError(
+            f"calibration provenance.calibrated_at_unix is not numeric "
+            f"({prov['calibrated_at_unix']!r}): its age cannot be verified. "
+            "Re-run scripts/calibrate_rate.py to record valid provenance.")
     age = calibration_age_days(calib, now_unix)
     if age is not None and max_age_days is not None and age > float(max_age_days):
         raise CalibrationError(
@@ -1952,12 +1971,12 @@ def main() -> None:
     # 2. Verify image pin.
     pin = load_image_pin(args.repo_root / cell["engine"]["digest_pin_file"])
     image_full = f'{cell["engine"]["image_repo"]}:{cell["engine"]["image_tag"]}'
-    if pin["image_tag"] != image_full:
-        die(f"image pin mismatch: cell expects {image_full}, pin file has {pin['image_tag']}")
+    if pin.get("image_tag") != image_full:
+        die(f"image pin mismatch: cell expects {image_full}, pin file has {pin.get('image_tag')!r}", rc=6)
     pinned_digest = str(pin.get("digest", "")).strip()
     if not pinned_digest:
         die(f"image pin file for {image_full} has no 'digest'. Run "
-            "scripts/utils/pin_images.sh to record it before a production run.")
+            "scripts/utils/pin_images.sh to record it before a production run.", rc=6)
     verify_image_digest(image_full, pinned_digest)
     (run_dir / "image_digest.txt").write_text(pinned_digest + "\n")
     log(f"image: {image_full}  digest: {pinned_digest} (verified against local image)")

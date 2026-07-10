@@ -94,6 +94,7 @@ import argparse
 import json
 import os
 import platform
+import shlex
 import shutil
 import signal
 import socket
@@ -675,7 +676,8 @@ class Campaign:
     def write_alert(self, event: str, run_key: str, reason: str) -> None:
         """Operator notification hook (item 5). Atomically write state/ALERT.json
         (ts, run_key, event, reason, next command) and, if CAMPAIGN_NOTIFY_CMD is
-        set in the environment, invoke it with the alert path as $1. The hook is
+        set in the environment, invoke it (shlex-split, so it may carry its own
+        arguments) with the alert path appended as the final argument. The hook is
         BEST-EFFORT and timeout-bounded: a failing / missing / hung notifier is
         logged and swallowed, NEVER changing the campaign's outcome. Fired on
         campaign-fatal, failed-after-retry, interrupted, and
@@ -701,10 +703,21 @@ class Campaign:
         cmd = os.environ.get("CAMPAIGN_NOTIFY_CMD")
         if not cmd:
             return
+        # shlex.split so an operator can set a command WITH arguments
+        # (CAMPAIGN_NOTIFY_CMD="notify-send Campaign" or a wrapper + flags), not
+        # only a bare executable path; the alert path is appended as the last arg.
         try:
-            subprocess.run([cmd, str(path)], timeout=30, check=False,
+            argv = shlex.split(cmd) + [str(path)]
+        except ValueError as e:  # unbalanced quotes in the env value
+            log(f"WARNING: CAMPAIGN_NOTIFY_CMD is not a valid command ({e!r}); skipping notify")
+            return
+        if not argv[:-1]:  # split yielded no program (e.g. whitespace-only)
+            log("WARNING: CAMPAIGN_NOTIFY_CMD is empty after parsing; skipping notify")
+            return
+        try:
+            subprocess.run(argv, timeout=30, check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            log(f"notify hook invoked: {cmd} {path}")
+            log(f"notify hook invoked: {' '.join(argv)}")
         except Exception as e:  # noqa: BLE001 - notify must never affect the outcome
             log(f"WARNING: CAMPAIGN_NOTIFY_CMD failed (ignored): {e!r}")
 
