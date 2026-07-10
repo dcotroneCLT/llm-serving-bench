@@ -19,16 +19,20 @@
 #
 # Sections:
 #   A. Campaign-wide  (state file, disk, GPU pool, container count)
-#   B. Per-run health (looped over <campaign_id>_*_rNN in runs_root)
-#      B.1 Required output files
-#      B.2 Manifest content
-#      B.3 Container alive on correct GPU
-#      B.4 PID resolution (engine.pid; find_engine_pid daemon for triton_child)
-#      B.5 proc_monitor: alive ratio, field completeness, RSS magnitude
-#      B.6 gpu_monitor:  VRAM plausible, sample continuity
-#      B.7 system_monitor: sample presence, swap quiescent
-#      B.8 client:       issued rate vs target, success ratio
-#      B.9 Logs:         FATAL/error/exception inspection
+#   B. Per-run health (looped over <campaign_id>_*_rNN in runs_root), LIFECYCLE-
+#      AWARE: it branches on manifest.lifecycle so multi-process dynamo_disagg
+#      runs are checked, not skipped.
+#      single_container:
+#        B.1 Required output files      B.2 Manifest/image-pin content
+#        B.3 Container alive on GPU     B.4 PID resolution (engine.pid / triton daemon)
+#        B.5 proc: alive/fields/RSS     B.6 gpu: VRAM + continuity
+#        B.7 system + swap  B.8 client rate/success  B.9 logs
+#      dynamo_disagg (topology prefill_gpu/decode_gpu, agg_<group> proc_prefix,
+#      per-component containers+pgids -- no single gpu/container/engine.pid):
+#        B.1 files + component PGID identity (in place of engine.pid)
+#        B.2 image pin (shared)         B.5 agg_<group>: membership + continuity
+#        B.6 gpu VRAM+continuity on BOTH topology GPUs
+#        B.7 system + swap  B.8 client  B.9 logs  (all shared, unchanged)
 #
 # Tunable thresholds (env vars override):
 #   HEALTH_MIN_RUNS_ROOT_GB=5     runs_root free, hard fail if below
@@ -425,6 +429,263 @@ find_proc_csvs() {
     printf '%s\n' "${out[@]}"
 }
 
+# ---------- Per-run checks shared by both lifecycles ----------
+# These read the per-run loop's ambient variables (section, run_dir, manifest,
+# CELL_YAML, CELL_ID, IS_RUNNING, ELAPSED, PID_STRATEGY, NOW_TS) and the global
+# thresholds. Extracted verbatim from the single-container B.2/B.7/B.8/B.9 blocks
+# so the single-container report stays byte-identical while the dynamo_disagg
+# branch reuses them (system/swap/client/logs are lifecycle-agnostic).
+
+check_image_pin() {
+    # B.2 image pin consistency
+    if [ -f "$run_dir/image_digest.txt" ]; then
+        digest_file=$(head -1 "$run_dir/image_digest.txt" | tr -d '\n')
+        digest_manifest=$(json_get "$manifest" "image.digest")
+        digest_pin=$(cell_pin_digest "$CELL_YAML")
+        if [ -z "$digest_manifest" ]; then
+            if [ -n "$digest_pin" ] && [ "$digest_file" = "$digest_pin" ]; then
+                record PASS "${section}.image_digest" "$digest_file (verified against cell pin; manifest digest unavailable in $MANIFEST_KIND manifest)"
+            elif [ -n "$digest_pin" ]; then
+                record FAIL "${section}.image_digest" "image_digest.txt and cell pin disagree"
+            else
+                record WARN "${section}.image_digest" "$digest_file (could not resolve manifest or cell pin digest)"
+            fi
+        elif [ "$digest_file" = "$digest_manifest" ]; then
+            record PASS "${section}.image_digest" "$digest_file"
+        else
+            record FAIL "${section}.image_digest" "image_digest.txt and manifest disagree"
+        fi
+    fi
+}
+
+check_system() {
+    # B.7 system_monitor presence + swap quiescence
+    sys_csvs=$(ls "$run_dir"/system_*.csv 2>/dev/null)
+    if [ -z "$sys_csvs" ]; then
+        record FAIL "${section}.system.csv" "no system CSV"
+    else
+        sys_rows=$(awk -F, 'FNR>1 {n++} END {print n+0}' $sys_csvs)
+        if [ "$sys_rows" -eq 0 ]; then
+            if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_MONITOR_WARMUP_S" ]; then
+                record WARN "${section}.system.csv" "no system samples on disk yet (elapsed=${ELAPSED}s, monitor buffer not flushed)"
+            else
+                record FAIL "${section}.system.csv" "system CSV files exist but contain no samples"
+            fi
+        else
+            record PASS "${section}.system.csv" "${sys_rows} samples"
+            # Check swap column (look for any non-zero non-empty value)
+            swap_max=$(awk -F, '
+                FNR==1 { for(i=1;i<=NF;i++) if($i ~ /swap.*used/) col=i; next }
+                col && $col!="" && $col+0>m { m=$col+0 }
+                END { print m+0 }
+            ' $sys_csvs)
+            if [ -n "$swap_max" ] && [ "$swap_max" -gt 1073741824 ]; then  # > 1 GB swap = bad
+                record WARN "${section}.system.swap" "max swap used = ${swap_max} bytes (host memory pressure)"
+            else
+                record PASS "${section}.system.swap" "no significant swap (max=${swap_max} bytes)"
+            fi
+            system_last_ts=$(csv_max_ts "ts_unix" $sys_csvs)
+            check_freshness "$section" "system" "$system_last_ts" "$HEALTH_MAX_SYSTEM_STALENESS_S" "$ELAPSED" "$IS_RUNNING"
+        fi
+    fi
+}
+
+check_client() {
+    # B.8 client throughput vs target
+    client_csvs=$(ls "$run_dir"/client/requests_*.csv 2>/dev/null)
+    request_timeout_s=$(json_get "$manifest" "workload.client_config_overrides.request_timeout_s")
+    [ -n "$request_timeout_s" ] || request_timeout_s=$(yaml_path "$CELL_YAML" "workload.client_config_overrides.request_timeout_s")
+    request_timeout_s=${request_timeout_s:-600}
+    request_timeout_i=${request_timeout_s%.*}
+    is_int "$request_timeout_i" || request_timeout_i=600
+    client_start_grace_s=$(( request_timeout_i + 120 ))
+    client_staleness_s="$HEALTH_MAX_CLIENT_STALENESS_S"
+    if [ "$client_staleness_s" -lt "$client_start_grace_s" ]; then
+        client_staleness_s="$client_start_grace_s"
+    fi
+    if [ -z "$client_csvs" ]; then
+        if [ "$IS_RUNNING" -eq 0 ] || [ "${ELAPSED:-0}" -gt "$client_start_grace_s" ]; then
+            record FAIL "${section}.client.csv" "no client CSV after elapsed=${ELAPSED}s"
+        else
+            record WARN "${section}.client.csv" "no client CSV yet (elapsed=${ELAPSED}s, grace=${client_start_grace_s}s)"
+        fi
+    else
+        client_stats=$(awk -F, -v ok_statuses="$HEALTH_OK_STATUSES" '
+            BEGIN {
+                split(ok_statuses, ok_arr, /[ ,]+/)
+                for (i in ok_arr) if (ok_arr[i]!="") ok_map[tolower(ok_arr[i])] = 1
+            }
+            FNR==1 {
+                for(i=1;i<=NF;i++) {
+                    if($i=="status") status_col=i
+                    if($i=="submitted_at_unix") submitted_col=i
+                    if($i=="finished_at_unix") finished_col=i
+                }
+                next
+            }
+            {
+                total++
+                status = status_col ? $status_col : ""
+                status_l = tolower(status)
+                if(status_l in ok_map) ok++
+                else if(status_l=="timeout") timeout++
+                else if(status_l=="dropped") dropped++
+                else if(status_l=="error") error++
+                else if(status!="") {
+                    unknown++
+                    unknown_counts[status]++
+                }
+
+                submitted_ts = (submitted_col && $submitted_col!="") ? ($submitted_col + 0) : 0
+                if(submitted_ts>0) {
+                    nsubmitted++
+                    if(nsubmitted==1 || submitted_ts<sub_mn) sub_mn=submitted_ts
+                    if(submitted_ts>sub_mx) sub_mx=submitted_ts
+                    if(submitted_ts>last_ts) last_ts=submitted_ts
+                }
+                finished_ts = (finished_col && $finished_col!="") ? ($finished_col + 0) : 0
+                if(finished_ts>last_ts) last_ts=finished_ts
+            }
+            END {
+                span = (nsubmitted>1) ? (sub_mx-sub_mn) : 0
+                printf "total=%d ok=%d error=%d timeout=%d dropped=%d unknown=%d submitted_span=%.3f last_ts=%.0f", total, ok, error, timeout, dropped, unknown, span, last_ts
+                if (unknown>0) {
+                    printf " unknown_statuses="
+                    first=1
+                    for (k in unknown_counts) {
+                        if (!first) printf ";"
+                        printf "%s:%d", k, unknown_counts[k]
+                        first=0
+                    }
+                }
+            }
+        ' $client_csvs)
+        n_total=$(echo "$client_stats" | sed 's/.*total=\([0-9]*\).*/\1/')
+        n_ok=$(echo "$client_stats" | sed 's/.*ok=\([0-9]*\).*/\1/')
+        n_error=$(echo "$client_stats" | sed 's/.*error=\([0-9]*\).*/\1/')
+        n_timeout=$(echo "$client_stats" | sed 's/.*timeout=\([0-9]*\).*/\1/')
+        n_dropped=$(echo "$client_stats" | sed 's/.*dropped=\([0-9]*\).*/\1/')
+        n_unknown=$(echo "$client_stats" | sed 's/.*unknown=\([0-9]*\).*/\1/')
+        client_span=$(echo "$client_stats" | sed 's/.*submitted_span=\([0-9.]*\).*/\1/')
+        client_last_ts=$(echo "$client_stats" | sed 's/.*last_ts=\([0-9]*\).*/\1/')
+        if [ "$n_total" -eq 0 ]; then
+            if [ "$IS_RUNNING" -eq 0 ] || [ "${ELAPSED:-0}" -gt "$client_start_grace_s" ]; then
+                record FAIL "${section}.client.csv" "client CSV files exist but contain no request rows after elapsed=${ELAPSED}s"
+            else
+                record WARN "${section}.client.csv" "client CSV files exist but contain no request rows yet"
+            fi
+        elif [ "$n_ok" -eq 0 ] && [ "${ELAPSED:-0}" -gt "$client_start_grace_s" ]; then
+            record FAIL "${section}.client.ok" "zero successful client rows: total=${n_total} error=${n_error} timeout=${n_timeout} dropped=${n_dropped}"
+        fi
+        check_freshness "$section" "client" "$client_last_ts" "$client_staleness_s" "$ELAPSED" "$IS_RUNNING"
+        issued_rate=$(awk -v n=$n_total -v s=$client_span 'BEGIN{if(s>0) printf "%.3f", n/s; else print 0}')
+        # Prefer manifest (json, stdlib-only) so the rate check works even when
+        # PyYAML is unavailable in the invoking python3 (e.g. running from the
+        # conda base env instead of the wosar env).
+        target=$(json_get "$manifest" "workload.client_config_overrides.target_rate_rps")
+        [ -n "$target" ] || target=$(yaml_path "$CELL_YAML" "workload.client_config_overrides.target_rate_rps")
+        if [ -n "$target" ] && [ "$target" != "0" ] && awk -v s=$client_span 'BEGIN{exit !(s>0)}'; then
+            # Below HEALTH_RATE_MIN_ELAPSED_S, a Poisson stream is too sparse
+            # to estimate a meaningful ratio (e3b at 0.05 rps needs ~10 min
+            # for the first ~30 events). Don't WARN inside the warmup window.
+            if [ "${ELAPSED:-0}" -lt "$HEALTH_RATE_MIN_ELAPSED_S" ]; then
+                record PASS "${section}.client.rate" "issued=${issued_rate} target=${target} submitted_span=${client_span}s (warming up, elapsed=${ELAPSED}s < ${HEALTH_RATE_MIN_ELAPSED_S}s)"
+            else
+                ratio=$(awk -v a=$issued_rate -v t=$target 'BEGIN{if(t>0) printf "%.3f", a/t; else print 0}')
+                tol=$HEALTH_RATE_TOLERANCE
+                if awk -v r=$ratio -v t=$tol 'BEGIN{exit !(r<1-t || r>1+t)}'; then
+                    record WARN "${section}.client.rate" "issued=${issued_rate} target=${target} ratio=${ratio} outside [1-${tol},1+${tol}] submitted_span=${client_span}s"
+                else
+                    record PASS "${section}.client.rate" "issued=${issued_rate} target=${target} ratio=${ratio}  ok=${n_ok}/${n_total} submitted_span=${client_span}s"
+                fi
+            fi
+        elif [ -n "$target" ]; then
+            record WARN "${section}.client.rate" "not enough timestamp span to estimate request rate yet (n=${n_total})"
+        fi
+        if [ "${n_unknown:-0}" -gt 0 ]; then
+            unknown_detail=$(echo "$client_stats" | sed -n 's/.*unknown_statuses=\(.*\)$/\1/p')
+            record WARN "${section}.client.status" "unknown status values: ${unknown_detail:-count=$n_unknown}"
+        fi
+        # Error rate
+        if [ "$n_total" -gt 100 ]; then
+            err_pct=$(awk -v e=$n_error -v to=$n_timeout -v t=$n_total 'BEGIN{printf "%.1f", 100*(e+to)/t}')
+            if awk -v p=$err_pct 'BEGIN{exit !(p>5)}'; then
+                record WARN "${section}.client.errors" "error/timeout responses = ${err_pct}% (>5%); dropped=${n_dropped}/${n_total}"
+            fi
+            dropped_pct=$(awk -v d=$n_dropped -v t=$n_total 'BEGIN{printf "%.1f", 100*d/t}')
+            cell_upper=$(printf '%s' "$CELL_ID" | tr '[:lower:]' '[:upper:]')
+            fail_var="HEALTH_FAIL_DROPPED_PCT_${cell_upper}"
+            warn_var="HEALTH_WARN_DROPPED_PCT_${cell_upper}"
+            fail_threshold="${!fail_var:-$HEALTH_FAIL_DROPPED_PCT}"
+            warn_threshold="${!warn_var:-$HEALTH_WARN_DROPPED_PCT}"
+            if awk -v p=$dropped_pct -v f=$fail_threshold 'BEGIN{exit !(p>f)}'; then
+                record FAIL "${section}.client.dropped" "dropped requests = ${dropped_pct}% > ${fail_threshold}% (cell=${CELL_ID})"
+            elif awk -v p=$dropped_pct -v w=$warn_threshold 'BEGIN{exit !(p>w)}'; then
+                record WARN "${section}.client.dropped" "dropped requests = ${dropped_pct}% > ${warn_threshold}% (cell=${CELL_ID})"
+            fi
+        fi
+    fi
+}
+
+check_manifest_and_logs() {
+    # B.9 manifest finalization + log inspection
+    interrupted_early=$(json_get "$manifest" "interrupted_early")
+    client_forced_kill=$(json_get "$manifest" "client_forced_kill")
+    manifest_client_total=$(json_get "$manifest" "client_summary.total")
+    manifest_client_ok=$(json_get "$manifest" "client_summary.ok")
+    if [ "$interrupted_early" = "True" ] || [ "$interrupted_early" = "true" ]; then
+        record FAIL "${section}.manifest.interrupted" "interrupted_early=true"
+    fi
+    if [ "$client_forced_kill" = "True" ] || [ "$client_forced_kill" = "true" ]; then
+        record FAIL "${section}.manifest.client" "client_forced_kill=true"
+    fi
+    if [ "$IS_RUNNING" -eq 0 ] && is_int "$manifest_client_total" && [ "$manifest_client_total" -eq 0 ]; then
+        record FAIL "${section}.manifest.client" "client_summary.total=0"
+    elif [ "$IS_RUNNING" -eq 0 ] && is_int "$manifest_client_ok" && [ "$manifest_client_ok" -eq 0 ]; then
+        record FAIL "${section}.manifest.client" "client_summary.ok=0"
+    fi
+
+    for log in "$run_dir/launch_cell.log" "$run_dir/logs"/*.log; do
+        [ -f "$log" ] || continue
+        bn=$(basename "$log")
+        # docker.log / container.log capture the engine stdout, which routinely
+        # logs Python tracebacks for benign per-request errors. Use a tighter
+        # pattern there so genuine fatals (OOM, panic) still surface.
+        case "$bn" in
+            docker*.log|container*.log) pattern="$HEALTH_CONTAINER_FATAL_GREP" ;;
+            *) pattern="$HEALTH_FATAL_GREP" ;;
+        esac
+        n_fatal=$(grep -cE "$pattern" "$log" 2>/dev/null || true)
+        n_fatal=${n_fatal:-0}
+        if [ "$n_fatal" -gt 0 ]; then
+            sample=$(grep -E "$pattern" "$log" | head -1 | cut -c1-150)
+            record WARN "${section}.log.$bn" "${n_fatal} suspicious lines; sample: $sample"
+        fi
+    done
+    # find_engine_pid log for triton_child
+    if [ "$PID_STRATEGY" = "triton_child" ]; then
+        fep_log="$run_dir/logs/find_engine_pid.log"
+        if [ -f "$fep_log" ]; then
+            n_resolved=$(grep -cE "resolved pid=" "$fep_log" 2>/dev/null || true)
+            n_no_match=$(grep -cE "no descendant" "$fep_log" 2>/dev/null || true)
+            n_resolved=${n_resolved:-0}
+            n_no_match=${n_no_match:-0}
+            if [ "$n_resolved" -eq 0 ]; then
+                record FAIL "${section}.fep.resolutions" "find_engine_pid never resolved a PID"
+            else
+                msg="resolved ${n_resolved} times (1=initial, >1=respawn events)"
+                if [ "$n_no_match" -gt 0 ]; then
+                    record WARN "${section}.fep.resolutions" "$msg; $n_no_match 'no descendant' incidents"
+                else
+                    record PASS "${section}.fep.resolutions" "$msg"
+                fi
+            fi
+        else
+            record WARN "${section}.fep.log" "find_engine_pid.log absent for triton_child cell"
+        fi
+    fi
+}
+
 # ============================================================
 # Section A: campaign-wide
 # ============================================================
@@ -696,6 +957,163 @@ for run_dir in $RUN_DIRS; do
     PID_STRATEGY=$(json_get "$manifest" "engine.pid_strategy.type")
     [ -n "$PID_STRATEGY" ] || PID_STRATEGY=$(yaml_path "$CELL_YAML" "engine.pid_strategy.type")
 
+    # Lifecycle-aware branch. A dynamo_disagg manifest records no single
+    # container / gpu_device / engine.pid -- it records lifecycle, topology
+    # (prefill_gpu/decode_gpu), per-component containers+pgids, and proc_prefix
+    # agg_<group>. Without this branch the single-container required-fields guard
+    # below FAILs "missing required fields" and SKIPS every per-run check on
+    # exactly the multi-process runs that most need watching. Single-container
+    # manifests have no top-level "lifecycle" key -> default, byte-identical path.
+    LIFECYCLE=$(json_get "$manifest" "lifecycle")
+    [ -n "$LIFECYCLE" ] || LIFECYCLE=$(yaml_path "$CELL_YAML" "engine.lifecycle")
+    [ -n "$LIFECYCLE" ] || LIFECYCLE="single_container"
+
+    if [ "$LIFECYCLE" = "dynamo_disagg" ]; then
+        # Running? (shared semantics: an "ended_at" in the manifest -> finished.)
+        if [ -n "$ENDED_AT" ]; then IS_RUNNING=0; else IS_RUNNING=1; fi
+        END_OR_NOW="$NOW_TS"
+        [ -n "$ENDED_AT_UNIX" ] && END_OR_NOW="$ENDED_AT_UNIX"
+        ELAPSED=$(awk -v s="${STARTED_AT_UNIX:-0}" -v n="$END_OR_NOW" -v d="${DURATION_S:-0}" 'BEGIN{if(s>0 && n>=s) print int(n-s); else print int(d)}')
+
+        # Topology GPUs (the monitor samples BOTH) + engine aggregate prefix.
+        PREFILL_GPU=$(json_get "$manifest" "topology.prefill_gpu")
+        [ -n "$PREFILL_GPU" ] || PREFILL_GPU=$(yaml_path "$CELL_YAML" "engine.topology.prefill_gpu")
+        DECODE_GPU=$(json_get "$manifest" "topology.decode_gpu")
+        [ -n "$DECODE_GPU" ] || DECODE_GPU=$(yaml_path "$CELL_YAML" "engine.topology.decode_gpu")
+        is_int "$PREFILL_GPU" || PREFILL_GPU=0
+        is_int "$DECODE_GPU" || DECODE_GPU=1
+        AGG_PREFIX=$(json_get "$manifest" "proc_prefix")
+        [ -n "$AGG_PREFIX" ] || AGG_PREFIX="agg_engine"
+
+        record PASS "${section}.context" "cell=$CELL_ID rep=$REPLICA lifecycle=dynamo_disagg gpus=${PREFILL_GPU},${DECODE_GPU} agg=${AGG_PREFIX} elapsed=${ELAPSED}s running=$IS_RUNNING manifest=$MANIFEST_KIND"
+
+        # ---- B.1 required files (component PGID identity instead of engine.pid) ----
+        comp_count=$(JSON_FILE="$manifest" python3 - <<'PY' 2>/dev/null
+import json, os
+try:
+    d = json.load(open(os.environ["JSON_FILE"], encoding="utf-8"))
+    comps = d.get("components") or {}
+    # A component is identity-complete when it recorded at least one PGID.
+    print(sum(1 for c in comps.values() if isinstance(c, dict) and c.get("pgids")))
+except Exception:
+    print(0)
+PY
+)
+        comp_count=${comp_count:-0}
+        files_missing=()
+        [ -s "$run_dir/image_digest.txt" ] || files_missing+=("image_digest.txt")
+        [ -s "$run_dir/docker_inspect.json" ] || files_missing+=("docker_inspect.json")
+        [ -d "$run_dir/logs" ] || files_missing+=("logs/")
+        [ -d "$run_dir/client" ] || files_missing+=("client/")
+        [ "$comp_count" -ge 1 ] || files_missing+=("components-identity")
+        if [ "${#files_missing[@]}" -gt 0 ]; then
+            record FAIL "${section}.files" "missing: ${files_missing[*]}"
+        else
+            record PASS "${section}.files" "manifest/image_digest/docker_inspect/logs/client + ${comp_count}-component PGID identity all present"
+        fi
+
+        # ---- B.2 image pin consistency (shared, manifest+cell-pin based) ----
+        check_image_pin
+
+        # ---- B.5 engine aggregate: alive (membership_complete) + continuity ----
+        #   proc_prefix is agg_<group>; process_alive == membership_complete, so a
+        #   low ratio means a component dropped out of the recorded PGID scope.
+        agg_csvs=$(find_proc_csvs "$run_dir" "$AGG_PREFIX")
+        if [ -z "$agg_csvs" ]; then
+            if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_PROC_ALIVE_GRACE_S" ]; then
+                record WARN "${section}.proc.csv" "no ${AGG_PREFIX} aggregate CSV yet (elapsed=${ELAPSED}s, monitor warming up)"
+            else
+                record FAIL "${section}.proc.csv" "no ${AGG_PREFIX} aggregate CSV found"
+            fi
+        else
+            n_agg_files=$(printf '%s\n' "$agg_csvs" | wc -l | tr -d ' ')
+            agg_stats=$(awk -F, '
+                FNR==1 { ac=0; for(i=1;i<=NF;i++) if($i=="process_alive") ac=i; next }
+                { tot++; av = ac?$ac:$3; if(av=="True"||av=="true"||av=="1") alive++ }
+                END { printf "tot=%d alive=%d", tot+0, alive+0 }
+            ' $agg_csvs)
+            agg_tot=$(echo "$agg_stats" | sed 's/.*tot=\([0-9]*\).*/\1/')
+            agg_alive=$(echo "$agg_stats" | sed 's/.*alive=\([0-9]*\).*/\1/')
+            agg_pct=$(awk -v a=${agg_alive:-0} -v t=${agg_tot:-0} 'BEGIN{if(t>0) printf "%.1f", 100*a/t; else print "0"}')
+            if [ "${agg_tot:-0}" -eq 0 ]; then
+                if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_PROC_ALIVE_GRACE_S" ]; then
+                    record WARN "${section}.proc.alive" "no aggregate samples yet (elapsed=${ELAPSED}s, monitor warming up)"
+                else
+                    record FAIL "${section}.proc.alive" "no aggregate samples after elapsed=${ELAPSED}s"
+                fi
+            elif awk -v p=$agg_pct -v m=$HEALTH_MIN_ALIVE_PCT 'BEGIN{exit !(p<m)}'; then
+                record FAIL "${section}.proc.alive" "membership_complete=${agg_alive}/${agg_tot} = ${agg_pct}% < ${HEALTH_MIN_ALIVE_PCT}% (a component dropped out of scope)"
+            else
+                record PASS "${section}.proc.alive" "membership_complete=${agg_alive}/${agg_tot} = ${agg_pct}% (${n_agg_files} rotated ${AGG_PREFIX} files)"
+            fi
+            agg_gap=$(awk -F, '
+                FNR==1 { next }
+                { ts=$1+0 }
+                prev>0 { g = ts - prev; if(g>maxg) maxg=g }
+                { prev = ts }
+                END { printf "%.1f", maxg+0 }
+            ' $agg_csvs)
+            if awk -v g=$agg_gap -v m=$HEALTH_MAX_PROC_GAP_S 'BEGIN{exit !(g>m)}'; then
+                record WARN "${section}.proc.continuity" "max gap ${agg_gap}s > ${HEALTH_MAX_PROC_GAP_S}s"
+            else
+                record PASS "${section}.proc.continuity" "max gap ${agg_gap}s"
+            fi
+            agg_last_ts=$(csv_max_ts "ts_unix" $agg_csvs)
+            check_freshness "$section" "proc" "$agg_last_ts" "$HEALTH_MAX_PROC_STALENESS_S" "$ELAPSED" "$IS_RUNNING"
+        fi
+
+        # ---- B.6 gpu_monitor: vram + continuity on BOTH topology GPUs ----
+        gpu_indices=$(printf '%s\n%s\n' "$PREFILL_GPU" "$DECODE_GPU" | awk '!seen[$0]++')
+        for gi in $gpu_indices; do
+            gi_csvs=$(ls "$run_dir"/gpu${gi}_*.csv 2>/dev/null)
+            if [ -z "$gi_csvs" ]; then
+                if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_MONITOR_WARMUP_S" ]; then
+                    record WARN "${section}.gpu${gi}.csv" "no gpu${gi} CSV yet (elapsed=${ELAPSED}s, monitor buffer not flushed)"
+                else
+                    record FAIL "${section}.gpu${gi}.csv" "no gpu${gi} CSV"
+                fi
+                continue
+            fi
+            gi_stats=$(awk -F, '
+                FNR==1 { col=0; for(i=1;i<=NF;i++) if($i=="vram_used_bytes") col=i; next }
+                col && $col!="" { v=$col/1048576; n++; if(n==1||v<mn) mn=v; if(v>mx) mx=v }
+                END { if(n>0) printf "n=%d vram_min=%.0f vram_max=%.0f MiB", n, mn, mx }
+            ' $gi_csvs)
+            gi_vram_max=$(echo "$gi_stats" | grep -oE "vram_max=[0-9]+" | cut -d= -f2)
+            if [ -z "$gi_vram_max" ]; then
+                if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_MONITOR_WARMUP_S" ]; then
+                    record WARN "${section}.gpu${gi}.vram" "no vram samples on disk yet (elapsed=${ELAPSED}s, monitor buffer not flushed)"
+                else
+                    record FAIL "${section}.gpu${gi}.vram" "no populated vram_used_bytes samples"
+                fi
+            elif [ "$gi_vram_max" -lt "$HEALTH_MIN_VRAM_MIB" ]; then
+                record FAIL "${section}.gpu${gi}.vram" "vram_max=${gi_vram_max}MiB < ${HEALTH_MIN_VRAM_MIB}MiB"
+            else
+                record PASS "${section}.gpu${gi}.vram" "$gi_stats"
+            fi
+            gi_gap=$(awk -F, '
+                FNR==1 { next }
+                { ts=$1+0 }
+                prev>0 { g = ts - prev; if(g>maxg) maxg=g }
+                { prev = ts }
+                END { printf "%.1f", maxg+0 }
+            ' $gi_csvs)
+            if awk -v g=$gi_gap -v m=$HEALTH_MAX_GPU_GAP_S 'BEGIN{exit !(g>m)}'; then
+                record WARN "${section}.gpu${gi}.continuity" "max gap ${gi_gap}s > ${HEALTH_MAX_GPU_GAP_S}s"
+            else
+                record PASS "${section}.gpu${gi}.continuity" "max gap ${gi_gap}s"
+            fi
+            gi_last_ts=$(csv_max_ts "ts_unix" $gi_csvs)
+            check_freshness "$section" "gpu${gi}" "$gi_last_ts" "$HEALTH_MAX_GPU_STALENESS_S" "$ELAPSED" "$IS_RUNNING"
+        done
+
+        # ---- B.7/B.8/B.9 shared (system/swap, client, manifest+logs) ----
+        check_system
+        check_client
+        check_manifest_and_logs
+        continue
+    fi
+
     if [ -z "$CELL_ID" ] || [ -z "$GPU_INDEX" ] || [ -z "$LABEL" ] || [ -z "$CONTAINER_NAME" ]; then
         record FAIL "${section}.manifest" "missing required fields after fallback (cell=$CELL_ID gpu=$GPU_INDEX label=$LABEL container=$CONTAINER_NAME kind=$MANIFEST_KIND)"
         continue
@@ -731,24 +1149,7 @@ for run_dir in $RUN_DIRS; do
     fi
 
     # ---- B.2 image pin consistency ----
-    if [ -f "$run_dir/image_digest.txt" ]; then
-        digest_file=$(head -1 "$run_dir/image_digest.txt" | tr -d '\n')
-        digest_manifest=$(json_get "$manifest" "image.digest")
-        digest_pin=$(cell_pin_digest "$CELL_YAML")
-        if [ -z "$digest_manifest" ]; then
-            if [ -n "$digest_pin" ] && [ "$digest_file" = "$digest_pin" ]; then
-                record PASS "${section}.image_digest" "$digest_file (verified against cell pin; manifest digest unavailable in $MANIFEST_KIND manifest)"
-            elif [ -n "$digest_pin" ]; then
-                record FAIL "${section}.image_digest" "image_digest.txt and cell pin disagree"
-            else
-                record WARN "${section}.image_digest" "$digest_file (could not resolve manifest or cell pin digest)"
-            fi
-        elif [ "$digest_file" = "$digest_manifest" ]; then
-            record PASS "${section}.image_digest" "$digest_file"
-        else
-            record FAIL "${section}.image_digest" "image_digest.txt and manifest disagree"
-        fi
-    fi
+    check_image_pin
 
     # ---- B.3 container alive on correct GPU ----
     CURRENT_CONTAINER_PID=""
@@ -1072,226 +1473,13 @@ print('descendant' if pids & compute else 'no')
     fi
 
     # ---- B.7 system_monitor presence + swap quiescence ----
-    sys_csvs=$(ls "$run_dir"/system_*.csv 2>/dev/null)
-    if [ -z "$sys_csvs" ]; then
-        record FAIL "${section}.system.csv" "no system CSV"
-    else
-        sys_rows=$(awk -F, 'FNR>1 {n++} END {print n+0}' $sys_csvs)
-        if [ "$sys_rows" -eq 0 ]; then
-            if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_MONITOR_WARMUP_S" ]; then
-                record WARN "${section}.system.csv" "no system samples on disk yet (elapsed=${ELAPSED}s, monitor buffer not flushed)"
-            else
-                record FAIL "${section}.system.csv" "system CSV files exist but contain no samples"
-            fi
-        else
-            record PASS "${section}.system.csv" "${sys_rows} samples"
-            # Check swap column (look for any non-zero non-empty value)
-            swap_max=$(awk -F, '
-                FNR==1 { for(i=1;i<=NF;i++) if($i ~ /swap.*used/) col=i; next }
-                col && $col!="" && $col+0>m { m=$col+0 }
-                END { print m+0 }
-            ' $sys_csvs)
-            if [ -n "$swap_max" ] && [ "$swap_max" -gt 1073741824 ]; then  # > 1 GB swap = bad
-                record WARN "${section}.system.swap" "max swap used = ${swap_max} bytes (host memory pressure)"
-            else
-                record PASS "${section}.system.swap" "no significant swap (max=${swap_max} bytes)"
-            fi
-            system_last_ts=$(csv_max_ts "ts_unix" $sys_csvs)
-            check_freshness "$section" "system" "$system_last_ts" "$HEALTH_MAX_SYSTEM_STALENESS_S" "$ELAPSED" "$IS_RUNNING"
-        fi
-    fi
+    check_system
 
     # ---- B.8 client throughput vs target ----
-    client_csvs=$(ls "$run_dir"/client/requests_*.csv 2>/dev/null)
-    request_timeout_s=$(json_get "$manifest" "workload.client_config_overrides.request_timeout_s")
-    [ -n "$request_timeout_s" ] || request_timeout_s=$(yaml_path "$CELL_YAML" "workload.client_config_overrides.request_timeout_s")
-    request_timeout_s=${request_timeout_s:-600}
-    request_timeout_i=${request_timeout_s%.*}
-    is_int "$request_timeout_i" || request_timeout_i=600
-    client_start_grace_s=$(( request_timeout_i + 120 ))
-    client_staleness_s="$HEALTH_MAX_CLIENT_STALENESS_S"
-    if [ "$client_staleness_s" -lt "$client_start_grace_s" ]; then
-        client_staleness_s="$client_start_grace_s"
-    fi
-    if [ -z "$client_csvs" ]; then
-        if [ "$IS_RUNNING" -eq 0 ] || [ "${ELAPSED:-0}" -gt "$client_start_grace_s" ]; then
-            record FAIL "${section}.client.csv" "no client CSV after elapsed=${ELAPSED}s"
-        else
-            record WARN "${section}.client.csv" "no client CSV yet (elapsed=${ELAPSED}s, grace=${client_start_grace_s}s)"
-        fi
-    else
-        client_stats=$(awk -F, -v ok_statuses="$HEALTH_OK_STATUSES" '
-            BEGIN {
-                split(ok_statuses, ok_arr, /[ ,]+/)
-                for (i in ok_arr) if (ok_arr[i]!="") ok_map[tolower(ok_arr[i])] = 1
-            }
-            FNR==1 {
-                for(i=1;i<=NF;i++) {
-                    if($i=="status") status_col=i
-                    if($i=="submitted_at_unix") submitted_col=i
-                    if($i=="finished_at_unix") finished_col=i
-                }
-                next
-            }
-            {
-                total++
-                status = status_col ? $status_col : ""
-                status_l = tolower(status)
-                if(status_l in ok_map) ok++
-                else if(status_l=="timeout") timeout++
-                else if(status_l=="dropped") dropped++
-                else if(status_l=="error") error++
-                else if(status!="") {
-                    unknown++
-                    unknown_counts[status]++
-                }
-
-                submitted_ts = (submitted_col && $submitted_col!="") ? ($submitted_col + 0) : 0
-                if(submitted_ts>0) {
-                    nsubmitted++
-                    if(nsubmitted==1 || submitted_ts<sub_mn) sub_mn=submitted_ts
-                    if(submitted_ts>sub_mx) sub_mx=submitted_ts
-                    if(submitted_ts>last_ts) last_ts=submitted_ts
-                }
-                finished_ts = (finished_col && $finished_col!="") ? ($finished_col + 0) : 0
-                if(finished_ts>last_ts) last_ts=finished_ts
-            }
-            END {
-                span = (nsubmitted>1) ? (sub_mx-sub_mn) : 0
-                printf "total=%d ok=%d error=%d timeout=%d dropped=%d unknown=%d submitted_span=%.3f last_ts=%.0f", total, ok, error, timeout, dropped, unknown, span, last_ts
-                if (unknown>0) {
-                    printf " unknown_statuses="
-                    first=1
-                    for (k in unknown_counts) {
-                        if (!first) printf ";"
-                        printf "%s:%d", k, unknown_counts[k]
-                        first=0
-                    }
-                }
-            }
-        ' $client_csvs)
-        n_total=$(echo "$client_stats" | sed 's/.*total=\([0-9]*\).*/\1/')
-        n_ok=$(echo "$client_stats" | sed 's/.*ok=\([0-9]*\).*/\1/')
-        n_error=$(echo "$client_stats" | sed 's/.*error=\([0-9]*\).*/\1/')
-        n_timeout=$(echo "$client_stats" | sed 's/.*timeout=\([0-9]*\).*/\1/')
-        n_dropped=$(echo "$client_stats" | sed 's/.*dropped=\([0-9]*\).*/\1/')
-        n_unknown=$(echo "$client_stats" | sed 's/.*unknown=\([0-9]*\).*/\1/')
-        client_span=$(echo "$client_stats" | sed 's/.*submitted_span=\([0-9.]*\).*/\1/')
-        client_last_ts=$(echo "$client_stats" | sed 's/.*last_ts=\([0-9]*\).*/\1/')
-        if [ "$n_total" -eq 0 ]; then
-            if [ "$IS_RUNNING" -eq 0 ] || [ "${ELAPSED:-0}" -gt "$client_start_grace_s" ]; then
-                record FAIL "${section}.client.csv" "client CSV files exist but contain no request rows after elapsed=${ELAPSED}s"
-            else
-                record WARN "${section}.client.csv" "client CSV files exist but contain no request rows yet"
-            fi
-        elif [ "$n_ok" -eq 0 ] && [ "${ELAPSED:-0}" -gt "$client_start_grace_s" ]; then
-            record FAIL "${section}.client.ok" "zero successful client rows: total=${n_total} error=${n_error} timeout=${n_timeout} dropped=${n_dropped}"
-        fi
-        check_freshness "$section" "client" "$client_last_ts" "$client_staleness_s" "$ELAPSED" "$IS_RUNNING"
-        issued_rate=$(awk -v n=$n_total -v s=$client_span 'BEGIN{if(s>0) printf "%.3f", n/s; else print 0}')
-        # Prefer manifest (json, stdlib-only) so the rate check works even when
-        # PyYAML is unavailable in the invoking python3 (e.g. running from the
-        # conda base env instead of the wosar env).
-        target=$(json_get "$manifest" "workload.client_config_overrides.target_rate_rps")
-        [ -n "$target" ] || target=$(yaml_path "$CELL_YAML" "workload.client_config_overrides.target_rate_rps")
-        if [ -n "$target" ] && [ "$target" != "0" ] && awk -v s=$client_span 'BEGIN{exit !(s>0)}'; then
-            # Below HEALTH_RATE_MIN_ELAPSED_S, a Poisson stream is too sparse
-            # to estimate a meaningful ratio (e3b at 0.05 rps needs ~10 min
-            # for the first ~30 events). Don't WARN inside the warmup window.
-            if [ "${ELAPSED:-0}" -lt "$HEALTH_RATE_MIN_ELAPSED_S" ]; then
-                record PASS "${section}.client.rate" "issued=${issued_rate} target=${target} submitted_span=${client_span}s (warming up, elapsed=${ELAPSED}s < ${HEALTH_RATE_MIN_ELAPSED_S}s)"
-            else
-                ratio=$(awk -v a=$issued_rate -v t=$target 'BEGIN{if(t>0) printf "%.3f", a/t; else print 0}')
-                tol=$HEALTH_RATE_TOLERANCE
-                if awk -v r=$ratio -v t=$tol 'BEGIN{exit !(r<1-t || r>1+t)}'; then
-                    record WARN "${section}.client.rate" "issued=${issued_rate} target=${target} ratio=${ratio} outside [1-${tol},1+${tol}] submitted_span=${client_span}s"
-                else
-                    record PASS "${section}.client.rate" "issued=${issued_rate} target=${target} ratio=${ratio}  ok=${n_ok}/${n_total} submitted_span=${client_span}s"
-                fi
-            fi
-        elif [ -n "$target" ]; then
-            record WARN "${section}.client.rate" "not enough timestamp span to estimate request rate yet (n=${n_total})"
-        fi
-        if [ "${n_unknown:-0}" -gt 0 ]; then
-            unknown_detail=$(echo "$client_stats" | sed -n 's/.*unknown_statuses=\(.*\)$/\1/p')
-            record WARN "${section}.client.status" "unknown status values: ${unknown_detail:-count=$n_unknown}"
-        fi
-        # Error rate
-        if [ "$n_total" -gt 100 ]; then
-            err_pct=$(awk -v e=$n_error -v to=$n_timeout -v t=$n_total 'BEGIN{printf "%.1f", 100*(e+to)/t}')
-            if awk -v p=$err_pct 'BEGIN{exit !(p>5)}'; then
-                record WARN "${section}.client.errors" "error/timeout responses = ${err_pct}% (>5%); dropped=${n_dropped}/${n_total}"
-            fi
-            dropped_pct=$(awk -v d=$n_dropped -v t=$n_total 'BEGIN{printf "%.1f", 100*d/t}')
-            cell_upper=$(printf '%s' "$CELL_ID" | tr '[:lower:]' '[:upper:]')
-            fail_var="HEALTH_FAIL_DROPPED_PCT_${cell_upper}"
-            warn_var="HEALTH_WARN_DROPPED_PCT_${cell_upper}"
-            fail_threshold="${!fail_var:-$HEALTH_FAIL_DROPPED_PCT}"
-            warn_threshold="${!warn_var:-$HEALTH_WARN_DROPPED_PCT}"
-            if awk -v p=$dropped_pct -v f=$fail_threshold 'BEGIN{exit !(p>f)}'; then
-                record FAIL "${section}.client.dropped" "dropped requests = ${dropped_pct}% > ${fail_threshold}% (cell=${CELL_ID})"
-            elif awk -v p=$dropped_pct -v w=$warn_threshold 'BEGIN{exit !(p>w)}'; then
-                record WARN "${section}.client.dropped" "dropped requests = ${dropped_pct}% > ${warn_threshold}% (cell=${CELL_ID})"
-            fi
-        fi
-    fi
+    check_client
 
     # ---- B.9 manifest finalization + log inspection ----
-    interrupted_early=$(json_get "$manifest" "interrupted_early")
-    client_forced_kill=$(json_get "$manifest" "client_forced_kill")
-    manifest_client_total=$(json_get "$manifest" "client_summary.total")
-    manifest_client_ok=$(json_get "$manifest" "client_summary.ok")
-    if [ "$interrupted_early" = "True" ] || [ "$interrupted_early" = "true" ]; then
-        record FAIL "${section}.manifest.interrupted" "interrupted_early=true"
-    fi
-    if [ "$client_forced_kill" = "True" ] || [ "$client_forced_kill" = "true" ]; then
-        record FAIL "${section}.manifest.client" "client_forced_kill=true"
-    fi
-    if [ "$IS_RUNNING" -eq 0 ] && is_int "$manifest_client_total" && [ "$manifest_client_total" -eq 0 ]; then
-        record FAIL "${section}.manifest.client" "client_summary.total=0"
-    elif [ "$IS_RUNNING" -eq 0 ] && is_int "$manifest_client_ok" && [ "$manifest_client_ok" -eq 0 ]; then
-        record FAIL "${section}.manifest.client" "client_summary.ok=0"
-    fi
-
-    for log in "$run_dir/launch_cell.log" "$run_dir/logs"/*.log; do
-        [ -f "$log" ] || continue
-        bn=$(basename "$log")
-        # docker.log / container.log capture the engine stdout, which routinely
-        # logs Python tracebacks for benign per-request errors. Use a tighter
-        # pattern there so genuine fatals (OOM, panic) still surface.
-        case "$bn" in
-            docker*.log|container*.log) pattern="$HEALTH_CONTAINER_FATAL_GREP" ;;
-            *) pattern="$HEALTH_FATAL_GREP" ;;
-        esac
-        n_fatal=$(grep -cE "$pattern" "$log" 2>/dev/null || true)
-        n_fatal=${n_fatal:-0}
-        if [ "$n_fatal" -gt 0 ]; then
-            sample=$(grep -E "$pattern" "$log" | head -1 | cut -c1-150)
-            record WARN "${section}.log.$bn" "${n_fatal} suspicious lines; sample: $sample"
-        fi
-    done
-    # find_engine_pid log for triton_child
-    if [ "$PID_STRATEGY" = "triton_child" ]; then
-        fep_log="$run_dir/logs/find_engine_pid.log"
-        if [ -f "$fep_log" ]; then
-            n_resolved=$(grep -cE "resolved pid=" "$fep_log" 2>/dev/null || true)
-            n_no_match=$(grep -cE "no descendant" "$fep_log" 2>/dev/null || true)
-            n_resolved=${n_resolved:-0}
-            n_no_match=${n_no_match:-0}
-            if [ "$n_resolved" -eq 0 ]; then
-                record FAIL "${section}.fep.resolutions" "find_engine_pid never resolved a PID"
-            else
-                msg="resolved ${n_resolved} times (1=initial, >1=respawn events)"
-                if [ "$n_no_match" -gt 0 ]; then
-                    record WARN "${section}.fep.resolutions" "$msg; $n_no_match 'no descendant' incidents"
-                else
-                    record PASS "${section}.fep.resolutions" "$msg"
-                fi
-            fi
-        else
-            record WARN "${section}.fep.log" "find_engine_pid.log absent for triton_child cell"
-        fi
-    fi
+    check_manifest_and_logs
 done
 
 # ============================================================
