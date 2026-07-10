@@ -443,3 +443,54 @@ file and `--resume`s). On exit it prints the per-run status, the campaign exit
 code (0 ok / 4 interrupted / 5 fatal), and the exact
 `validate_extension_run.py` / `validation_check.py` / `aging_trends.py`
 commands to run next.
+
+## DoW screening campaign (the extension's scientific core)
+
+The 57-cell workload Design-of-Experiments campaign (Resolution V `2^(5-1)`,
+defining relation `I=ABCDE`: 16 design points + 3 center points per system,
+replicated on Dynamo / Triton+vLLM / vLLM-standalone) is **generated**, never
+hand-edited. The single source of truth is the design matrix embedded in
+`scripts/generate_dow_cells.py`; the per-cell yamls, the campaign descriptor,
+and the auditable design matrix are its outputs:
+
+- `campaigns/extension/cells/dow/dow_<system>_p<NN>.yaml` (design points, `NN` =
+  standard Yates index) and `dow_<system>_cp<1-3>.yaml` (center points)
+- `campaigns/extension/dow_campaign.yaml` (descriptor: `campaign_id
+  extension_dow_screening`, its **own** `state_file`, strictly serial, the
+  fixed-seed interleaved 57-run order baked into the `cells:` list)
+- `campaigns/extension/dow_design_matrix.csv` (run id, coded levels, physical
+  values, schedule position — the artifact the paper's methods section cites)
+
+Windows: 36h (`duration_s=129600`) for all cells except the 3 Dynamo center
+points at 48h (`172800`) as the cross-anchor against the 48h long test;
+`warmup_discard_s=3600` throughout. Factor A (rate) is a fraction-of-ceiling
+realized per cell via `calibration_file`, not a fixed `target_rate_rps`.
+
+### Regenerate
+
+```bash
+python3 scripts/generate_dow_cells.py            # write campaigns/extension/{cells/dow,dow_campaign.yaml,dow_design_matrix.csv}
+python3 scripts/generate_dow_cells.py --check     # CI/pre-run guard: non-zero if the tree is out of date
+```
+
+The generator is deterministic and idempotent (same inputs -> byte-identical
+outputs; a second run changes nothing) and prints the final 57-run linear order.
+`DESIGN_SEED` in the script fixes that order; changing it reorders the schedule
+but never changes the set of 57 cells. `tests/test_dow_campaign.py` enforces the
+matrix algebra, the schedule properties, the engine/monitors byte-identity to
+each system template, and that the descriptor loads through `campaign.py`.
+
+### Dry-run
+
+```bash
+python3 scripts/campaign.py --campaign-yaml campaigns/extension/dow_campaign.yaml --dry-run
+```
+
+Until the per-cell calibrations exist this dry-run exits `3` (EXIT_PREFLIGHT):
+every cell sets `calibration_required: true`, so the pre-flight gate refuses the
+whole campaign loudly if a `state/calibration/<cell_id>.json` is missing or
+invalid — before hour 37, not during it. Each cell's ceiling depends on its
+workload SHAPE, so it must be calibrated with that cell's materialized client
+config and fraction (16 design shapes + 1 center shape per system = 51 distinct
+calibrations, though each of the 57 cells names its own calibration file). The
+calibration orchestrator that produces those files is a **separate** task.

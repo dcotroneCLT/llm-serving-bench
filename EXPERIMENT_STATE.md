@@ -137,15 +137,24 @@ frozen 2026-06-29. Early cross-system contrast worth remembering: Triton
 RSS slope +0.59 MB/h vs standalone +15.7 MB/h vs Dynamo aggregate +7.6 MB/h
 (validation-length windows; the DoW will measure this properly).
 
+**DoW WINDOW DECISION (2026-07-10): screening runs are 36h, not 48h.**
+Full rationale and the 20-week mission timeline are in the 2026-07-10
+AMENDMENT block of paper/PAPER_UPDATE_PLAN.md (comparability with the n=3
+36h baseline, pipeline tuned at 36h, mission budget protecting the
+post-screening phase). Exception: the 3 Dynamo center points run at 48h as
+a cross-anchor against the long test. Strict serialism confirmed. Calendar:
+wk1 calibrations + dry-run; wk2-14 screening (57 runs); wk14-18 finer DoE +
+2x 7-day confirmations; wk19-20 contingency.
+
 **NEXT STEP (resume here): pre-campaign phase, two items left.**
-1. Per-cell calibration (30%/85% of a conservative ceiling) with the
+1. Generate the DoW cells + campaign yaml (Res V 16-run I=ABCDE + 3 center
+   points x 3 systems = 57 runs, 36h each except Dynamo CPs at 48h,
+   fixed-seed interleaved ordering across systems, calibration_required on
+   every cell; levels CONFIRMED 2026-06-29 in the plan) and dry-run it.
+2. Per-cell calibration (30%/85% of the per-cell ceiling) with the
    validated calibrate_rate path; keep calibration topology in sync with
    cell topology (dynamo cells calibrate against the same 1+1 stack the
-   run uses).
-2. Populate the DoW campaign yaml (Res V 16-run + 3 center points across
-   the 5 workload factors x 3 systems, ~57 runs, strictly serial; see
-   paper/PAPER_UPDATE_PLAN.md "2026-06-12: EXPERIMENTAL PLAN -- DoW") and
-   dry-run it. The 48h DoW cells MUST set calibration_required: true.
+   run uses); provenance + max-age gates are enforced in code.
 Backlog (non-blocking): longtest_status.sh must fail loudly when run
 outside the wosar env (today it prints truncated paths); summaries of
 review-fix commits 2322c09/ad18f22 still owed to this file.
