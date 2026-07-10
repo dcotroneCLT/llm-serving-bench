@@ -964,7 +964,13 @@ for run_dir in $RUN_DIRS; do
     # below FAILs "missing required fields" and SKIPS every per-run check on
     # exactly the multi-process runs that most need watching. Single-container
     # manifests have no top-level "lifecycle" key -> default, byte-identical path.
+    # Prefer JSON (stdlib json_get, works in ANY conda env) over the PyYAML
+    # fallback: launch_cell writes top-level "lifecycle"; attach_run writes it
+    # under "engine.lifecycle". Only fall back to the cell YAML (PyYAML) if the
+    # manifest carries neither -- so a non-PyYAML shell never mis-classifies a
+    # dynamo run as single_container.
     LIFECYCLE=$(json_get "$manifest" "lifecycle")
+    [ -n "$LIFECYCLE" ] || LIFECYCLE=$(json_get "$manifest" "engine.lifecycle")
     [ -n "$LIFECYCLE" ] || LIFECYCLE=$(yaml_path "$CELL_YAML" "engine.lifecycle")
     [ -n "$LIFECYCLE" ] || LIFECYCLE="single_container"
 
@@ -976,9 +982,13 @@ for run_dir in $RUN_DIRS; do
         ELAPSED=$(awk -v s="${STARTED_AT_UNIX:-0}" -v n="$END_OR_NOW" -v d="${DURATION_S:-0}" 'BEGIN{if(s>0 && n>=s) print int(n-s); else print int(d)}')
 
         # Topology GPUs (the monitor samples BOTH) + engine aggregate prefix.
+        # JSON first (launch_cell top-level "topology"; attach_run "engine.topology"),
+        # YAML only as a last resort so GPUs are correct without PyYAML.
         PREFILL_GPU=$(json_get "$manifest" "topology.prefill_gpu")
+        [ -n "$PREFILL_GPU" ] || PREFILL_GPU=$(json_get "$manifest" "engine.topology.prefill_gpu")
         [ -n "$PREFILL_GPU" ] || PREFILL_GPU=$(yaml_path "$CELL_YAML" "engine.topology.prefill_gpu")
         DECODE_GPU=$(json_get "$manifest" "topology.decode_gpu")
+        [ -n "$DECODE_GPU" ] || DECODE_GPU=$(json_get "$manifest" "engine.topology.decode_gpu")
         [ -n "$DECODE_GPU" ] || DECODE_GPU=$(yaml_path "$CELL_YAML" "engine.topology.decode_gpu")
         is_int "$PREFILL_GPU" || PREFILL_GPU=0
         is_int "$DECODE_GPU" || DECODE_GPU=1
@@ -990,11 +1000,22 @@ for run_dir in $RUN_DIRS; do
         # ---- B.1 required files (component PGID identity instead of engine.pid) ----
         comp_count=$(JSON_FILE="$manifest" python3 - <<'PY' 2>/dev/null
 import json, os
+def with_pgids(items):
+    # A component is identity-complete when it recorded at least one PGID.
+    return sum(1 for c in items if isinstance(c, dict) and c.get("pgids"))
 try:
     d = json.load(open(os.environ["JSON_FILE"], encoding="utf-8"))
-    comps = d.get("components") or {}
-    # A component is identity-complete when it recorded at least one PGID.
-    print(sum(1 for c in comps.values() if isinstance(c, dict) and c.get("pgids")))
+    n = 0
+    # launch_cell manifest: top-level "components" = {label: {pgids: [...]}}.
+    top = d.get("components")
+    if isinstance(top, dict):
+        n = max(n, with_pgids(top.values()))
+    # attach_run manifest: identity merged in place under
+    # monitors.components.components = [{label, pgids: [...]}, ...].
+    mon = ((d.get("monitors") or {}).get("components") or {})
+    if isinstance(mon, dict) and isinstance(mon.get("components"), list):
+        n = max(n, with_pgids(mon["components"]))
+    print(n)
 except Exception:
     print(0)
 PY
@@ -1027,13 +1048,38 @@ PY
             fi
         else
             n_agg_files=$(printf '%s\n' "$agg_csvs" | wc -l | tr -d ' ')
+            # process_alive == membership_complete. n_pids_unexpected counts stray
+            # processes matching the regex but OUTSIDE the recorded PGID scope --
+            # launch_cell's runtime health treats any >0 (or a missing/unparseable
+            # value) as a violation because the aggregate is then contaminated by
+            # PIDs that are not the run's. We mirror that here over ALL ticks:
+            #   uc_present=1 iff the column exists, uc_bad=#ticks with value>0,
+            #   uc_max=largest observed stray count, uc_bad_parse=#unparseable.
             agg_stats=$(awk -F, '
-                FNR==1 { ac=0; for(i=1;i<=NF;i++) if($i=="process_alive") ac=i; next }
-                { tot++; av = ac?$ac:$3; if(av=="True"||av=="true"||av=="1") alive++ }
-                END { printf "tot=%d alive=%d", tot+0, alive+0 }
+                FNR==1 {
+                    ac=0; uc=0
+                    for(i=1;i<=NF;i++) { if($i=="process_alive") ac=i; if($i=="n_pids_unexpected") uc=i }
+                    if(uc>0) uc_present=1
+                    next
+                }
+                {
+                    tot++; av = ac?$ac:$3; if(av=="True"||av=="true"||av=="1") alive++
+                    if(uc>0) {
+                        v=$uc
+                        if(v=="" || v=="None") uc_bad_parse++
+                        else if(v ~ /^-?[0-9]+$/) { n=v+0; if(n>0) uc_bad++; if(n>uc_max) uc_max=n }
+                        else uc_bad_parse++
+                    }
+                }
+                END { printf "tot=%d alive=%d uc_present=%d uc_bad=%d uc_max=%d uc_bad_parse=%d",
+                        tot+0, alive+0, uc_present+0, uc_bad+0, uc_max+0, uc_bad_parse+0 }
             ' $agg_csvs)
             agg_tot=$(echo "$agg_stats" | sed 's/.*tot=\([0-9]*\).*/\1/')
             agg_alive=$(echo "$agg_stats" | sed 's/.*alive=\([0-9]*\).*/\1/')
+            agg_uc_present=$(echo "$agg_stats" | sed 's/.*uc_present=\([0-9]*\).*/\1/')
+            agg_uc_bad=$(echo "$agg_stats" | sed 's/.*uc_bad=\([0-9]*\).*/\1/')
+            agg_uc_max=$(echo "$agg_stats" | sed 's/.*uc_max=\([0-9]*\).*/\1/')
+            agg_uc_bad_parse=$(echo "$agg_stats" | sed 's/.*uc_bad_parse=\([0-9]*\).*/\1/')
             agg_pct=$(awk -v a=${agg_alive:-0} -v t=${agg_tot:-0} 'BEGIN{if(t>0) printf "%.1f", 100*a/t; else print "0"}')
             if [ "${agg_tot:-0}" -eq 0 ]; then
                 if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_PROC_ALIVE_GRACE_S" ]; then
@@ -1045,6 +1091,19 @@ PY
                 record FAIL "${section}.proc.alive" "membership_complete=${agg_alive}/${agg_tot} = ${agg_pct}% < ${HEALTH_MIN_ALIVE_PCT}% (a component dropped out of scope)"
             else
                 record PASS "${section}.proc.alive" "membership_complete=${agg_alive}/${agg_tot} = ${agg_pct}% (${n_agg_files} rotated ${AGG_PREFIX} files)"
+            fi
+            # Scope integrity: any stray process outside the recorded PGIDs
+            # contaminates the aggregate (launch_cell treats >0 as a health kill).
+            if [ "${agg_tot:-0}" -gt 0 ]; then
+                if [ "${agg_uc_present:-0}" -eq 0 ]; then
+                    record WARN "${section}.proc.membership" "n_pids_unexpected column absent from ${AGG_PREFIX} CSVs (pre-hardening monitor schema?); PGID-scope integrity cannot be verified"
+                elif [ "${agg_uc_bad:-0}" -gt 0 ]; then
+                    record FAIL "${section}.proc.membership" "n_pids_unexpected>0 on ${agg_uc_bad}/${agg_tot} ticks (max=${agg_uc_max}): stray process(es) outside the recorded PGIDs -- the engine aggregate is contaminated"
+                elif [ "${agg_uc_bad_parse:-0}" -gt 0 ]; then
+                    record FAIL "${section}.proc.membership" "n_pids_unexpected missing/unparseable on ${agg_uc_bad_parse}/${agg_tot} ticks (malformed monitor rows); scope integrity unverifiable"
+                else
+                    record PASS "${section}.proc.membership" "no stray processes (n_pids_unexpected=0 on all ${agg_tot} ticks)"
+                fi
             fi
             agg_gap=$(awk -F, '
                 FNR==1 { next }
