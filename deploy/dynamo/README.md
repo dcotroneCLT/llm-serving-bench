@@ -501,5 +501,50 @@ whole campaign loudly if a `state/calibration/<cell_id>.json` is missing or
 invalid — before hour 37, not during it. Each cell's ceiling depends on its
 workload SHAPE, so it must be calibrated with that cell's materialized client
 config and fraction (16 design shapes + 1 center shape per system = 51 distinct
-calibrations, though each of the 57 cells names its own calibration file). The
-calibration orchestrator that produces those files is a **separate** task.
+shapes, though each of the 57 cells names — and gets — its own calibration
+file). `scripts/calibrate_dow.py` produces those files (next section).
+
+### Week 1: per-cell calibration (`scripts/calibrate_dow.py`)
+
+The orchestrator turns the 57 MISSING calibrations into 57 valid per-cell JSONs,
+**one engine bring-up per serving system** (Dynamo, then Triton, then vLLM — all
+of a system's sweeps share a single bring-up, torn down between systems). It
+drives the **same** `launch_cell` production lifecycle (`make_lifecycle` /
+`bring_up` / `teardown`, monitors and the run client simply not started) — there
+is deliberately no second bring-up path — and holds the reaper run-slot lock for
+the whole run, so it refuses to start if a run is live and a run cannot start
+underneath it. Per cell it materializes that cell's client config, runs
+`calibrate_rate.py` at the cell's own `calibration_fraction`, and writes the
+cell's `state/calibration/<cell_id>.json`.
+
+It runs **one honest sweep per cell** (no dedupe across the identical center
+points): the dispatch-time binding checks each file's own `cell_id`, so a shared
+sweep would have to be stamped with a foreign id — the 6 extra center-point
+sweeps are cheap (the sweep early-stops past the knee) and keep every file a
+real calibration of its own cell.
+
+```bash
+# Preview: grouped plan + each cell's current validity, no lock, no bring-up.
+python3 scripts/calibrate_dow.py --campaign-yaml campaigns/extension/dow_campaign.yaml --dry-run
+
+# Run it (inside tmux; it tees to campaigns/extension/state/logs/calibrate_dow_<ts>.log
+# and is safe to Ctrl-C and re-run — valid calibrations are skipped on resume):
+tmux new -d -s calib_dow \
+  'source ~/miniconda3/etc/profile.d/conda.sh && conda activate wosar && \
+   cd ~/wosar/llm-serving-bench && \
+   python3 scripts/calibrate_dow.py --campaign-yaml campaigns/extension/dow_campaign.yaml'
+
+# Force a re-sweep of specific cells (or "all"), e.g. after widening a grid:
+python3 scripts/calibrate_dow.py --recalibrate dow_vllm_p07,dow_triton_p02
+```
+
+Failure policy: a sweep that ends `no_stable_point` / `did_not_saturate` does
+**not** halt the run — it is recorded, the rest continue, and the process exits
+non-zero with a summary table suggesting the next (narrower / wider) rate grid
+per bad cell. A hard stop happens only for host preconditions (lock held, image
+pin / docker / env, or bring-up failing after `--bringup-retries`). Default
+sweep grids are per-system and long-prompt/long-output shapes can cap below
+1 rps; override per cell or per system with `--rate-grids <yaml>`, or globally
+with `WOSAR_CALIB_RATES=r1,r2,...`. The orchestrator ends by running the
+campaign's own `--dry-run` and its success criterion is that pre-flight moving
+from 57 MISSING to 0.
