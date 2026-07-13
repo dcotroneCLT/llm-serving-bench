@@ -739,10 +739,56 @@ validation with 2 short runs; calibration tooling). wk3-7 the three DoW
 campaigns (Dynamo first). wk7-8 deep analysis + dominant factors + 7-day runs
 on the worst stressor.
 
-LOCKED: 48h window; Res V 16+3CP; rate = fraction-of-ceiling; 3 systems; Qwen
-local / Nemotron+A100 on the grant; "stress-workload" terminology (never
-"adversarial"); security framed as a resource-exhaustion implication with
-responsible disclosure; factor levels (CONFIRMED 2026-06-29, above).
+LOCKED: 48h window [AMENDED 2026-07-10 to 36h -- see the amendment block
+below; everything else in this list stands]; Res V 16+3CP; rate =
+fraction-of-ceiling; 3 systems; Qwen local / Nemotron+A100 on the grant;
+"stress-workload" terminology (never "adversarial"); security framed as a
+resource-exhaustion implication with responsible disclosure; factor levels
+(CONFIRMED 2026-06-29, above).
+
+### 2026-07-10: AMENDMENT — screening window 48h -> 36h; mission timeline
+
+**Decision (Domenico + review chat, 2026-07-10): the DoW screening runs are
+36h, not 48h.** Exception: the 3 Dynamo center points run at 48h as a
+cross-anchor against the completed 48h long test. Strictly serial execution
+stands (one run at a time on the whole host; enforced in code by the serial
+campaign scheduler and the run-slot lock).
+
+Why the amendment. The original 48h budget (~3,650 GPU-h, "fits the 2-month
+window") implicitly assumed the three system campaigns run in PARALLEL on
+the 4 GPUs. The extension later adopted strict serialism for measurement
+isolation (a workload DoE cannot tolerate co-tenant load that varies per
+cell), which changes the wall-clock arithmetic: 57 x 48h = ~17 weeks vs
+57 x 36h = ~13 weeks, both plus ~4 days of overheads (bring-up/teardown/
+cooldown ~1h per run; per-cell calibrations ~40 min each) and a ~10% retry
+margin (grounded in the observed SUT pathology rate, e.g. the NIXL
+KV-transfer stall of 2026-07-06). The host window is 20 weeks. At 48h the
+post-screening phase (finer DoE on the dominant factors + 7-day
+confirmations) would be squeezed into ~3 weeks; at 36h it gets ~7.
+
+Why 36h is right on the merits, not only the calendar:
+1. Direct comparability with the n=3 baseline campaign (36h windows): every
+   DoW slope is one-to-one comparable with the submitted paper's numbers,
+   with no window-length confound between the two studies.
+2. The statistical pipeline (MK + BH-FDR, the 5-class stepness panel,
+   validator defaults) was built and validated on 36h series on this exact
+   hardware; stepness counts discrete step events and was unambiguous at
+   36h in the baseline, while 24h would leave slow steppers at 4-5 events
+   and borderline classifications.
+3. The marginal value of 48h over 36h is small for a SCREENING: the 48h
+   long test gave slope CIs of +/-6% while baseline factor effects span
+   orders of magnitude; late-onset coverage is delegated by design to the
+   7-day confirmation runs.
+
+Mission timeline within the 20-week window (strictly serial):
+  wk 1        per-cell calibrations (provenance + max-age gates enforced in
+              code), DoW campaign yaml dry-run, buffer.
+  wk 2-14     screening: 57 runs (54 x 36h + 3 Dynamo center points x 48h),
+              fixed-seed interleaved order across systems (see the cell
+              generation task), inter-run cooldown, ~10% retry margin.
+  wk 14-18    finer characterization on the 2-3 dominant factors + 2 x
+              7-day confirmation runs on the worst stressor.
+  wk 19-20    contingency + on-box analysis.
 
 NEXT (CONFIRMED 2026-06-29): STEP 1 = Dynamo bring-up (aggregated +
 disaggregated) + MONITORING decision (map component PIDs: router / prefill /

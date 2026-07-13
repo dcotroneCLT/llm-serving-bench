@@ -302,6 +302,17 @@ class CampaignLoads(unittest.TestCase):
             files.append(s.calibration_file)
         self.assertEqual(len(files), len(set(files)), "calibration files must be per-cell")
 
+    def test_disk_floors_are_explicit_for_unattended_runs(self):
+        # A 57-run unattended campaign must not rely on the code default inode
+        # floor; the descriptor declares all three disk floors explicitly and
+        # keeps the inode floor in sync with the validation campaign.
+        val = camp.load_campaign(EXT / "campaign.yaml")
+        self.assertEqual(self.campaign["min_free_gb"], 50)
+        self.assertEqual(self.campaign["min_free_gb_mid_run"], 25)
+        self.assertIn("min_inodes_free_mid_run", self.campaign)
+        self.assertEqual(self.campaign["min_inodes_free_mid_run"],
+                         val["min_inodes_free_mid_run"])
+
     def test_dynamo_center_points_are_the_only_48h_runs_in_schedule(self):
         sched = camp.build_schedule(self.campaign, self.yaml_path)
         long_runs = [s.cell_id for s in sched if s.duration_s == gen.DUR_48H]

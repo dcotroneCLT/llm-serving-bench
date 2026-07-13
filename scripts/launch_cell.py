@@ -993,6 +993,54 @@ def check_calibration_provenance(calib: dict, current_sig: dict,
             + "; ".join(mism) + "); re-calibrate on this host/image.")
 
 
+def check_calibration_binding(calib: dict, expected_cell_id: Optional[str],
+                              expected_fraction: Optional[float]) -> None:
+    """Refuse a calibration that is not THIS cell's, at THIS cell's fraction.
+
+    The calibrated rate = fraction x ceiling, and the ceiling depends on the
+    workload SHAPE. A file calibrated for a different cell, or at a different
+    fraction, would silently apply the wrong rate and invalidate Factor A (rate)
+    of the DoW -- a run that "passes" but measures the wrong operating point.
+    calibrate_rate.py records cell_id and fraction, so we bind against them.
+
+    When the cell declares a calibration_fraction (a shape-specific DoW cell), the
+    binding is HARD: the calibration MUST identify itself (cell_id + fraction
+    present) and match. When no fraction is declared (e.g. the validation/longtest
+    cells that pin a single fixed calibration), we still reject an obvious
+    wrong-cell file if both sides label a cell, but tolerate an unlabeled one."""
+    rec_cell = calib.get("cell_id")
+    rec_frac = calib.get("fraction")
+    if expected_fraction is not None:
+        if rec_cell is None:
+            raise CalibrationError(
+                "calibration file has no cell_id: cannot confirm it belongs to "
+                f"cell {expected_cell_id!r} (re-run calibrate_rate.py --cell-id).")
+        if expected_cell_id is not None and str(rec_cell) != str(expected_cell_id):
+            raise CalibrationError(
+                f"calibration is for cell {rec_cell!r}, not {expected_cell_id!r} "
+                "(wrong calibration file for this cell).")
+        if rec_frac is None:
+            raise CalibrationError(
+                "calibration file has no fraction: cannot confirm Factor A level "
+                f"{expected_fraction} for {expected_cell_id!r}.")
+        try:
+            if abs(float(rec_frac) - float(expected_fraction)) > 1e-9:
+                raise CalibrationError(
+                    f"calibration fraction={rec_frac} != cell fraction "
+                    f"{expected_fraction} for {expected_cell_id!r}: Factor A (rate) "
+                    "would be wrong. Calibrate this cell at its own fraction.")
+        except (TypeError, ValueError):
+            raise CalibrationError(
+                f"calibration fraction is not numeric ({rec_frac!r}); cannot verify "
+                "Factor A. Re-run calibrate_rate.py.")
+        return
+    # No declared fraction: catch a mislabeled wrong-cell file, tolerate absence.
+    if expected_cell_id is not None and rec_cell is not None and str(rec_cell) != str(expected_cell_id):
+        raise CalibrationError(
+            f"calibration is for cell {rec_cell!r}, not {expected_cell_id!r} "
+            "(wrong calibration file for this cell).")
+
+
 def resolve_calibrated_rate(calib: dict, allow_lower_bound: bool) -> float:
     """Return the calibrated rate to apply, or raise CalibrationError.
 
@@ -2131,6 +2179,16 @@ def main() -> None:
                 calib, current_sig, args.calibration_max_age_days, time.time())
         except CalibrationError as e:
             die(f"calibration provenance gate: {e} (file: {args.calibration_file})", rc=6)
+        # Bind the calibration to THIS cell + fraction (Factor A integrity). A
+        # wrong-cell / wrong-fraction file is a non-retryable precondition (rc=6):
+        # applying its rate would silently measure the wrong operating point.
+        # calibration_fraction is the cell's declared Factor-A level (metadata,
+        # not otherwise consumed); absent for non-DoW cells -> lenient binding.
+        try:
+            check_calibration_binding(
+                calib, cell.get("cell_id"), cell.get("calibration_fraction"))
+        except CalibrationError as e:
+            die(f"calibration binding gate: {e} (file: {args.calibration_file})", rc=6)
         try:
             rate_cal = resolve_calibrated_rate(calib, args.allow_lower_bound_calibration)
         except CalibrationError as e:

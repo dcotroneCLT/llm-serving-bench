@@ -18,10 +18,14 @@ replication baseline:
 
 - Model: `Qwen/Qwen2.5-7B-Instruct`, BF16.
 - Serving systems compared: Dynamo-disagg, Triton+vLLM, vLLM-standalone.
-- Full campaign: ~57 runs of 48h each; the descriptor currently ships three
-  STEP-1 validation cells (one per serving system) so the serial path can be
-  exercised end-to-end before the 48h DoW cells and per-cell calibration are
-  appended.
+- Full screening campaign: 57 runs (54 x 36h + 3 Dynamo center points x 48h;
+  window amended 2026-07-10), a Resolution V `2^(5-1)` workload DoW replicated on
+  the three systems. It has its OWN descriptor
+  `campaigns/extension/dow_campaign.yaml`, GENERATED from the design matrix in
+  `scripts/generate_dow_cells.py` (see "DoW screening campaign" in
+  `deploy/dynamo/README.md`). The separate `campaigns/extension/campaign.yaml`
+  ships the three STEP-1 validation cells (one per serving system) that exercise
+  the serial path end-to-end before the DoW runs and per-cell calibration.
 - Warmup discard: first 1h excluded from slope and figure normalization.
 - Topology: **one serial queue**, no parallel GPU slots — the
   measurement-isolation constraint forbids concurrency (the dynamo_disagg

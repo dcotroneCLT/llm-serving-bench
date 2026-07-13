@@ -328,9 +328,13 @@ Single-container cells (standalone vLLM, Triton) are unaffected: their
 
 ## Driving the whole extension campaign: `scripts/campaign.py` (strictly serial)
 
-The extension campaign is ~57 runs of 48h each and is **strictly serial by
-design** — measurement isolation demands one run at a time, and the
-`dynamo_disagg` cells occupy both GPUs anyway. `scripts/campaign.py` dispatches
+The extension screening campaign is 57 runs (54 x 36h + 3 Dynamo center points
+x 48h; window amended 2026-07-10) and is **strictly serial by design** —
+measurement isolation demands one run at a time, and the `dynamo_disagg` cells
+occupy both GPUs anyway. Its descriptor is
+`campaigns/extension/dow_campaign.yaml` (generated; see "DoW screening campaign"
+below); `campaigns/extension/campaign.yaml` is the small validation campaign
+(the three STEP-1 cells), not the screening run. `scripts/campaign.py` dispatches
 **one global ordered queue** of `(cell, replica)` runs, one `launch_cell.py`
 subprocess at a time (the production path above), each waited to full
 completion (teardown + VRAM quiescence happen *inside* `launch_cell`) plus a
@@ -340,20 +344,25 @@ parallelism (a `slots:` key, or `mode:` other than `serial`) is rejected at
 load time. (The retired n=3 parallel scheduler lives in this file's git
 history, not its runtime.)
 
+These examples use `<campaign.yaml>` as a placeholder: substitute
+`campaigns/extension/dow_campaign.yaml` for the 57-run screening campaign, or
+`campaigns/extension/campaign.yaml` for the three-cell validation campaign. The
+two have distinct `state_file`s, so they never collide.
+
 ```bash
 # Pre-flight only: full schedule in order, per-cell calibration status,
 # estimated wallclock, and the free-space gate — then exit.
-python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --dry-run
+python3 scripts/campaign.py --campaign-yaml <campaign.yaml> --dry-run
 
 # Start fresh (wipes the state file) — run it inside tmux; it also tees all
 # output to campaigns/extension/state/logs/campaign_<ts>.log (stdout dies with
 # the terminal, and the run must survive tmux loss):
 tmux new -d -s ext_campaign \
-  'python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --start'
+  'python3 scripts/campaign.py --campaign-yaml <campaign.yaml> --start'
 
 # Stop and pick up across days: --resume skips completed runs and re-queues
 # interrupted/failed ones under the retry policy.
-python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --resume
+python3 scripts/campaign.py --campaign-yaml <campaign.yaml> --resume
 ```
 
 The campaign yaml schema is documented in `campaigns/extension/campaign.yaml`

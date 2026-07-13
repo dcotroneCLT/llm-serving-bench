@@ -392,6 +392,10 @@ class RunSpec:
     calibration_file: Optional[str] = None      # absolute path or None
     calibration_required: bool = False
     allow_lower_bound_calibration: bool = False
+    # The cell's declared Factor-A level (fraction-of-ceiling), from the cell
+    # yaml's top-level calibration_fraction. When set, the calibration file MUST
+    # be for THIS cell at THIS fraction (bound in validate_calibration + launch_cell).
+    calibration_fraction: Optional[float] = None
 
     @property
     def run_key(self) -> str:
@@ -521,6 +525,7 @@ def build_schedule(campaign: dict, campaign_path: Path) -> list[RunSpec]:
 
         calib_file = entry.get("calibration_file")
         calib_abs = str((yaml_dir / calib_file).resolve()) if calib_file else None
+        calib_fraction = cell_doc.get("calibration_fraction")
         cells.append(
             {
                 "cell_id": cell_id,
@@ -530,6 +535,9 @@ def build_schedule(campaign: dict, campaign_path: Path) -> list[RunSpec]:
                 "calibration_required": bool(entry.get("calibration_required", False)),
                 "allow_lower_bound_calibration": bool(
                     entry.get("allow_lower_bound_calibration", global_allow_lb)
+                ),
+                "calibration_fraction": (
+                    float(calib_fraction) if calib_fraction is not None else None
                 ),
             }
         )
@@ -548,6 +556,7 @@ def build_schedule(campaign: dict, campaign_path: Path) -> list[RunSpec]:
             calibration_file=cell["calibration_file"],
             calibration_required=cell["calibration_required"],
             allow_lower_bound_calibration=cell["allow_lower_bound_calibration"],
+            calibration_fraction=cell["calibration_fraction"],
         )
 
     schedule: list[RunSpec] = []
@@ -585,6 +594,14 @@ def validate_calibration(spec: RunSpec) -> tuple[bool, str]:
         rate = launch_cell.resolve_calibrated_rate(
             calib, spec.allow_lower_bound_calibration
         )
+    except launch_cell.CalibrationError as e:
+        return False, f"REJECTED: {e}"
+    # Bind the file to THIS cell + fraction (Factor A integrity), the same gate
+    # launch_cell enforces at dispatch. Caught at pre-flight so a wrong-cell or
+    # wrong-fraction calibration fails before run 1, not at hour 37.
+    try:
+        launch_cell.check_calibration_binding(
+            calib, spec.cell_id, spec.calibration_fraction)
     except launch_cell.CalibrationError as e:
         return False, f"REJECTED: {e}"
     status = calib.get("status")

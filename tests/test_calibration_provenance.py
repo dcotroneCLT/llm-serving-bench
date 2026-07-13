@@ -139,6 +139,60 @@ class CheckCalibrationProvenance(unittest.TestCase):
         lc.check_calibration_provenance(_calib(now=now - 999 * 86400), self._sig(), None, now)
 
 
+class CheckCalibrationBinding(unittest.TestCase):
+    """A calibration must be for THIS cell at THIS fraction, else Factor A (rate)
+    of the DoW is silently wrong."""
+
+    def _calib(self, cell_id="dow_vllm_p01", fraction=0.30):
+        c = {"status": "ok", "rate_calibrated_rps": 3.0}
+        if cell_id is not None:
+            c["cell_id"] = cell_id
+        if fraction is not None:
+            c["fraction"] = fraction
+        return c
+
+    def test_matching_cell_and_fraction_passes(self):
+        lc.check_calibration_binding(self._calib(), "dow_vllm_p01", 0.30)
+
+    def test_wrong_cell_refused(self):
+        with self.assertRaises(lc.CalibrationError) as ctx:
+            lc.check_calibration_binding(self._calib(cell_id="dow_vllm_p02"),
+                                         "dow_vllm_p01", 0.30)
+        self.assertIn("cell", str(ctx.exception))
+
+    def test_wrong_fraction_refused(self):
+        # The 0.85 file used on a 0.30 cell -- the exact review scenario.
+        with self.assertRaises(lc.CalibrationError) as ctx:
+            lc.check_calibration_binding(self._calib(fraction=0.85),
+                                         "dow_vllm_p01", 0.30)
+        self.assertIn("fraction", str(ctx.exception))
+
+    def test_missing_cell_id_when_fraction_expected_refused(self):
+        with self.assertRaises(lc.CalibrationError):
+            lc.check_calibration_binding(self._calib(cell_id=None),
+                                         "dow_vllm_p01", 0.30)
+
+    def test_missing_fraction_when_expected_refused(self):
+        with self.assertRaises(lc.CalibrationError):
+            lc.check_calibration_binding(self._calib(fraction=None),
+                                         "dow_vllm_p01", 0.30)
+
+    def test_non_numeric_fraction_refused(self):
+        with self.assertRaises(lc.CalibrationError):
+            lc.check_calibration_binding(self._calib(fraction="bad"),
+                                         "dow_vllm_p01", 0.30)
+
+    def test_no_expected_fraction_is_lenient_but_catches_wrong_cell(self):
+        # A non-DoW cell (no declared fraction): an unlabeled calibration is
+        # tolerated, but a file that names a DIFFERENT cell is still refused.
+        lc.check_calibration_binding({"status": "ok"}, "val_vllm", None)  # no raise
+        lc.check_calibration_binding(self._calib(cell_id="val_vllm", fraction=None),
+                                     "val_vllm", None)  # matches -> no raise
+        with self.assertRaises(lc.CalibrationError):
+            lc.check_calibration_binding(self._calib(cell_id="other", fraction=None),
+                                         "val_vllm", None)
+
+
 class CalibrationAgeDays(unittest.TestCase):
     def test_age(self):
         now = 1_700_000_000.0
@@ -171,12 +225,13 @@ def _make_campaign(tmp, spec, **overrides):
     return c
 
 
-def _spec(tmp, calib_obj):
+def _spec(tmp, calib_obj, calibration_fraction=None):
     p = Path(tmp) / "calib.json"
     p.write_text(json.dumps(calib_obj))
     return camp.RunSpec(cell_id="a", cell_yaml=str(Path(tmp) / "nope.yaml"),
                         replica=1, duration_s=100, calibration_file=str(p),
-                        calibration_required=True)
+                        calibration_required=True,
+                        calibration_fraction=calibration_fraction)
 
 
 class CampaignProvenanceGate(unittest.TestCase):
@@ -212,6 +267,37 @@ class CampaignProvenanceGate(unittest.TestCase):
                 c._run_with_retry(spec)
             self.assertEqual(ctx.exception.rc, camp.LC_PRECONDITION)
             self.assertEqual(c.state.runs["a_r01"].status, "precondition_failed")
+
+    def test_preflight_rejects_wrong_fraction_calibration(self):
+        # A cell declaring fraction 0.30 must reject a file calibrated at 0.85
+        # (the review's Factor-A-invalidation scenario) BEFORE run 1.
+        with tempfile.TemporaryDirectory() as tmp:
+            calib = _calib()
+            calib["cell_id"] = "a"
+            calib["fraction"] = 0.85
+            spec = _spec(tmp, calib, calibration_fraction=0.30)
+            ok, msg = camp.validate_calibration(spec)
+            self.assertFalse(ok)
+            self.assertIn("fraction", msg)
+
+    def test_preflight_rejects_wrong_cell_calibration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calib = _calib()
+            calib["cell_id"] = "some_other_cell"
+            calib["fraction"] = 0.30
+            spec = _spec(tmp, calib, calibration_fraction=0.30)
+            ok, msg = camp.validate_calibration(spec)
+            self.assertFalse(ok)
+            self.assertIn("cell", msg)
+
+    def test_preflight_accepts_matching_cell_and_fraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calib = _calib()
+            calib["cell_id"] = "a"
+            calib["fraction"] = 0.30
+            spec = _spec(tmp, calib, calibration_fraction=0.30)
+            ok, _ = camp.validate_calibration(spec)
+            self.assertTrue(ok)
 
     def test_build_cmd_passes_max_age(self):
         with tempfile.TemporaryDirectory() as tmp:
