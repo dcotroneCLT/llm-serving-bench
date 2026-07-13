@@ -205,6 +205,9 @@ class OrchestrationFlow(unittest.TestCase):
             logf=io.StringIO())
         o._specs = specs
         o._now = lambda: 0.0
+        # Hermetic: no real signal handlers, no real host preconditions.
+        o._install_signals = False
+        o._preflight_fn = lambda: None
         return o
 
     def _instrument(self, o, statuses, sweep_result):
@@ -311,6 +314,74 @@ class OrchestrationFlow(unittest.TestCase):
         rc = o.run()
         self.assertEqual(rc, cdow.EXIT_BRINGUP)
         self.assertEqual(calls["sweep"], [])   # aborted before any sweep
+
+    def test_preflight_abort_refuses_before_bringup(self):
+        # A residual active run / unkillable orphan must refuse the whole thing
+        # BEFORE any engine is brought up (finding: reap must run under the lock).
+        specs = [_spec("dow_vllm_cp1")]
+        o = self._orch(specs)
+        calls = self._instrument(o, lambda s: (False, "missing"),
+                                 lambda spec, grid: self.fail("must not sweep"))
+
+        def refuse():
+            raise cdow.PreflightAbort(cdow.EXIT_PRECONDITION, "prior run still active")
+        o._preflight_fn = refuse
+        rc = o.run()
+        self.assertEqual(rc, cdow.EXIT_PRECONDITION)
+        self.assertEqual(calls["bringup"], [])
+
+    def test_signal_tears_down_active_engine_and_releases_lock(self):
+        # A kill mid-run must teardown the live engine, run the abort-cleanup
+        # backstop, close the slot, and exit -- not leave containers alive.
+        specs = [_spec("dow_vllm_cp1")]
+        o = self._orch(specs)
+        torn, cleaned, closed = [], [], []
+        o._teardown_fn = lambda eng: torn.append(eng.system)
+        o._abort_cleanup = lambda: cleaned.append(True)
+        o._slot = types.SimpleNamespace(close=lambda: closed.append(True))
+        o._active_engine = types.SimpleNamespace(system="vllm")
+        with self.assertRaises(SystemExit) as ctx:
+            o._handle_signal(15, None)
+        self.assertEqual(ctx.exception.code, cdow.EXIT_INTERRUPTED)
+        self.assertEqual(torn, ["vllm"])
+        self.assertEqual(cleaned, [True])   # backstop ran (covers partial bring-up)
+        self.assertEqual(closed, [True])    # lock released
+
+
+class PublishCalibration(unittest.TestCase):
+    """Atomic publish / stale invalidation -- a crashed sweep must never leave a
+    prior ok JSON masquerading as this sweep's success."""
+
+    def test_fresh_result_is_published_over_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cal.json"
+            out.write_text(json.dumps({"status": "ok", "rate_calibrated_rps": 1.0}))
+            tmp_out = out.with_name(out.name + ".tmp")
+            tmp_out.write_text(json.dumps({"status": "ok", "rate_calibrated_rps": 9.9}))
+            res = cdow.publish_calibration(tmp_out, out)
+            self.assertEqual(res["rate_calibrated_rps"], 9.9)
+            self.assertFalse(tmp_out.exists())                       # consumed
+            self.assertEqual(json.loads(out.read_text())["rate_calibrated_rps"], 9.9)
+
+    def test_no_new_output_invalidates_stale_final(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cal.json"
+            out.write_text(json.dumps({"status": "ok", "rate_calibrated_rps": 1.0}))
+            tmp_out = out.with_name(out.name + ".tmp")   # not written (crash)
+            res = cdow.publish_calibration(tmp_out, out)
+            self.assertIsNone(res)
+            self.assertFalse(out.exists())   # stale ok removed -> reads as MISSING
+
+    def test_corrupt_temp_is_discarded_and_stale_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cal.json"
+            out.write_text(json.dumps({"status": "ok"}))
+            tmp_out = out.with_name(out.name + ".tmp")
+            tmp_out.write_text("{ not json")
+            res = cdow.publish_calibration(tmp_out, out)
+            self.assertIsNone(res)
+            self.assertFalse(tmp_out.exists())
+            self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":

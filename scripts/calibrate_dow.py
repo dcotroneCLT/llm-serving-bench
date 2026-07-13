@@ -55,6 +55,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -103,7 +104,12 @@ _FALLBACK_GRID = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
 EXIT_OK = 0
 EXIT_SOME_FAILED = 1
 EXIT_BRINGUP = 2
+# Host-precondition codes mirror launch_cell's where they overlap: 7 = free-space
+# gate, 8 = residual active run / unkillable orphan, 9 = run-slot lock held.
+EXIT_DISK = 7
+EXIT_PRECONDITION = 8
 EXIT_LOCK_HELD = 9
+EXIT_INTERRUPTED = 130
 
 
 def system_of(cell_id: str) -> str:
@@ -186,6 +192,43 @@ def calibration_is_valid(calib_path, cell_id: str, fraction: Optional[float],
     return True, f"ok (status={calib.get('status')}, rate={calib.get('rate_calibrated_rps')})"
 
 
+def publish_calibration(tmp_out: Path, out_path: Path) -> Optional[dict]:
+    """Atomically publish a freshly-written calibration, or invalidate a stale one.
+
+    calibrate_rate.py writes to a per-sweep TEMP path; only a parseable temp file
+    is os.replace()'d onto the cell's real calibration_file. If the sweep wrote
+    nothing (crash, StaleSweepDir, docker failure) or a corrupt file, we remove
+    BOTH the partial temp and any prior out_path -- so a stale ok JSON from an
+    earlier run can never be mistaken for this (e.g. --recalibrate) sweep's
+    success. Returns the parsed result dict on publish, else None. Temp and final
+    live in the same directory so the replace is atomic on one filesystem."""
+    res = None
+    if tmp_out.exists():
+        try:
+            res = json.loads(tmp_out.read_text())
+        except (OSError, json.JSONDecodeError):
+            res = None
+    if res is not None:
+        os.replace(str(tmp_out), str(out_path))
+        return res
+    for p in (tmp_out, out_path):
+        try:
+            if p.exists():
+                p.unlink()
+        except OSError:
+            pass
+    return None
+
+
+class PreflightAbort(RuntimeError):
+    """A host precondition (residual active run / unkillable orphan) refuses the
+    orchestration. Carries the process exit code to return."""
+
+    def __init__(self, rc: int, msg: str) -> None:
+        super().__init__(msg)
+        self.rc = rc
+
+
 class BringUpFailed(RuntimeError):
     """Engine bring-up for a system exhausted its retries (host precondition)."""
 
@@ -213,7 +256,7 @@ class Orchestrator:
                  hf_cache_host: Path, max_age_days: float, window_s: int,
                  cooldown_s: int, bringup_retries: int, recalibrate: set[str],
                  grid_map: dict, env_rates: Optional[list[float]],
-                 logf=None) -> None:
+                 min_free_gb: float = 20.0, logf=None) -> None:
         self.campaign_yaml = Path(campaign_yaml)
         self.runs_root = Path(runs_root)
         self.repo_root = Path(repo_root)
@@ -225,6 +268,7 @@ class Orchestrator:
         self.recalibrate = recalibrate
         self.grid_map = grid_map or {}
         self.env_rates = env_rates
+        self.min_free_gb = float(min_free_gb)
         self._logf = logf
 
         # The args namespace launch_cell's lifecycle classes read from. Only a
@@ -242,13 +286,25 @@ class Orchestrator:
             duration_s_override=None,
         )
 
+        # Runtime state for signal-safe teardown: the slot handle and the engine
+        # currently up (bring-up arms launch_cell's abort-cleanup for the engine's
+        # containers, so cleanup_after_abort() covers a partial bring-up too).
+        self._slot = None
+        self._active_engine: Optional[Engine] = None
+        self._aborting = False
+        self._prev_handlers: dict = {}
+        self._install_signals = True
+
         # Injection seams.
         self._acquire_slot = reaper.acquire_run_slot
+        self._preflight_fn = self._real_preflight
         self._bring_up_fn = self._real_bring_up
         self._sweep_fn = self._real_sweep
         self._teardown_fn = self._real_teardown
         self._status_fn = self._real_status
         self._dry_run_fn = self._real_dry_run
+        self._abort_cleanup = launch_cell.cleanup_after_abort
+        self._invoke_calibrate = self._real_invoke_calibrate
         self._now = time.time
         self._specs = None  # tests may inject a synthetic schedule
 
@@ -403,6 +459,11 @@ class Orchestrator:
             self.repo_root, sweep_root, cell, 1)
         out_path = Path(spec.calibration_file)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        # calibrate_rate writes to a TEMP path next to the final file; only a
+        # parseable temp is atomically published (publish_calibration). This is
+        # what stops a stale ok JSON (e.g. under --recalibrate) from surviving a
+        # sweep that crashed before rewriting and passing as a false success.
+        tmp_out = out_path.with_name(out_path.name + ".tmp")
 
         fraction = spec.calibration_fraction if spec.calibration_fraction is not None else 0.85
         if spec.calibration_fraction is None:
@@ -424,19 +485,12 @@ class Orchestrator:
             "--system", engine.system,
             "--image-tag", engine.image_full,
             "--image-digest", engine.image_digest,
-            "--output", str(out_path),
+            "--output", str(tmp_out),
             "--sweep-dir", str(sweep_root / "sweep"),
         ]
-        proc = subprocess.run(cmd, capture_output=False)
-        rc = proc.returncode
-
-        res = {}
-        if out_path.exists():
-            try:
-                res = json.loads(out_path.read_text())
-            except (OSError, json.JSONDecodeError):
-                res = {}
-        status = res.get("status") or ("no_output" if rc != 0 else "unknown")
+        rc = self._invoke_calibrate(cmd, tmp_out)
+        res = publish_calibration(tmp_out, out_path) or {}
+        status = res.get("status") or "no_output"
         result = {
             "status": status,
             "ceiling_rps": res.get("ceiling_rps"),
@@ -448,6 +502,10 @@ class Orchestrator:
         if status != "ok":
             result["suggested_grid"] = suggest_next_grid(status, grid)
         return result
+
+    @staticmethod
+    def _real_invoke_calibrate(cmd: list[str], _tmp_out: Path) -> int:
+        return subprocess.run(cmd, capture_output=False).returncode
 
     # -- verdict ------------------------------------------------------------
 
@@ -487,13 +545,98 @@ class Orchestrator:
             self.log(f"another launcher holds the run-slot lock on {self.runs_root}; "
                      "the host is strictly serial -- refusing to start.")
             return EXIT_LOCK_HELD
+        self._slot = slot
+        self._install_signal_handlers()
         try:
+            # Under the held slot, run the SAME host preconditions launch_cell runs:
+            # the free-space gate and the pre-run orphan reap (a stray run_client
+            # from a prior crash could load the calibration endpoint and skew the
+            # ceiling). A residual active run or unkillable orphan aborts here.
+            try:
+                self._preflight_fn()
+            except PreflightAbort as e:
+                self.log(f"FATAL: {e} -- refusing to start.")
+                return e.rc
             return self._run_locked()
         finally:
+            self._restore_signal_handlers()
             try:
                 slot.close()
             except Exception:  # noqa: BLE001
                 pass
+            self._slot = None
+
+    # -- host preconditions + signal-safe teardown --------------------------
+
+    def _real_preflight(self) -> None:
+        # Free-space gate across the runs-root (sweep CSVs) and the docker
+        # data-root (engine images + container logs). die()s (rc=7) if below.
+        docker_root = launch_cell.docker_root_dir()
+        launch_cell.require_free_space(
+            [self.runs_root, docker_root], self.min_free_gb, label="calibrate_dow")
+        # Pre-run orphan reap, valid ONLY because we hold the run-slot lock. No
+        # current_run_id to spare: nothing of ours is running yet at this point.
+        for line in reaper.reap_orphans(self.runs_root, current_run_id=None):
+            self.log(line)
+        stuck = reaper.ledger_run_ids(self.runs_root)
+        if stuck:
+            raise PreflightAbort(
+                EXIT_PRECONDITION,
+                f"prior run(s) {stuck} are still active (launcher alive) or have an "
+                f"unkillable orphan -- calibrating over a live run would skew ceilings")
+        hw_lines, hw_unkillable = reaper.reap_host_wide(self.runs_root, current_run_id=None)
+        for line in hw_lines:
+            self.log(line)
+        if hw_unkillable:
+            raise PreflightAbort(
+                EXIT_PRECONDITION,
+                f"host-wide reaper could not kill orphan process(es) {hw_unkillable} "
+                f"referencing {self.runs_root}")
+
+    def _install_signal_handlers(self) -> None:
+        """Route SIGTERM/SIGINT/SIGHUP through the SAME abort-cleanup path
+        launch_cell uses: tear the active engine down (bring-up armed
+        cleanup_after_abort for its containers, so a partial bring-up is covered
+        too) and release the lock before exiting, instead of leaving containers
+        alive on a kill / dropped SSH session."""
+        if not self._install_signals:
+            return
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try:
+                self._prev_handlers[sig] = signal.signal(sig, self._handle_signal)
+            except (ValueError, OSError):  # not main thread / unsupported
+                pass
+
+    def _restore_signal_handlers(self) -> None:
+        for sig, prev in self._prev_handlers.items():
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError):
+                pass
+        self._prev_handlers = {}
+
+    def _handle_signal(self, signum, _frame) -> None:
+        if self._aborting:
+            return
+        self._aborting = True
+        self.log(f"received signal {signum}: tearing down and releasing the run-slot lock")
+        if self._active_engine is not None:
+            try:
+                self._teardown_fn(self._active_engine)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"teardown during abort raised {e!r}")
+        # Backstop for a partial bring-up (no Engine yet): remove the containers
+        # bring-up armed via launch_cell.enable_abort_cleanup.
+        try:
+            self._abort_cleanup()
+        except Exception:  # noqa: BLE001
+            pass
+        if self._slot is not None:
+            try:
+                self._slot.close()
+            except Exception:  # noqa: BLE001
+                pass
+        sys.exit(EXIT_INTERRUPTED)
 
     def _run_locked(self) -> int:
         groups = self.plan_groups()
@@ -529,6 +672,7 @@ class Orchestrator:
             except BringUpFailed as e:
                 self.log(f"FATAL: {e} -- host precondition, aborting orchestration.")
                 return EXIT_BRINGUP
+            self._active_engine = engine
 
             try:
                 for spec in todo:
@@ -550,6 +694,7 @@ class Orchestrator:
                              f"({durations[-1] / 60:.1f} min){extra}")
             finally:
                 self._teardown_fn(engine)
+                self._active_engine = None
 
         return self._finish(results)
 
@@ -640,6 +785,8 @@ def build_orchestrator(args) -> Orchestrator:
                  else yaml_dir.parent.parent)
     max_age_days = float(campaign.get("calibration_max_age_days",
                                       launch_cell.DEFAULT_CALIBRATION_MAX_AGE_DAYS))
+    # Same pre-run free-space floor the runs use (dow_campaign.yaml: 50 GB).
+    min_free_gb = float(campaign.get("min_free_gb", 20.0))
 
     logf = None
     if not args.no_log_file:
@@ -664,6 +811,7 @@ def build_orchestrator(args) -> Orchestrator:
         recalibrate=recal,
         grid_map=_load_grid_map(args.rate_grids),
         env_rates=_env_rates(),
+        min_free_gb=min_free_gb,
         logf=logf,
     )
 
