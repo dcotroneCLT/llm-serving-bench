@@ -642,6 +642,14 @@ class Campaign:
         self.calibration_max_age_days = float(
             campaign.get("calibration_max_age_days",
                          launch_cell.DEFAULT_CALIBRATION_MAX_AGE_DAYS))
+        # Optional HARD floor on the calibration measurement method: a campaign
+        # that must not run on a superseded method (e.g. the v1 finite-window
+        # ceilings this campaign re-takes as v2) sets calibration_min_method_version
+        # and any older calibration is refused at pre-flight AND dispatch. Absent
+        # -> no method gate (back-compat).
+        _min_mv = campaign.get("calibration_min_method_version")
+        self.calibration_min_method_version = (
+            int(_min_mv) if _min_mv is not None else None)
         self.inter_run_cooldown_s = int(campaign.get("inter_run_cooldown_s", 0))
         self.est_run_overhead_s = int(campaign.get("est_run_overhead_s", 0))
         self.min_free_gb = float(campaign.get("min_free_gb", 20.0))
@@ -806,6 +814,9 @@ class Campaign:
         if spec.calibration_file:
             cmd += ["--calibration-file", spec.calibration_file,
                     "--calibration-max-age-days", str(self.calibration_max_age_days)]
+            if self.calibration_min_method_version is not None:
+                cmd += ["--calibration-min-method-version",
+                        str(self.calibration_min_method_version)]
         if spec.allow_lower_bound_calibration:
             cmd += ["--allow-lower-bound-calibration"]
         return cmd
@@ -1053,7 +1064,9 @@ class Campaign:
         current_sig = self._current_calibration_signature(spec)
         try:
             launch_cell.check_calibration_provenance(
-                calib, current_sig, self.calibration_max_age_days, now_unix)
+                calib, current_sig, self.calibration_max_age_days, now_unix,
+                warn_method_version=launch_cell.EXPECTED_CALIBRATION_METHOD_VERSION,
+                min_method_version=self.calibration_min_method_version)
         except launch_cell.CalibrationError as e:
             return False, f"STALE/MISMATCH: {e}"
         age = launch_cell.calibration_age_days(calib, now_unix)

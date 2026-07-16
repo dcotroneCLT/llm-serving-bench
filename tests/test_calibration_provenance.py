@@ -138,6 +138,68 @@ class CheckCalibrationProvenance(unittest.TestCase):
         now = time.time()
         lc.check_calibration_provenance(_calib(now=now - 999 * 86400), self._sig(), None, now)
 
+    def test_method_version_mismatch_warns_but_does_not_refuse(self):
+        # An old-method (v1 / unversioned) file is still accepted -- host/image/age
+        # gate it -- but check_calibration_provenance WARNS when asked to, so a
+        # finite-window-biased ceiling is not silently reused after the v2 fix.
+        import io
+        from contextlib import redirect_stderr
+        now = time.time()
+        calib = _calib(now=now)  # no calibration_method_version -> treated as v1
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            lc.check_calibration_provenance(
+                calib, self._sig(), 14, now,
+                warn_method_version=lc.EXPECTED_CALIBRATION_METHOD_VERSION)
+        self.assertIn("calibration_method_version", buf.getvalue())
+
+    def test_method_version_match_is_silent(self):
+        import io
+        from contextlib import redirect_stderr
+        now = time.time()
+        calib = _calib(now=now)
+        calib["calibration_method_version"] = lc.EXPECTED_CALIBRATION_METHOD_VERSION
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            lc.check_calibration_provenance(
+                calib, self._sig(), 14, now,
+                warn_method_version=lc.EXPECTED_CALIBRATION_METHOD_VERSION)
+        self.assertNotIn("WARNING", buf.getvalue())
+
+    def test_no_warn_param_is_backward_compatible(self):
+        # Existing callers pass no warn_method_version -> no version check at all.
+        import io
+        from contextlib import redirect_stderr
+        now = time.time()
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            lc.check_calibration_provenance(_calib(now=now), self._sig(), 14, now)
+        self.assertNotIn("WARNING", buf.getvalue())
+
+    def test_min_method_version_hard_rejects_old(self):
+        # A v1 (unversioned) file is REFUSED when a minimum method version is
+        # required, even if it is fresh and host/image-matching.
+        now = time.time()
+        with self.assertRaises(lc.CalibrationError) as ctx:
+            lc.check_calibration_provenance(
+                _calib(now=now), self._sig(), 14, now, min_method_version=2)
+        self.assertIn("method_version", str(ctx.exception))
+
+    def test_min_method_version_accepts_current(self):
+        now = time.time()
+        calib = _calib(now=now)
+        calib["calibration_method_version"] = 2
+        lc.check_calibration_provenance(
+            calib, self._sig(), 14, now, min_method_version=2)  # no raise
+
+    def test_min_method_version_rejects_unparseable(self):
+        now = time.time()
+        calib = _calib(now=now)
+        calib["calibration_method_version"] = "bad"
+        with self.assertRaises(lc.CalibrationError):
+            lc.check_calibration_provenance(
+                calib, self._sig(), 14, now, min_method_version=2)
+
 
 class CheckCalibrationBinding(unittest.TestCase):
     """A calibration must be for THIS cell at THIS fraction, else Factor A (rate)

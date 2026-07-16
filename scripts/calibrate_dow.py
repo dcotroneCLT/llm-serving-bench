@@ -71,6 +71,7 @@ import yaml
 # the whole point: no second bring-up / provenance / gate path.
 import launch_cell
 import reaper
+import calibrate_rate
 import campaign as camp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -160,15 +161,18 @@ def suggest_next_grid(status: str, grid: list[float]) -> Optional[list[float]]:
 
 def calibration_is_valid(calib_path, cell_id: str, fraction: Optional[float],
                          current_sig: Optional[dict], max_age_days: Optional[float],
-                         now: float) -> tuple[bool, str]:
+                         now: float,
+                         min_method_version: Optional[int] = None) -> tuple[bool, str]:
     """Is an existing calibration JSON good enough to SKIP (re-)calibrating this
     cell? Reuses launch_cell's own gate functions so "valid" means exactly what
     the campaign pre-flight (binding + usable rate) AND the run dispatch
-    (provenance + max-age) will accept -- no reimplementation.
+    (provenance + max-age + method) will accept -- no reimplementation.
 
     current_sig None means the host/image signature could not be built (e.g. the
-    image pin is unreadable); the provenance leg is then skipped and the caller
-    proceeds to calibrate, where the real pin gate will surface any problem."""
+    image pin is unreadable); the SIGNATURE leg is then skipped and the caller
+    proceeds to calibrate, where the real pin gate will surface any problem. The
+    method-version gate does not need the signature, so it is enforced regardless
+    -- a v1 file must be re-taken as v2 even on a host whose pin is unreadable."""
     p = Path(calib_path)
     if not p.exists():
         return False, "missing"
@@ -184,15 +188,27 @@ def calibration_is_valid(calib_path, cell_id: str, fraction: Optional[float],
         launch_cell.check_calibration_binding(calib, cell_id, fraction)
     except launch_cell.CalibrationError as e:
         return False, f"binding: {e}"
+    # Method gate first, independent of the host/image signature: a superseded
+    # (e.g. v1 finite-window) ceiling must be re-taken even when current_sig is
+    # None. Pass an empty signature so only the age+method legs run here.
+    if min_method_version is not None:
+        try:
+            launch_cell.check_calibration_provenance(
+                calib, {}, None, now, min_method_version=min_method_version)
+        except launch_cell.CalibrationError as e:
+            return False, f"method: {e}"
     if current_sig is not None:
         try:
-            launch_cell.check_calibration_provenance(calib, current_sig, max_age_days, now)
+            launch_cell.check_calibration_provenance(
+                calib, current_sig, max_age_days, now,
+                min_method_version=min_method_version)
         except launch_cell.CalibrationError as e:
             return False, f"provenance: {e}"
     return True, f"ok (status={calib.get('status')}, rate={calib.get('rate_calibrated_rps')})"
 
 
-def publish_calibration(tmp_out: Path, out_path: Path) -> Optional[dict]:
+def publish_calibration(tmp_out: Path, out_path: Path,
+                        rc: Optional[int] = None) -> Optional[dict]:
     """Atomically publish a freshly-written calibration, or invalidate a stale one.
 
     calibrate_rate.py writes to a per-sweep TEMP path; only a parseable temp file
@@ -201,13 +217,23 @@ def publish_calibration(tmp_out: Path, out_path: Path) -> Optional[dict]:
     BOTH the partial temp and any prior out_path -- so a stale ok JSON from an
     earlier run can never be mistaken for this (e.g. --recalibrate) sweep's
     success. Returns the parsed result dict on publish, else None. Temp and final
-    live in the same directory so the replace is atomic on one filesystem."""
+    live in the same directory so the replace is atomic on one filesystem.
+
+    When rc is given, it must be CONSISTENT with the temp file's own verdict:
+    calibrate_rate maps status -> exit code (exit_code_for_status), so a parseable
+    temp whose rc does not match its status (e.g. an 'ok' JSON left behind by a
+    process that was then SIGKILLed, rc=-9) is treated as a crashed sweep and
+    purged -- an abnormal exit must never be published as a success."""
     res = None
     if tmp_out.exists():
         try:
             res = json.loads(tmp_out.read_text())
         except (OSError, json.JSONDecodeError):
             res = None
+    if res is not None and rc is not None:
+        expected_rc = calibrate_rate.exit_code_for_status(res.get("status", ""))
+        if int(rc) != expected_rc:
+            res = None  # rc contradicts the written verdict -> not trustworthy
     if res is not None:
         os.replace(str(tmp_out), str(out_path))
         return res
@@ -256,13 +282,25 @@ class Orchestrator:
                  hf_cache_host: Path, max_age_days: float, window_s: int,
                  cooldown_s: int, bringup_retries: int, recalibrate: set[str],
                  grid_map: dict, env_rates: Optional[list[float]],
-                 min_free_gb: float = 20.0, logf=None) -> None:
+                 min_free_gb: float = 20.0, step_min_s: float = 600.0,
+                 ceil_mult: float = 20.0, min_method_version: Optional[int] = None,
+                 logf=None) -> None:
         self.campaign_yaml = Path(campaign_yaml)
         self.runs_root = Path(runs_root)
         self.repo_root = Path(repo_root)
         self.hf_cache_host = Path(hf_cache_host)
         self.max_age_days = max_age_days
+        # window_s is the legacy fixed per-rate window; the v2 method sizes each
+        # step by wall duration (max(step_min_s, ceil_mult x p99)), so window_s is
+        # kept only as the step-floor fallback when step_min_s is unset.
         self.window_s = window_s
+        self.step_min_s = float(step_min_s) if step_min_s is not None else float(window_s)
+        self.ceil_mult = float(ceil_mult)
+        # HARD method floor for the SKIP check: an existing v1 ceiling is treated
+        # as invalid so this campaign re-takes it as v2 (mirrors the campaign
+        # pre-flight / dispatch gate). None -> no method gate.
+        self.min_method_version = (int(min_method_version)
+                                   if min_method_version is not None else None)
         self.cooldown_s = cooldown_s
         self.bringup_retries = max(1, int(bringup_retries))
         self.recalibrate = recalibrate
@@ -386,7 +424,8 @@ class Orchestrator:
         sig = self._current_sig_for(spec)
         return calibration_is_valid(
             spec.calibration_file, spec.cell_id, spec.calibration_fraction,
-            sig, self.max_age_days, self._now())
+            sig, self.max_age_days, self._now(),
+            min_method_version=self.min_method_version)
 
     # -- bring-up / teardown -----------------------------------------------
 
@@ -477,7 +516,8 @@ class Orchestrator:
             "--protocol", str(overrides["protocol"]),
             "--model", str(overrides["model"]),
             "--rates", ",".join(str(r) for r in grid),
-            "--window-seconds", str(self.window_s),
+            "--step-min-seconds", str(self.step_min_s),
+            "--ceil-mult", str(self.ceil_mult),
             "--cooldown-seconds", str(self.cooldown_s),
             "--concurrency-cap", str(int(overrides.get("concurrency_cap", 64))),
             "--fraction", str(fraction),
@@ -489,7 +529,7 @@ class Orchestrator:
             "--sweep-dir", str(sweep_root / "sweep"),
         ]
         rc = self._invoke_calibrate(cmd, tmp_out)
-        res = publish_calibration(tmp_out, out_path) or {}
+        res = publish_calibration(tmp_out, out_path, rc=rc) or {}
         status = res.get("status") or "no_output"
         result = {
             "status": status,
@@ -785,6 +825,8 @@ def build_orchestrator(args) -> Orchestrator:
                  else yaml_dir.parent.parent)
     max_age_days = float(campaign.get("calibration_max_age_days",
                                       launch_cell.DEFAULT_CALIBRATION_MAX_AGE_DAYS))
+    _min_mv = campaign.get("calibration_min_method_version")
+    min_method_version = int(_min_mv) if _min_mv is not None else None
     # Same pre-run free-space floor the runs use (dow_campaign.yaml: 50 GB).
     min_free_gb = float(campaign.get("min_free_gb", 20.0))
 
@@ -806,6 +848,9 @@ def build_orchestrator(args) -> Orchestrator:
         hf_cache_host=hf_cache_host,
         max_age_days=max_age_days,
         window_s=args.window_seconds,
+        step_min_s=args.step_min_seconds,
+        ceil_mult=args.ceil_mult,
+        min_method_version=min_method_version,
         cooldown_s=args.cooldown_seconds,
         bringup_retries=args.bringup_retries,
         recalibrate=recal,
@@ -825,7 +870,13 @@ def main() -> None:
                    help="Force re-calibration of a cell_id (repeatable, or comma-list), "
                         "or 'all'. Ignores any existing valid JSON for those cells.")
     p.add_argument("--window-seconds", type=int, default=240,
-                   help="Per-rate sweep window (passed to calibrate_rate).")
+                   help="DEPRECATED legacy fixed per-rate window; kept only as the "
+                        "step-floor fallback. Prefer --step-min-seconds.")
+    p.add_argument("--step-min-seconds", type=float, default=600.0,
+                   help="Floor for each rate step's WALL duration, passed to "
+                        "calibrate_rate (actual = max(step_min, ceil_mult x p99)).")
+    p.add_argument("--ceil-mult", type=float, default=20.0,
+                   help="Per-step wall duration >= ceil_mult x running p99 estimate.")
     p.add_argument("--cooldown-seconds", type=int, default=30,
                    help="Idle between sweep rates so the KV cache flushes.")
     p.add_argument("--rate-grids", type=Path, default=None,

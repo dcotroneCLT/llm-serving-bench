@@ -383,6 +383,37 @@ class PublishCalibration(unittest.TestCase):
             self.assertFalse(tmp_out.exists())
             self.assertFalse(out.exists())
 
+    def test_rc_inconsistent_with_ok_status_is_purged(self):
+        # An 'ok' JSON left behind by a process that then died (rc=-9 SIGKILL)
+        # must NOT be published: the abnormal exit contradicts the ok verdict.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cal.json"
+            out.write_text(json.dumps({"status": "ok", "rate_calibrated_rps": 1.0}))
+            tmp_out = out.with_name(out.name + ".tmp")
+            tmp_out.write_text(json.dumps({"status": "ok", "rate_calibrated_rps": 9.9}))
+            res = cdow.publish_calibration(tmp_out, out, rc=-9)
+            self.assertIsNone(res)
+            self.assertFalse(tmp_out.exists())
+            self.assertFalse(out.exists())   # stale removed too -> reads as MISSING
+
+    def test_rc_consistent_ok_is_published(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cal.json"
+            tmp_out = out.with_name(out.name + ".tmp")
+            tmp_out.write_text(json.dumps({"status": "ok", "rate_calibrated_rps": 2.5}))
+            res = cdow.publish_calibration(tmp_out, out, rc=0)  # ok -> exit 0
+            self.assertEqual(res["rate_calibrated_rps"], 2.5)
+
+    def test_rc_consistent_non_ok_verdict_is_published(self):
+        # did_not_saturate legitimately exits 4; rc matching the status is fine and
+        # the (non-ok) result is still published for the campaign to act on.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cal.json"
+            tmp_out = out.with_name(out.name + ".tmp")
+            tmp_out.write_text(json.dumps({"status": "did_not_saturate"}))
+            res = cdow.publish_calibration(tmp_out, out, rc=4)
+            self.assertEqual(res["status"], "did_not_saturate")
+
 
 if __name__ == "__main__":
     unittest.main()

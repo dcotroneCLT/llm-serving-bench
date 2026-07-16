@@ -13,13 +13,21 @@ serves every cell, so the intended batch usage is "bring the engine up
 once, then call this once per cell against the same endpoint" (the load-once
 optimization that keeps the calibration budget small).
 
+Each rate step runs for a WALL DURATION sized to the workload's own tail
+(max(step_min_s, ceil_mult x running p99 estimate)), and the achieved/offered
+ratio is measured over an inner sub-window with a warmup discard and a p99
+drain grace, attributing requests by SUBMISSION time. This removes the
+finite-window bias where requests still in flight at the window edge
+mechanically depress completed/offered on an unsaturated server (see
+measure_window_stats). The acceptance bar is unchanged.
+
 Conservative ceiling (deliberately NOT the 0.95 saturation edge, so that
 85% of ceiling keeps real margin over a 48h run): the highest swept offered
-rate for which ALL hold within the measurement window:
+rate for which ALL hold within the measurement sub-window:
   - achieved/offered >= achieved_ratio_min (default 0.98)
   - drop rate <= drop_max (default 0.02)
   - e2e p99 <= p99_bound seconds (a generous absolute bound, per cell)
-  - backlog is flat: mean e2e in the second half of the window is not more
+  - backlog is flat: mean e2e in the second half of the sub-window is not more
     than climb_frac (default 0.20) above the first half (a rising latency
     within a fixed-rate window means the server is accumulating backlog and
     the rate is already unsustainable).
@@ -34,7 +42,7 @@ Usage (single cell against a running endpoint):
   python3 scripts/calibrate_rate.py \
     --config <materialized client_config.yaml> \
     --base-url http://localhost:8100 --protocol vllm_openai --model Qwen/... \
-    --rates 0.5,1,2,4,8 --window-seconds 240 \
+    --rates 0.5,1,2,4,8 --step-min-seconds 600 --ceil-mult 20 \
     --fraction 0.85 --cell-id e1 --system vllm_standalone \
     --output calibration_e1.json
 """
@@ -46,6 +54,7 @@ import csv
 import glob
 import hashlib
 import json
+import math
 import socket
 import statistics
 import subprocess
@@ -54,6 +63,19 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import yaml
+
+# Calibration method version. v1 (the original / unversioned method) sized each
+# rate step by REQUEST COUNT / a fixed short window and counted completed-OK over
+# the whole wall window, which mechanically depresses achieved/offered on an
+# UNSATURATED server whenever e2e latency is a non-trivial fraction of the window
+# (requests still in flight at the edge). v2 sizes each step by WALL DURATION
+# (>= ceil_mult x p99) and measures over an inner sub-window with an unbiased
+# submitted-in-window ratio and a p99 drain grace. Bump this whenever the
+# measurement changes so old-method files are identifiable and cross-method
+# ceilings are never mixed. See measure_window_stats() for the bias fix.
+CALIBRATION_METHOD_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -67,13 +89,21 @@ def select_ceiling(
     drop_max: float = 0.02,
     p99_bound: float = 60.0,
     climb_frac: float = 0.20,
+    offered_span_min: float = 0.5,
 ) -> tuple[Optional[dict], str]:
     """Pick the conservative ceiling from ascending-rate sweep rows.
 
     Each row must have: offered_rate, achieved_rps, achieved_ratio,
     drop_rate, p99_e2e_s, latency_climb_frac. Returns (ceiling_row, status).
     status in {"ok", "no_stable_point", "did_not_saturate"}.
-    """
+
+    offered_span_frac and client_rc are OPTIONAL (older rows / unit rows omit
+    them): a row lacking them defaults to full span / rc 0, so the acceptance bar
+    is unchanged for callers that don't record them. When present they reject a
+    step whose load generator did not submit across the whole sub-window (a
+    mid-step stall/death) or whose client exited non-zero -- a step that did not
+    actually test the requested offer must not become a ceiling under the v2
+    completed/submitted ratio."""
     ordered = sorted(rows, key=lambda r: r["offered_rate"])
 
     def stable(r: dict) -> bool:
@@ -82,6 +112,8 @@ def select_ceiling(
             and r["drop_rate"] <= drop_max
             and r["p99_e2e_s"] <= p99_bound
             and r["latency_climb_frac"] <= climb_frac
+            and r.get("offered_span_frac", 1.0) >= offered_span_min
+            and int(r.get("client_rc", 0)) == 0
         )
 
     # Top of the contiguous stable prefix from the lowest rate upward.
@@ -100,36 +132,221 @@ def select_ceiling(
     return ceiling, "ok"
 
 
-def window_stats_from_csvs(sub: Path, window_s: float) -> dict:
-    """Aggregate one rate window's per-request CSVs into summary stats."""
-    n_total = n_ok = n_dropped = 0
-    e2e_with_ts: list[tuple[float, float]] = []  # (submitted_at_unix, e2e_s)
-    for f in sorted(glob.glob(str(sub / "requests_*.csv"))):
-        with open(f, newline="") as fp:
-            for r in csv.DictReader(fp):
-                n_total += 1
-                status = (r.get("status") or "").strip().lower()
-                if status in ("ok", "success"):
-                    n_ok += 1
-                    try:
-                        e2e_with_ts.append((float(r["submitted_at_unix"]), float(r["e2e_latency_s"])))
-                    except (ValueError, KeyError, TypeError):
-                        pass
-                elif status == "dropped":
-                    n_dropped += 1
-    achieved = n_ok / window_s if window_s > 0 else 0.0
-    e2e_vals = sorted(v for _, v in e2e_with_ts)
-    p50 = _quantile(e2e_vals, 0.50)
-    p95 = _quantile(e2e_vals, 0.95)
-    p99 = _quantile(e2e_vals, 0.99)
-    climb = _latency_climb_frac(e2e_with_ts)
+def size_step_window(p99_est: float, step_min_s: float, ceil_mult: float) -> float:
+    """Wall duration for one rate step: max(step_min_s, ceil_mult x p99 estimate).
+
+    Sizing by WALL DURATION (not request count) keeps the edge tail -- the
+    warmup fill + drain grace, each ~one p99 -- a bounded small fraction of the
+    window: with ceil_mult=20 the two p99 edges are ~10% of the window. The p99
+    estimate is the running max over the steps already swept (0 on the first
+    step, so it falls back to step_min_s). An ascending sweep has monotone-ish
+    growing p99, so the previous step's p99 is a safe pre-run estimate for the
+    next; the actual warmup/drain of each step are re-derived post-run from that
+    step's own measured p99 (see measure_window_stats)."""
+    return max(float(step_min_s), float(ceil_mult) * max(0.0, float(p99_est)))
+
+
+def burst_cycle_seconds(arrival_mode: str, burst_factor: float,
+                        burst_on_seconds: float) -> float:
+    """MEAN length of one on/off burst cycle (burst_on + gap), else 0 for
+    non-bursty.
+
+    The client's BurstyArrival is an MMPP-2 with EXPONENTIAL on/off sojourns
+    (client/benchmark.py), mean rate preserved: it is ON a fraction 1/burst_factor
+    of the time, so the mean OFF sojourn is burst_on*(burst_factor-1) and the
+    MEAN cycle is burst_on*burst_factor. Because the sojourns are stochastic the
+    cycle length is not fixed, so trimming the sub-window to an integer number of
+    MEAN cycles does not make the offered accounting exactly phase-independent --
+    it removes the systematic bias of ending on a partial burst and lowers the
+    phase/seed variance. The dominant robustness comes from the window spanning
+    MANY cycles (the wall window is >= ceil_mult x p99 and >= step_min, i.e. tens
+    of mean cycles), where the law of large numbers averages the on/off phase
+    out. See measure_window_stats."""
+    if (arrival_mode or "").strip().lower() != "bursty":
+        return 0.0
+    on = max(0.0, float(burst_on_seconds))
+    bf = max(1.0, float(burst_factor))
+    return on * bf
+
+
+def _empty_window_stats(wall_s: float) -> dict:
     return {
-        "n_total": n_total, "n_ok": n_ok, "n_dropped": n_dropped,
-        "achieved_rps": achieved,
-        "drop_rate": (n_dropped / n_total) if n_total > 0 else 0.0,
-        "p50_e2e_s": p50, "p95_e2e_s": p95, "p99_e2e_s": p99,
+        "n_offered": 0, "n_total": 0, "n_ok": 0, "n_dropped": 0,
+        "achieved_rps": 0.0, "achieved_ratio": 0.0, "offered_coverage": 0.0,
+        "offered_span_frac": 0.0, "drop_rate": 0.0,
+        "p50_e2e_s": float("nan"), "p95_e2e_s": float("nan"),
+        "p99_e2e_s": float("nan"), "latency_climb_frac": 0.0,
+        "window_seconds": round(float(wall_s), 3), "warmup_s": 0.0,
+        "drain_s": 0.0, "measure_seconds": 0.0, "p99_size_s": 0.0,
+        "burst_cycle_s": 0.0, "burst_cycles": 0,
+    }
+
+
+def measure_window_stats(
+    records: list[dict],
+    wall_s: float,
+    offered_rate: float,
+    *,
+    arrival_mode: str = "poisson",
+    burst_factor: float = 4.0,
+    burst_on_seconds: float = 10.0,
+    warmup_mult: float = 1.0,
+    drain_mult: float = 1.0,
+) -> dict:
+    """Unbiased per-rate window stats from per-request records.
+
+    Fixes the finite-window throughput bias: over a wall window of length W at
+    offered rate r with e2e latency L, ~r*L requests are still in flight at the
+    window edge, so counting completed-OK / W mechanically reports r*(1 - L/W)
+    even on an UNSATURATED server -- the shorter W is relative to L, the worse
+    the bias (the real-data symptom: a low-rate, zero-drop, flat-latency,
+    p99=15s step reporting achieved_ratio=0.83 purely because W~200s).
+
+    We instead measure over an INNER sub-window, attributing each request by its
+    SUBMISSION time: discard a warmup at the head (pipeline fill) and reserve a
+    drain grace >= p99 at the tail, so every request submitted WITHIN the
+    sub-window has had time to complete. Then
+        achieved_ratio = completed-OK / submitted   (both counted in-sub-window)
+    which converges to 1.0 on an unsaturated server regardless of L, while a
+    genuinely saturated server -- which cannot complete what was offered, or
+    whose e2e/backlog explodes -- still fails on ratio, drop, p99 or climb.
+
+    For bursty arrivals the sub-window is trimmed to an integer number of MEAN
+    burst cycles (burst_on + gap = burst_on_seconds * burst_factor). The client's
+    on/off sojourns are exponential, so this does not make the accounting exactly
+    phase-independent -- it removes the partial-burst edge bias and, combined with
+    a window spanning many cycles, keeps the offered rate close to the mean
+    regardless of starting phase (offered_coverage records the residual).
+
+    `records`: dicts with submitted_at_unix (float), status (str), and
+    e2e_latency_s (float | None). Returns a stats dict carrying the SAME keys the
+    ceiling selector consumes (achieved_ratio, drop_rate, p99_e2e_s,
+    latency_climb_frac, achieved_rps) plus the window provenance fields
+    (window_seconds, warmup_s, drain_s, measure_seconds, burst_cycles)."""
+    recs: list[tuple[float, str, Optional[float]]] = []
+    for r in records:
+        try:
+            sub_t = float(r["submitted_at_unix"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        status = (r.get("status") or "").strip().lower()
+        raw = r.get("e2e_latency_s")
+        try:
+            e2e = float(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            e2e = None
+        recs.append((sub_t, status, e2e))
+
+    if not recs:
+        return _empty_window_stats(wall_s)
+
+    t0 = min(t for t, _, _ in recs)
+    # Size warmup/drain from the p99 of ALL ok e2e in the raw window: a stable
+    # estimate that does not depend on the sub-window we are about to carve.
+    ok_e2e_all = sorted(e for _, s, e in recs
+                        if s in ("ok", "success") and e is not None)
+    p99_size = _quantile(ok_e2e_all, 0.99) if ok_e2e_all else 0.0
+    if not (p99_size == p99_size):  # NaN guard
+        p99_size = 0.0
+    warmup_s = max(0.0, float(warmup_mult)) * p99_size
+    drain_s = max(0.0, float(drain_mult)) * p99_size
+
+    meas_start = t0 + warmup_s
+    meas_end = t0 + float(wall_s) - drain_s
+
+    cycle_s = burst_cycle_seconds(arrival_mode, burst_factor, burst_on_seconds)
+    burst_cycles = 0
+    if cycle_s > 0 and meas_end > meas_start:
+        k = int(math.floor((meas_end - meas_start) / cycle_s))
+        if k >= 1:
+            burst_cycles = k
+            meas_end = meas_start + k * cycle_s
+        # else: fewer than one full cycle fits -> keep the raw sub-window and
+        # leave burst_cycles=0 so provenance flags the window as undersized.
+
+    measure_s = meas_end - meas_start
+    win = {
+        "window_seconds": round(float(wall_s), 3),
+        "warmup_s": round(warmup_s, 3),
+        "drain_s": round(drain_s, 3),
+        "measure_seconds": round(max(0.0, measure_s), 3),
+        "p99_size_s": round(p99_size, 4),
+        "burst_cycle_s": round(cycle_s, 3),
+        "burst_cycles": burst_cycles,
+    }
+
+    if measure_s <= 0:
+        # The tail (warmup+drain, sized from the observed p99) consumed the whole
+        # window: e2e is huge relative to W, which only happens when the server is
+        # deeply backlogged. Emit an explicitly UNSTABLE row so the ceiling
+        # selector breaks the stable prefix here instead of dividing by <= 0.
+        out = _empty_window_stats(wall_s)
+        out.update(win)
+        out["p99_e2e_s"] = p99_size
+        out["latency_climb_frac"] = float("inf")
+        return out
+
+    sel = [(t, s, e) for (t, s, e) in recs if meas_start <= t < meas_end]
+    n_offered = len(sel)
+    n_ok = sum(1 for _, s, _ in sel if s in ("ok", "success"))
+    n_dropped = sum(1 for _, s, _ in sel if s == "dropped")
+    ok_e2e = sorted(e for _, s, e in sel if s in ("ok", "success") and e is not None)
+    climb = _latency_climb_frac(
+        [(t, e) for (t, s, e) in sel if s in ("ok", "success") and e is not None])
+    # Guard the v2 ratio's blind spot: achieved_ratio is now completed/SUBMITTED,
+    # so a load generator that stalled or died mid-step could submit a handful of
+    # requests that all succeed -> ratio 1.0 on a step that never tested the
+    # requested offer (a silently-low ceiling). Two metrics:
+    #   offered_coverage = submitted / (offered_rate x measure_s)  [INFORMATIONAL]
+    #   offered_span_frac = (last_sub - first_sub) / measure_s      [GATED]
+    # offered_coverage (a count ratio) is confounded by the arrival process: the
+    # client's bursty MMPP-2 legitimately over/under-shoots the nominal rate by
+    # ~+/-20% over a practical window, so a healthy bursty step can read ~0.82 --
+    # gating on it would false-reject. offered_span_frac instead asks whether
+    # submissions actually spanned the whole sub-window; bursty OFF gaps are
+    # INTERIOR so they do not shrink the span, but a mid-window death leaves a
+    # large empty tail -> a clean, arrival-mode-agnostic stall signal.
+    expected_offered = float(offered_rate) * measure_s if offered_rate > 0 else 0.0
+    offered_coverage = (n_offered / expected_offered) if expected_offered > 0 else 0.0
+    sub_ts = [t for t, _, _ in sel]
+    offered_span_frac = ((max(sub_ts) - min(sub_ts)) / measure_s
+                         if len(sub_ts) >= 2 and measure_s > 0 else 0.0)
+    out = {
+        "n_offered": n_offered, "n_total": n_offered,
+        "n_ok": n_ok, "n_dropped": n_dropped,
+        "achieved_rps": (n_ok / measure_s) if measure_s > 0 else 0.0,
+        "achieved_ratio": (n_ok / n_offered) if n_offered > 0 else 0.0,
+        "offered_coverage": offered_coverage,
+        "offered_span_frac": offered_span_frac,
+        "drop_rate": (n_dropped / n_offered) if n_offered > 0 else 0.0,
+        "p50_e2e_s": _quantile(ok_e2e, 0.50),
+        "p95_e2e_s": _quantile(ok_e2e, 0.95),
+        "p99_e2e_s": _quantile(ok_e2e, 0.99),
         "latency_climb_frac": climb,
     }
+    out.update(win)
+    return out
+
+
+def window_stats_from_csvs(
+    sub: Path, wall_s: float, offered_rate: float, *,
+    arrival_mode: str = "poisson", burst_factor: float = 4.0,
+    burst_on_seconds: float = 10.0, warmup_mult: float = 1.0,
+    drain_mult: float = 1.0,
+) -> dict:
+    """Load one rate step's per-request CSVs and reduce them to unbiased window
+    stats (see measure_window_stats). Reads EVERY requests_*.csv in `sub`, so the
+    caller must guarantee the dir holds only THIS step's CSVs (StaleSweepDir)."""
+    records: list[dict] = []
+    for f in sorted(glob.glob(str(sub / "requests_*.csv"))):
+        with open(f, newline="") as fp:
+            records.extend(csv.DictReader(fp))
+    return measure_window_stats(
+        records, float(wall_s), float(offered_rate),
+        arrival_mode=arrival_mode, burst_factor=burst_factor,
+        burst_on_seconds=burst_on_seconds, warmup_mult=warmup_mult,
+        drain_mult=drain_mult,
+    )
 
 
 def _quantile(sorted_vals: list[float], q: float) -> float:
@@ -171,7 +388,10 @@ class StaleSweepDir(RuntimeError):
 
 def run_one_rate(
     repo_root: Path, config: Path, base_url: str, protocol: str, model: str,
-    rate: float, window_s: int, concurrency_cap: int, sub: Path,
+    rate: float, wall_s: float, concurrency_cap: int, sub: Path, *,
+    arrival_mode: str = "poisson", burst_factor: float = 4.0,
+    burst_on_seconds: float = 10.0, warmup_mult: float = 1.0,
+    drain_mult: float = 1.0,
 ) -> dict:
     # Refuse to reuse a rate subdir that still holds a prior sweep's CSVs:
     # window_stats_from_csvs() reads EVERY requests_*.csv in `sub`, so leftover
@@ -187,11 +407,15 @@ def run_one_rate(
             "pass a fresh --sweep-dir."
         )
     sub.mkdir(parents=True, exist_ok=True)
+    # The client submits at `rate` for the ENTIRE wall window; warmup and drain
+    # are analysis-time partitions of the collected timeline, not client phases,
+    # so the drain grace is naturally satisfied by the client running (and then
+    # end-draining) past the measurement sub-window.
     cmd = [
         sys.executable, str(repo_root / "client" / "run_client.py"),
         "--config", str(config),
         "--output-dir", str(sub),
-        "--duration-seconds", str(window_s),
+        "--duration-seconds", str(int(math.ceil(float(wall_s)))),
         "--protocol", protocol,
         "--base-url", base_url,
         "--model", model,
@@ -199,10 +423,25 @@ def run_one_rate(
         "--concurrency-cap", str(concurrency_cap),
     ]
     with (sub / "client.log").open("wb") as logf:
-        subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, check=False)
-    stats = window_stats_from_csvs(sub, float(window_s))
+        proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, check=False)
+    stats = window_stats_from_csvs(
+        sub, float(wall_s), rate,
+        arrival_mode=arrival_mode, burst_factor=burst_factor,
+        burst_on_seconds=burst_on_seconds, warmup_mult=warmup_mult,
+        drain_mult=drain_mult,
+    )
     stats["offered_rate"] = rate
-    stats["achieved_ratio"] = (stats["achieved_rps"] / rate) if rate > 0 else 0.0
+    # A non-zero client exit (e.g. run_client's writer-fatal abort) means the step
+    # did not run cleanly; record it so select_ceiling refuses the step rather
+    # than trusting whatever partial CSVs landed. Kept as an int rc for provenance.
+    try:
+        stats["client_rc"] = int(proc.returncode)
+    except (TypeError, ValueError):
+        stats["client_rc"] = 0
+    # measure_window_stats already computes the unbiased submitted-in-window
+    # ratio; keep a fallback for callers/tests that stub window_stats_from_csvs.
+    stats.setdefault(
+        "achieved_ratio", (stats["achieved_rps"] / rate) if rate > 0 else 0.0)
     return stats
 
 
@@ -265,6 +504,28 @@ def exit_code_for_status(status: str) -> int:
     return {"ok": 0, "no_stable_point": 3, "did_not_saturate": 4}.get(status, 0)
 
 
+def read_arrival_config(config: Path) -> tuple[str, float, float]:
+    """(arrival_mode, burst_factor, burst_on_seconds) from the materialized client
+    config, mirroring run_client.py's own precedence (arrival_mode supersedes the
+    legacy request_distribution). Burst-cycle-aware measurement windows need the
+    SAME burst timing the client will actually use. Best-effort: an unreadable
+    config falls back to the poisson defaults (non-bursty -> no cycle trimming)."""
+    try:
+        cfg = yaml.safe_load(Path(config).read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return "poisson", 4.0, 10.0
+    mode = cfg.get("arrival_mode") or cfg.get("request_distribution") or "poisson"
+    try:
+        bf = float(cfg.get("burst_factor", 4.0))
+    except (TypeError, ValueError):
+        bf = 4.0
+    try:
+        on = float(cfg.get("burst_on_seconds", 10.0))
+    except (TypeError, ValueError):
+        on = 10.0
+    return str(mode).strip().lower(), bf, on
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Per-cell rate calibration (conservative ceiling).")
     p.add_argument("--config", type=Path, required=True, help="Materialized client config for the cell (all factors except rate).")
@@ -272,7 +533,25 @@ def main() -> None:
     p.add_argument("--protocol", type=str, required=True)
     p.add_argument("--model", type=str, required=True)
     p.add_argument("--rates", type=str, required=True, help="Comma-separated ascending offered rates, e.g. 0.5,1,2,4,8")
-    p.add_argument("--window-seconds", type=int, default=240)
+    p.add_argument("--step-min-seconds", type=float, default=None,
+                   help="Floor for each rate step's WALL duration (default 600). The "
+                        "actual per-step duration = max(step_min, ceil_mult x running "
+                        "p99 estimate), so a long-latency shape gets a proportionally "
+                        "longer window and the edge tail stays a bounded fraction.")
+    p.add_argument("--ceil-mult", type=float, default=20.0,
+                   help="Per-step wall duration >= ceil_mult x the running p99 estimate "
+                        "(default 20 -> the warmup+drain p99 edges are ~10%% of the "
+                        "window).")
+    p.add_argument("--warmup-mult", type=float, default=1.0,
+                   help="In-step warmup discard = warmup_mult x measured p99 (pipeline "
+                        "fill; excluded from the measurement sub-window).")
+    p.add_argument("--drain-mult", type=float, default=1.0,
+                   help="Drain grace = drain_mult x measured p99 (>= p99), reserved at "
+                        "the tail so requests submitted in the sub-window can complete.")
+    p.add_argument("--window-seconds", type=int, default=None,
+                   help="DEPRECATED (v1 fixed-window method). If set and "
+                        "--step-min-seconds is not, it is used as the per-step wall "
+                        "floor for back-compat; prefer --step-min-seconds.")
     p.add_argument("--cooldown-seconds", type=int, default=30)
     p.add_argument("--concurrency-cap", type=int, default=64)
     p.add_argument("--fraction", type=float, default=0.85, help="rate_calibrated = fraction x achieved ceiling (DoW: 0.30 / 0.85).")
@@ -280,6 +559,12 @@ def main() -> None:
     p.add_argument("--drop-max", type=float, default=0.02)
     p.add_argument("--p99-bound", type=float, default=60.0)
     p.add_argument("--latency-climb-frac", type=float, default=0.20)
+    p.add_argument("--offered-span-min", type=float, default=0.5,
+                   help="A rate step's submissions must span at least this fraction "
+                        "of the measurement sub-window (last-minus-first submit / "
+                        "measure_seconds), else it is rejected as a stalled/died "
+                        "step. Temporal span, not a count ratio, so it is robust to "
+                        "the bursty arrival process's rate variance.")
     p.add_argument("--cell-id", type=str, default="")
     p.add_argument("--system", type=str, default="")
     p.add_argument("--image-tag", type=str, default=None,
@@ -298,23 +583,62 @@ def main() -> None:
     sweep_dir = args.sweep_dir or args.output.parent / f"calib_sweep_{args.cell_id or 'cell'}"
     sweep_dir.mkdir(parents=True, exist_ok=True)
 
+    # Step floor: prefer --step-min-seconds; fall back to the deprecated
+    # --window-seconds for back-compat; else the 600s default.
+    if args.step_min_seconds is not None:
+        step_min_s = float(args.step_min_seconds)
+    elif args.window_seconds is not None:
+        step_min_s = float(args.window_seconds)
+    else:
+        step_min_s = 600.0
+
+    arrival_mode, burst_factor, burst_on_seconds = read_arrival_config(args.config)
+
     print(f"[calibrate] cell={args.cell_id} system={args.system} base_url={args.base_url}", flush=True)
-    print(f"[calibrate] rates={rates} window={args.window_seconds}s", flush=True)
+    print(f"[calibrate] method=v{CALIBRATION_METHOD_VERSION} rates={rates} "
+          f"step_min={step_min_s:.0f}s ceil_mult={args.ceil_mult} "
+          f"arrival={arrival_mode}"
+          + (f" burst(factor={burst_factor},on={burst_on_seconds}s,"
+             f"cycle={burst_cycle_seconds(arrival_mode, burst_factor, burst_on_seconds):.0f}s)"
+             if arrival_mode == "bursty" else ""),
+          flush=True)
 
     rows: list[dict] = []
+    p99_est = 0.0  # running max p99 across swept steps; sizes the NEXT step.
     for rate in rates:
-        print(f"[calibrate] rate={rate} rps for {args.window_seconds}s ...", flush=True)
+        wall_s = size_step_window(p99_est, step_min_s, args.ceil_mult)
+        print(f"[calibrate] rate={rate} rps for {wall_s:.0f}s "
+              f"(p99_est={p99_est:.1f}s) ...", flush=True)
         sub = sweep_dir / f"rate_{rate}"
         stats = run_one_rate(
             repo_root, args.config, args.base_url, args.protocol, args.model,
-            rate, args.window_seconds, args.concurrency_cap, sub,
+            rate, wall_s, args.concurrency_cap, sub,
+            arrival_mode=arrival_mode, burst_factor=burst_factor,
+            burst_on_seconds=burst_on_seconds, warmup_mult=args.warmup_mult,
+            drain_mult=args.drain_mult,
         )
         rows.append(stats)
+        if stats.get("client_rc", 0) != 0:
+            print(f"[calibrate]   WARNING: client exited rc={stats['client_rc']} "
+                  "at this rate; step marked incomplete (cannot be a ceiling).",
+                  file=sys.stderr, flush=True)
         print(
             f"[calibrate]   achieved={stats['achieved_rps']:.3f} ratio={stats['achieved_ratio']:.3f} "
-            f"drop={stats['drop_rate']:.3f} p99={stats['p99_e2e_s']:.2f}s climb={stats['latency_climb_frac']:+.2f}",
+            f"cover={stats.get('offered_coverage', 1.0):.2f} span={stats.get('offered_span_frac', 1.0):.2f} "
+            f"drop={stats['drop_rate']:.3f} p99={stats['p99_e2e_s']:.2f}s climb={stats['latency_climb_frac']:+.2f} "
+            f"(measure={stats.get('measure_seconds', 0):.0f}s"
+            + (f", {stats.get('burst_cycles', 0)} cycles" if arrival_mode == "bursty" else "")
+            + ")",
             flush=True,
         )
+        # Grow the running p99 estimate so the NEXT (higher-rate) step gets a
+        # window sized to its expected tail. NaN (no completions) does not update.
+        p99 = stats.get("p99_e2e_s")
+        try:
+            if p99 is not None and float(p99) == float(p99):
+                p99_est = max(p99_est, float(p99))
+        except (TypeError, ValueError):
+            pass
         # Early stop once clearly past the knee, to save GPU-h.
         if stats["achieved_ratio"] < 0.90 or stats["latency_climb_frac"] > 1.0:
             print("[calibrate]   past the knee, stopping sweep early", flush=True)
@@ -327,6 +651,7 @@ def main() -> None:
         drop_max=args.drop_max,
         p99_bound=args.p99_bound,
         climb_frac=args.latency_climb_frac,
+        offered_span_min=args.offered_span_min,
     )
 
     out = {
@@ -335,11 +660,30 @@ def main() -> None:
         "base_url": args.base_url,
         "fraction": args.fraction,
         "status": status,
+        # Identifies the measurement method so v1 (short-fixed-window, biased on
+        # long-latency/bursty shapes) files are distinguishable and never mixed
+        # with v2 ceilings. launch_cell.check_calibration_provenance can warn on a
+        # mismatch against the version it expects.
+        "calibration_method_version": CALIBRATION_METHOD_VERSION,
         "criteria": {
             "achieved_ratio_min": args.achieved_ratio_min,
             "drop_max": args.drop_max,
             "p99_bound_s": args.p99_bound,
             "latency_climb_frac": args.latency_climb_frac,
+            "offered_span_min": args.offered_span_min,
+        },
+        # Step-sizing / sub-window provenance: how each rate step's wall window
+        # was sized and partitioned (per-row window_seconds/warmup_s/drain_s/
+        # measure_seconds/burst_cycles record what was actually used).
+        "step_params": {
+            "step_min_seconds": step_min_s,
+            "ceil_mult": args.ceil_mult,
+            "warmup_mult": args.warmup_mult,
+            "drain_mult": args.drain_mult,
+            "arrival_mode": arrival_mode,
+            "burst_factor": burst_factor,
+            "burst_on_seconds": burst_on_seconds,
+            "burst_cycle_s": burst_cycle_seconds(arrival_mode, burst_factor, burst_on_seconds),
         },
         "sweep": rows,
         "ceiling_rps": None,

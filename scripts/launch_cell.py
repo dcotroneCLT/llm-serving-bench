@@ -900,6 +900,13 @@ class CalibrationError(Exception):
 # month-3 run is exactly the staleness this gate exists to stop.
 DEFAULT_CALIBRATION_MAX_AGE_DAYS = 14
 
+# The calibration measurement method this build EXPECTS (mirrors
+# calibrate_rate.CALIBRATION_METHOD_VERSION). A file recorded by an older method
+# is not rejected -- host/image/age still gate it -- but callers can ask
+# check_calibration_provenance to WARN so a v1 (finite-window-biased) ceiling is
+# not silently reused after the v2 fix. Bump in lockstep with calibrate_rate.
+EXPECTED_CALIBRATION_METHOD_VERSION = 2
+
 
 def gpu_name_and_driver() -> tuple[Optional[str], Optional[str]]:
     """(gpu_name, driver_version) from nvidia-smi, or (None, None) if it cannot
@@ -947,7 +954,9 @@ def calibration_age_days(calib: dict, now_unix: float) -> Optional[float]:
 
 
 def check_calibration_provenance(calib: dict, current_sig: dict,
-                                 max_age_days: Optional[float], now_unix: float) -> None:
+                                 max_age_days: Optional[float], now_unix: float,
+                                 warn_method_version: Optional[int] = None,
+                                 min_method_version: Optional[int] = None) -> None:
     """Refuse (raise CalibrationError) a calibration that is STALE (older than
     max_age_days) or whose recorded host/image signature does not match the
     current one. Same fail-loud intent as a missing REQUIRED calibration.
@@ -956,7 +965,35 @@ def check_calibration_provenance(calib: dict, current_sig: dict,
     verified -- it is refused (its calibrated_at is unknowable, so it could be
     arbitrarily old). Signature fields the CURRENT side cannot determine (e.g.
     gpu_name when nvidia-smi is absent) are skipped, but every field present on
-    BOTH sides must match: any drift is a stale calibration."""
+    BOTH sides must match: any drift is a stale calibration.
+
+    Method-version handling (calibration_method_version; an absent field is
+    treated as v1):
+      - min_method_version (HARD gate): a file older than this is REFUSED. Use it
+        when a campaign must not run on a superseded measurement method (e.g. the
+        v1 finite-window ceilings this campaign is re-taking as v2).
+      - warn_method_version (SOFT): a file whose version differs is only warned
+        about on stderr. Ignored when min_method_version already covers it."""
+    rec_ver_raw = calib.get("calibration_method_version", 1)
+    try:
+        rec_ver = int(rec_ver_raw)
+    except (TypeError, ValueError):
+        rec_ver = None  # unparseable -> treat as unknown/too-old below
+    if min_method_version is not None:
+        if rec_ver is None or rec_ver < int(min_method_version):
+            raise CalibrationError(
+                f"calibration_method_version={rec_ver_raw!r} is below the required "
+                f"minimum v{min_method_version}: this ceiling was measured with a "
+                "superseded method (e.g. the v1 finite-window sweep). Re-run "
+                "scripts/calibrate_rate.py to re-calibrate with the current method.")
+    elif warn_method_version is not None:
+        if rec_ver is None or rec_ver != int(warn_method_version):
+            print(
+                f"[launch_cell] WARNING: calibration_method_version={rec_ver_raw!r} "
+                f"differs from the expected v{warn_method_version}; this ceiling "
+                "may have been taken with an older measurement method "
+                "(re-run scripts/calibrate_rate.py to refresh).",
+                flush=True, file=sys.stderr)
     prov = calib.get("provenance")
     if not isinstance(prov, dict) or prov.get("calibrated_at_unix") is None:
         raise CalibrationError(
@@ -1969,6 +2006,15 @@ def main() -> None:
              "recorded host/image signature does not match the current run's.",
     )
     p.add_argument(
+        "--calibration-min-method-version",
+        type=int,
+        default=None,
+        help="Method gate: refuse a --calibration-file whose "
+             "calibration_method_version is below this (non-retryable, exit 6). "
+             "Set to reject ceilings measured with a superseded method (e.g. v1 "
+             "finite-window sweeps). Absent -> no method gate.",
+    )
+    p.add_argument(
         "--allow-lower-bound-calibration",
         action="store_true",
         help="Permit a calibration whose status != 'ok' (e.g. did_not_saturate, "
@@ -2176,7 +2222,9 @@ def main() -> None:
             socket.gethostname(), gpu_name, driver_version, image_full, pinned_digest)
         try:
             check_calibration_provenance(
-                calib, current_sig, args.calibration_max_age_days, time.time())
+                calib, current_sig, args.calibration_max_age_days, time.time(),
+                warn_method_version=EXPECTED_CALIBRATION_METHOD_VERSION,
+                min_method_version=args.calibration_min_method_version)
         except CalibrationError as e:
             die(f"calibration provenance gate: {e} (file: {args.calibration_file})", rc=6)
         # Bind the calibration to THIS cell + fraction (Factor A integrity). A
