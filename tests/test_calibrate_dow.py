@@ -87,6 +87,55 @@ class SuggestNextGrid(unittest.TestCase):
         self.assertIsNone(cdow.suggest_next_grid("ok", [1, 2, 4]))
 
 
+class ClassifyEngineFailure(unittest.TestCase):
+    """The 2026-07-06 finding in one function: a dead endpoint (n_ok==0 at the
+    lowest grid rate) must classify as engine_failure, never no_stable_point; a
+    HEALTHY-but-unstable sweep must still be no_stable_point."""
+
+    def _row(self, offered, n_offered, n_ok, drop=0.0):
+        return {"offered_rate": offered, "n_offered": n_offered, "n_ok": n_ok,
+                "drop_rate": drop}
+
+    def test_dead_endpoint_lowest_rate_is_engine_failure(self):
+        # The exact field row: 0.25 rps, 159 offered, 0 ok, 0.60 dropped, p99 NaN.
+        res = {"status": "no_stable_point",
+               "sweep_rows": [self._row(0.25, 159, 0, drop=0.60)]}
+        reason = cdow.classify_engine_failure(res, health_reason=None)
+        self.assertIsNotNone(reason)
+        self.assertIn("dead endpoint", reason)
+
+    def test_lowest_rate_picked_by_offered_not_list_order(self):
+        # A higher rate listed first must not mask the dead lowest rate.
+        res = {"status": "no_stable_point",
+               "sweep_rows": [self._row(1.0, 50, 5), self._row(0.25, 159, 0)]}
+        self.assertIsNotNone(cdow.classify_engine_failure(res, None))
+
+    def test_healthy_unstable_is_not_engine_failure(self):
+        # Lowest rate completed SOME requests but the sweep found no stable
+        # prefix -> a real no_stable_point, NOT an engine failure.
+        res = {"status": "no_stable_point",
+               "sweep_rows": [self._row(0.25, 100, 90, drop=0.10),
+                              self._row(0.5, 100, 60, drop=0.40)]}
+        self.assertIsNone(cdow.classify_engine_failure(res, health_reason=None))
+
+    def test_ok_sweep_is_never_engine_failure(self):
+        # An ok verdict implies a full stable prefix -> the engine served; even a
+        # (spurious) post-sweep health blip must not override it.
+        res = {"status": "ok", "sweep_rows": [self._row(0.25, 100, 100)]}
+        self.assertIsNone(cdow.classify_engine_failure(res, health_reason="blip"))
+
+    def test_health_check_failure_on_non_ok_is_engine_failure(self):
+        res = {"status": "no_stable_point",
+               "sweep_rows": [self._row(0.25, 100, 90)]}  # rows look alive...
+        reason = cdow.classify_engine_failure(res, health_reason="stack container down")
+        self.assertIsNotNone(reason)                       # ...but the stack died
+        self.assertIn("health check", reason)
+
+    def test_no_rows_no_health_is_not_engine_failure(self):
+        self.assertIsNone(cdow.classify_engine_failure(
+            {"status": "no_output", "sweep_rows": []}, health_reason=None))
+
+
 # --------------------------------------------------------------------------
 # Skip-valid / force-recalibrate against the REAL launch_cell gates
 # --------------------------------------------------------------------------
@@ -210,16 +259,26 @@ class OrchestrationFlow(unittest.TestCase):
         o._preflight_fn = lambda: None
         return o
 
-    def _instrument(self, o, statuses, sweep_result):
-        calls = {"bringup": [], "teardown": [], "sweep": []}
+    def _instrument(self, o, statuses, sweep_result, health=None):
+        # health(spec, ef_retries) -> reason|None; default: always healthy.
+        calls = {"bringup": [], "teardown": [], "sweep": [], "evidence": []}
         o._acquire_slot = lambda rr: _Lock()
         o._status_fn = lambda spec: statuses(spec)
         o._bring_up_fn = lambda system, rep: (
             calls["bringup"].append(system)
-            or types.SimpleNamespace(system=system))
-        o._sweep_fn = lambda spec, eng, grid: (
-            calls["sweep"].append(spec.cell_id) or sweep_result(spec, grid))
+            or types.SimpleNamespace(system=system, lifecycle=None,
+                                     work_dir=Path("/tmp")))
+        o._sweep_fn = lambda spec, eng, grid, **kw: (
+            calls["sweep"].append((spec.cell_id, kw.get("engine_failure_retries", 0)))
+            or sweep_result(spec, grid, kw.get("engine_failure_retries", 0)))
         o._teardown_fn = lambda eng: calls["teardown"].append(eng.system)
+        o._health_fn = (lambda eng: None) if health is None else (
+            lambda eng: health(eng, len(calls["sweep"]) - 1))
+        o._capture_evidence_fn = lambda eng, spec, reason, ef: calls["evidence"].append(
+            (spec.cell_id, ef))
+        # Do not touch the real filesystem when stamping engine_failure onto the
+        # (non-existent) calibration file.
+        o._stamp_engine_failure_file = lambda spec, reason, raw: None
         o._dry_run_fn = lambda: (0, "0 MISSING")
         return calls
 
@@ -232,24 +291,30 @@ class OrchestrationFlow(unittest.TestCase):
         o = self._orch(specs)
         bad = "dow_triton_p02"
 
-        def sweep_result(spec, grid):
+        def sweep_result(spec, grid, ef_retries):
             if spec.cell_id == bad:
                 return {"status": "did_not_saturate", "ceiling_rps": 8.0,
                         "rate_calibrated_rps": None, "rc": 4, "grid": list(grid),
-                        "skipped": False,
+                        "skipped": False, "sweep_rows": [],
                         "suggested_grid": cdow.suggest_next_grid("did_not_saturate", grid)}
             return {"status": "ok", "ceiling_rps": 3.0, "rate_calibrated_rps": 2.55,
-                    "rc": 0, "grid": list(grid), "skipped": False}
+                    "rc": 0, "grid": list(grid), "skipped": False, "sweep_rows": []}
 
         calls = self._instrument(o, lambda s: (False, "missing"), sweep_result)
         rc = o.run()
 
         # Every cell was swept (the bad one did NOT halt the rest).
-        self.assertEqual(len(calls["sweep"]), 6)
-        self.assertIn(bad, calls["sweep"])
-        # One bring-up + teardown per system.
-        self.assertEqual(calls["bringup"], ["dynamo_disagg", "triton", "vllm"])
-        self.assertEqual(calls["teardown"], ["dynamo_disagg", "triton", "vllm"])
+        swept = [cid for cid, _ in calls["sweep"]]
+        self.assertEqual(len(swept), 6)
+        self.assertIn(bad, swept)
+        # FRESH stack per sweep: one bring-up + teardown PER CELL, in system order.
+        self.assertEqual(calls["bringup"],
+                         ["dynamo_disagg", "dynamo_disagg", "triton", "triton",
+                          "vllm", "vllm"])
+        self.assertEqual(calls["teardown"], calls["bringup"])
+        # A did_not_saturate (healthy, no dead-endpoint rows) is NOT an engine
+        # failure -- no evidence captured, no retry.
+        self.assertEqual(calls["evidence"], [])
         # Non-zero exit and the summary carries the bad cell + a wider grid.
         self.assertEqual(rc, cdow.EXIT_SOME_FAILED)
         log = o._logf.getvalue()
@@ -261,20 +326,23 @@ class OrchestrationFlow(unittest.TestCase):
         o = self._orch(specs)
         calls = self._instrument(
             o, lambda s: (False, "missing"),
-            lambda spec, grid: {"status": "ok", "ceiling_rps": 3.0,
-                                "rate_calibrated_rps": 2.55, "rc": 0,
-                                "grid": list(grid), "skipped": False})
+            lambda spec, grid, ef=0: {"status": "ok", "ceiling_rps": 3.0,
+                                      "rate_calibrated_rps": 2.55, "rc": 0,
+                                      "grid": list(grid), "skipped": False,
+                                      "sweep_rows": []})
         rc = o.run()
         self.assertEqual(rc, cdow.EXIT_OK)
         self.assertEqual(len(calls["sweep"]), 2)
-        self.assertEqual(calls["bringup"], ["vllm"])
+        # FRESH stack per sweep: a bring-up (+teardown) per cell, not per system.
+        self.assertEqual(calls["bringup"], ["vllm", "vllm"])
+        self.assertEqual(calls["teardown"], ["vllm", "vllm"])
 
     def test_all_valid_skips_bringup_entirely(self):
         specs = [_spec("dow_vllm_cp1"), _spec("dow_vllm_p11")]
         o = self._orch(specs)
         calls = self._instrument(
             o, lambda s: (True, "ok (cached)"),
-            lambda spec, grid: self.fail("sweep must not run when all valid"))
+            lambda spec, grid, ef=0: self.fail("sweep must not run when all valid"))
         rc = o.run()
         self.assertEqual(rc, cdow.EXIT_OK)
         self.assertEqual(calls["bringup"], [])   # no engine churn on a clean resume
@@ -286,17 +354,18 @@ class OrchestrationFlow(unittest.TestCase):
         o.recalibrate = {"all"}
         calls = self._instrument(
             o, lambda s: (True, "ok (cached)"),   # would skip, but forced
-            lambda spec, grid: {"status": "ok", "ceiling_rps": 3.0,
-                                "rate_calibrated_rps": 2.55, "rc": 0,
-                                "grid": list(grid), "skipped": False})
+            lambda spec, grid, ef=0: {"status": "ok", "ceiling_rps": 3.0,
+                                      "rate_calibrated_rps": 2.55, "rc": 0,
+                                      "grid": list(grid), "skipped": False,
+                                      "sweep_rows": []})
         o.run()
-        self.assertEqual(calls["sweep"], ["dow_vllm_cp1"])
+        self.assertEqual([cid for cid, _ in calls["sweep"]], ["dow_vllm_cp1"])
 
     def test_lock_held_refuses_without_bringup(self):
         specs = [_spec("dow_vllm_cp1")]
         o = self._orch(specs)
         calls = self._instrument(o, lambda s: (False, "missing"),
-                                 lambda spec, grid: self.fail("must not sweep"))
+                                 lambda spec, grid, ef=0: self.fail("must not sweep"))
         o._acquire_slot = lambda rr: None   # another launcher holds the slot
         rc = o.run()
         self.assertEqual(rc, cdow.EXIT_LOCK_HELD)
@@ -306,7 +375,7 @@ class OrchestrationFlow(unittest.TestCase):
         specs = [_spec("dow_dynamo_disagg_cp1"), _spec("dow_vllm_cp1")]
         o = self._orch(specs)
         calls = self._instrument(o, lambda s: (False, "missing"),
-                                 lambda spec, grid: {"status": "ok"})
+                                 lambda spec, grid, ef=0: {"status": "ok"})
 
         def boom(system, rep):
             raise cdow.BringUpFailed(f"{system}: exhausted")
@@ -321,7 +390,7 @@ class OrchestrationFlow(unittest.TestCase):
         specs = [_spec("dow_vllm_cp1")]
         o = self._orch(specs)
         calls = self._instrument(o, lambda s: (False, "missing"),
-                                 lambda spec, grid: self.fail("must not sweep"))
+                                 lambda spec, grid, ef=0: self.fail("must not sweep"))
 
         def refuse():
             raise cdow.PreflightAbort(cdow.EXIT_PRECONDITION, "prior run still active")
@@ -329,6 +398,114 @@ class OrchestrationFlow(unittest.TestCase):
         rc = o.run()
         self.assertEqual(rc, cdow.EXIT_PRECONDITION)
         self.assertEqual(calls["bringup"], [])
+
+    def _dead_row(self):
+        # The field signature: lowest rate, many offered, zero completed.
+        return [{"offered_rate": 0.25, "n_offered": 159, "n_ok": 0,
+                 "drop_rate": 0.60}]
+
+    def test_dead_endpoint_retries_on_fresh_stack_then_records_engine_failure(self):
+        # A cell whose stack is dead on BOTH the first sweep and the retry:
+        # classified engine_failure (NEVER no_stable_point), evidence captured on
+        # each attempt, torn down + freshly brought up between them, moves on.
+        specs = [_spec("dow_dynamo_disagg_cp1")]
+        o = self._orch(specs)
+
+        def sweep_result(spec, grid, ef_retries):
+            return {"status": "no_stable_point", "ceiling_rps": None,
+                    "rate_calibrated_rps": None, "rc": 3, "grid": list(grid),
+                    "skipped": False, "sweep_rows": self._dead_row(),
+                    "engine_failure_retries": ef_retries,
+                    "suggested_grid": cdow.suggest_next_grid("no_stable_point", grid)}
+
+        calls = self._instrument(o, lambda s: (False, "missing"), sweep_result)
+        rc = o.run()
+
+        self.assertEqual(rc, cdow.EXIT_SOME_FAILED)
+        # 1 initial + 1 fresh-stack retry (default engine_failure_retries=1).
+        self.assertEqual([cid for cid, _ in calls["sweep"]],
+                         ["dow_dynamo_disagg_cp1", "dow_dynamo_disagg_cp1"])
+        # The retry ran on a FRESH stack: a bring-up + teardown per attempt.
+        self.assertEqual(calls["bringup"], ["dynamo_disagg", "dynamo_disagg"])
+        self.assertEqual(calls["teardown"], ["dynamo_disagg", "dynamo_disagg"])
+        # Evidence captured on BOTH attempts, tagged with the retry index.
+        self.assertEqual(calls["evidence"],
+                         [("dow_dynamo_disagg_cp1", 0), ("dow_dynamo_disagg_cp1", 1)])
+        # The retry sweep saw the incremented retry counter (provenance).
+        self.assertEqual([ef for _, ef in calls["sweep"]], [0, 1])
+        # Recorded as engine_failure, NEVER no_stable_point; no misleading grid.
+        r = o._last_results["dow_dynamo_disagg_cp1"]
+        self.assertEqual(r["status"], "engine_failure")
+        self.assertEqual(r["raw_status"], "no_stable_point")
+        self.assertNotIn("suggested_grid", r)
+        log = o._logf.getvalue()
+        self.assertIn("ENGINE FAILURE", log)
+
+    def test_dead_endpoint_then_healthy_retry_succeeds(self):
+        # First sweep dead, retry lands on a healthy fresh stack -> final status
+        # ok, exactly one retry, evidence captured once (for the failed attempt).
+        specs = [_spec("dow_dynamo_disagg_cp1")]
+        o = self._orch(specs)
+
+        def sweep_result(spec, grid, ef_retries):
+            if ef_retries == 0:
+                return {"status": "no_stable_point", "ceiling_rps": None,
+                        "rate_calibrated_rps": None, "rc": 3, "grid": list(grid),
+                        "skipped": False, "sweep_rows": self._dead_row()}
+            return {"status": "ok", "ceiling_rps": 3.0, "rate_calibrated_rps": 2.55,
+                    "rc": 0, "grid": list(grid), "skipped": False,
+                    "sweep_rows": [{"offered_rate": 0.25, "n_offered": 100, "n_ok": 100}]}
+
+        calls = self._instrument(o, lambda s: (False, "missing"), sweep_result)
+        rc = o.run()
+
+        self.assertEqual(rc, cdow.EXIT_OK)
+        self.assertEqual(calls["bringup"], ["dynamo_disagg", "dynamo_disagg"])
+        self.assertEqual(calls["evidence"], [("dow_dynamo_disagg_cp1", 0)])
+        self.assertEqual(o._last_results["dow_dynamo_disagg_cp1"]["status"], "ok")
+
+    def test_healthy_unstable_stays_no_stable_point_no_retry(self):
+        # A HEALTHY sweep that found no stable point: recorded no_stable_point,
+        # brought up ONCE (no engine-failure retry), no evidence captured.
+        specs = [_spec("dow_vllm_cp1")]
+        o = self._orch(specs)
+
+        def sweep_result(spec, grid, ef_retries):
+            return {"status": "no_stable_point", "ceiling_rps": None,
+                    "rate_calibrated_rps": None, "rc": 3, "grid": list(grid),
+                    "skipped": False,
+                    "sweep_rows": [{"offered_rate": 0.25, "n_offered": 100,
+                                    "n_ok": 88, "drop_rate": 0.12}],
+                    "suggested_grid": cdow.suggest_next_grid("no_stable_point", grid)}
+
+        calls = self._instrument(o, lambda s: (False, "missing"), sweep_result)
+        rc = o.run()
+
+        self.assertEqual(rc, cdow.EXIT_SOME_FAILED)
+        self.assertEqual([cid for cid, _ in calls["sweep"]], ["dow_vllm_cp1"])
+        self.assertEqual(calls["bringup"], ["vllm"])          # no retry
+        self.assertEqual(calls["evidence"], [])
+        self.assertEqual(o._last_results["dow_vllm_cp1"]["status"], "no_stable_point")
+
+    def test_health_failure_reclassifies_as_engine_failure(self):
+        # Rows look alive, but the post-sweep health check reports the stack down:
+        # engine_failure, retried on a fresh stack.
+        specs = [_spec("dow_vllm_cp1")]
+        o = self._orch(specs)
+
+        def sweep_result(spec, grid, ef_retries):
+            return {"status": "no_stable_point", "ceiling_rps": None,
+                    "rate_calibrated_rps": None, "rc": 3, "grid": list(grid),
+                    "skipped": False,
+                    "sweep_rows": [{"offered_rate": 0.25, "n_offered": 100,
+                                    "n_ok": 80}]}
+
+        calls = self._instrument(o, lambda s: (False, "missing"), sweep_result,
+                                 health=lambda eng, i: "stack container(s) not running")
+        rc = o.run()
+        self.assertEqual(rc, cdow.EXIT_SOME_FAILED)
+        self.assertEqual(calls["bringup"], ["vllm", "vllm"])   # retried fresh
+        self.assertEqual(o._last_results["dow_vllm_cp1"]["status"], "engine_failure")
 
     def test_signal_tears_down_active_engine_and_releases_lock(self):
         # A kill mid-run must teardown the live engine, run the abort-cleanup
@@ -413,6 +590,22 @@ class PublishCalibration(unittest.TestCase):
             tmp_out.write_text(json.dumps({"status": "did_not_saturate"}))
             res = cdow.publish_calibration(tmp_out, out, rc=4)
             self.assertEqual(res["status"], "did_not_saturate")
+
+    def test_orchestration_provenance_block_is_recorded(self):
+        # Fresh-per-sweep provenance (stack age at sweep start + engine-failure
+        # retry count) is merged into the published JSON, on disk and in-memory.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cal.json"
+            tmp_out = out.with_name(out.name + ".tmp")
+            tmp_out.write_text(json.dumps({"status": "ok", "rate_calibrated_rps": 2.5}))
+            orch = {"stack_age_at_sweep_start_s": 0.0, "engine_failure_retries": 1,
+                    "fresh_stack_per_sweep": True}
+            res = cdow.publish_calibration(tmp_out, out, rc=0, orchestration=orch)
+            self.assertEqual(res["orchestration"], orch)
+            on_disk = json.loads(out.read_text())
+            self.assertEqual(on_disk["orchestration"]["stack_age_at_sweep_start_s"], 0.0)
+            self.assertEqual(on_disk["orchestration"]["engine_failure_retries"], 1)
+            self.assertFalse(tmp_out.exists())
 
 
 if __name__ == "__main__":

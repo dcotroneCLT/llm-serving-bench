@@ -2,19 +2,29 @@
 """Week-1 calibration orchestrator for the DoW screening campaign.
 
 Turns the 57 MISSING calibrations that dow_campaign.yaml's pre-flight reports
-into 57 valid per-cell calibration JSONs, one bring-up per serving system.
+into 57 valid per-cell calibration JSONs, one FRESH engine bring-up per sweep.
 
 Why this exists (and why it is Python, not bash): the DoW cells all bind their
 calibration to a specific cell_id + calibration_fraction at dispatch
 (launch_cell.check_calibration_binding), and the five DoW factors are all
-workload-side, so ONE engine instance per system serves every cell of that
-system. This orchestrator reuses launch_cell's PRODUCTION lifecycle to bring the
-engine up once per system, then runs the existing calibrate_rate.py sweep once
-per cell against that endpoint. There is deliberately NO second bring-up path:
-the frontend-identity bug taught us what divergent bring-up paths cost, so we
-drive the SAME make_lifecycle / bring_up / teardown launch_cell drives (with
-monitors and the run client simply not started), and hold the reaper run-slot
-lock for the whole orchestration so a real run cannot start underneath it.
+workload-side. This orchestrator reuses launch_cell's PRODUCTION lifecycle to
+bring the engine up, then runs the existing calibrate_rate.py sweep against that
+endpoint. There is deliberately NO second bring-up path: the frontend-identity
+bug taught us what divergent bring-up paths cost, so we drive the SAME
+make_lifecycle / bring_up / teardown launch_cell drives (with monitors and the
+run client simply not started), and hold the reaper run-slot lock for the whole
+orchestration so a real run cannot start underneath it.
+
+FRESH STACK PER SWEEP (teardown + bring-up between cells, all systems): the
+first cut kept ONE engine per system alive for the whole system's sweeps (the
+load-once optimization). A field episode (2026-07-06) showed why that is unsafe:
+a single Dynamo stack held alive ~9h developed the NIXL KV-transfer total-stall
+pathology mid-way, and the cells scheduled during the sick window recorded dead-
+endpoint sweeps -- with no runtime health check (which launch_cell has and this
+orchestrator did not) to notice. Fresh-per-sweep is also methodologically
+required: every DoW run starts on a freshly brought-up stack, so the ceiling
+must be measured on one too. The 2-3 min bring-up cost is negligible against the
+40-80 min sweeps.
 
 Per-cell, NOT deduped: the 3 center points of a system share one workload shape,
 so there are only 51 distinct shapes -- but the binding checks each file's own
@@ -23,21 +33,33 @@ sweep per cell (57) rather than stamping a shared sweep with a foreign cell_id.
 The 6 extra center-point sweeps are cheap (calibrate_rate early-stops past the
 knee) and keep each file a real independent calibration of its own cell.
 
+Engine failure vs measurement verdict (the 2026-07-06 finding): a dead/sick
+endpoint must NEVER be misfiled as a measurement verdict. A sweep whose LOWEST
+grid rate ends with n_ok == 0 (or a catastrophic drop/error storm there), or a
+post-sweep engine health check that fails, is classified status "engine_failure"
+-- distinct from no_stable_point. On engine_failure we capture evidence (docker
+logs tail into the calibration work dir), tear down, bring up a FRESH stack, and
+retry that cell once; a second engine_failure records the cell as engine_failure
+and moves on. Only a HEALTHY sweep may conclude no_stable_point. Each calibration
+JSON also records provenance -- the stack age at sweep start (~0 with fresh-per-
+sweep) and the engine_failure retry count -- so any regression of this class is
+visible in the data.
+
 Failure policy: a sweep that ends status != ok (no_stable_point / did_not_
-saturate) does NOT halt the orchestrator -- unlike a 36h run, a failed
-calibration corrupts nothing, and halting 50 good sweeps for one bad shape
+saturate / engine_failure) does NOT halt the orchestrator -- unlike a 36h run, a
+failed calibration corrupts nothing, and halting 50 good sweeps for one bad shape
 wastes the week-1 budget. Such a sweep is recorded, the run continues, and the
 process exits non-zero at the end with a summary table (cell, status, suggested
-wider/narrower rate grid). A HARD stop happens only for host-level preconditions
-(run-slot lock held, image pin / docker / env, or engine bring-up failing after
-its retries).
+wider/narrower rate grid or engine-failure reason). A HARD stop happens only for
+host-level preconditions (run-slot lock held, image pin / docker / env, or engine
+bring-up failing after its retries). engine_failure is a non-ok status, so the
+campaign pre-flight refuses it -- nothing unsound can leak into a real run.
 
 Resumability: a cell whose calibration JSON already exists, is status=ok, and
 passes the SAME binding + provenance + max-age gates the campaign applies is
-skipped (the check reuses launch_cell's own gate functions, not a reimplement);
-if every cell of a system is already valid, that system's bring-up is skipped
-entirely. --recalibrate <cell_id|all> forces a re-sweep. The whole thing is
-safe to Ctrl-C and re-run.
+skipped (the check reuses launch_cell's own gate functions, not a reimplement)
+-- and a skipped cell brings no stack up at all. --recalibrate <cell_id|all>
+forces a re-sweep. The whole thing is safe to Ctrl-C and re-run.
 
 Verdict: the orchestrator ends by running the campaign's own pre-flight
 (campaign.py --dry-run) and printing its head -- success is that dry-run moving
@@ -159,6 +181,65 @@ def suggest_next_grid(status: str, grid: list[float]) -> Optional[list[float]]:
     return None
 
 
+def classify_engine_failure(res: dict, health_reason: Optional[str]) -> Optional[str]:
+    """Distinguish an ENGINE failure (dead / sick endpoint) from a measurement
+    verdict. Returns a short reason string if this sweep is an engine failure,
+    else None. This is the 2026-07-06 finding: a Dynamo NIXL total-stall episode
+    that sampled several cells as dead-endpoint sweeps had every one misfiled as
+    "no_stable_point" -- a measurement verdict -- because the sweep found no
+    stable operating point. It found none because NOTHING completed, which is an
+    engine failure, not a ceiling below the grid.
+
+    An `ok` sweep is never an engine failure: an ok verdict requires a full
+    contiguous stable prefix ending in a graceful knee, so the endpoint
+    demonstrably served throughout -- a dead engine breaks the prefix with an
+    n_ok==0 step and can never read `ok`. For a NON-ok sweep two signals apply:
+
+      1. The LOWEST offered grid rate ended with n_ok == 0: a dead endpoint.
+         A healthy-but-slow server still completes SOME requests at its lowest
+         grid rate; only a dead one completes none (field row: 0.25 rps,
+         n_offered=159, n_ok=0, drop_rate=0.60, p99=NaN). We key on n_ok==0 --
+         NOT on a high drop rate -- deliberately: a high drop/error rate at a
+         low rate is a legitimate stress signal (launch_cell's own endpoint-dead
+         detector counts only all-fail windows for the same reason), so gating on
+         drop_rate would false-reject a genuinely saturated lowest rate that is a
+         real no_stable_point. The all-fail (n_ok==0) window is the clean signal.
+      2. `health_reason` is set: the post-sweep engine health check (which
+         launch_cell runs continuously and this orchestrator now runs too) found
+         the stack lost a container or stopped serving during/around the sweep.
+
+    Only a HEALTHY sweep may conclude no_stable_point -- this is what stops a
+    sick-episode sample from being recorded as a real unstable ceiling."""
+    status = (res.get("status") or "").strip().lower()
+    if status == "ok":
+        return None
+    rows = res.get("sweep_rows") or []
+    if rows:
+        # The ascending sweep runs the lowest offered rate first; pick it by
+        # offered_rate so we do not depend on list order.
+        lowest = min(rows, key=lambda r: _row_offered(r))
+        n_ok = lowest.get("n_ok")
+        if n_ok is not None:
+            try:
+                if int(n_ok) == 0:
+                    return (f"dead endpoint: lowest grid rate "
+                            f"{lowest.get('offered_rate')} rps completed 0 of "
+                            f"{lowest.get('n_offered')} offered "
+                            f"(drop_rate={lowest.get('drop_rate')})")
+            except (TypeError, ValueError):
+                pass
+    if health_reason:
+        return f"engine health check failed: {health_reason}"
+    return None
+
+
+def _row_offered(r: dict) -> float:
+    try:
+        return float(r.get("offered_rate"))
+    except (TypeError, ValueError):
+        return float("inf")
+
+
 def calibration_is_valid(calib_path, cell_id: str, fraction: Optional[float],
                          current_sig: Optional[dict], max_age_days: Optional[float],
                          now: float,
@@ -208,7 +289,8 @@ def calibration_is_valid(calib_path, cell_id: str, fraction: Optional[float],
 
 
 def publish_calibration(tmp_out: Path, out_path: Path,
-                        rc: Optional[int] = None) -> Optional[dict]:
+                        rc: Optional[int] = None,
+                        orchestration: Optional[dict] = None) -> Optional[dict]:
     """Atomically publish a freshly-written calibration, or invalidate a stale one.
 
     calibrate_rate.py writes to a per-sweep TEMP path; only a parseable temp file
@@ -223,7 +305,12 @@ def publish_calibration(tmp_out: Path, out_path: Path,
     calibrate_rate maps status -> exit code (exit_code_for_status), so a parseable
     temp whose rc does not match its status (e.g. an 'ok' JSON left behind by a
     process that was then SIGKILLed, rc=-9) is treated as a crashed sweep and
-    purged -- an abnormal exit must never be published as a success."""
+    purged -- an abnormal exit must never be published as a success.
+
+    `orchestration` (when given) is merged into the published JSON under an
+    "orchestration" key BEFORE the atomic replace -- this is where the fresh-per-
+    sweep provenance lives (stack age at sweep start, engine_failure retry count),
+    recorded on EVERY published calibration regardless of verdict."""
     res = None
     if tmp_out.exists():
         try:
@@ -235,6 +322,11 @@ def publish_calibration(tmp_out: Path, out_path: Path,
         if int(rc) != expected_rc:
             res = None  # rc contradicts the written verdict -> not trustworthy
     if res is not None:
+        if orchestration is not None:
+            res["orchestration"] = dict(orchestration)
+            # Re-serialize the merged dict into the temp so the atomic replace
+            # publishes the provenance block too (keeps the one-replace guarantee).
+            tmp_out.write_text(json.dumps(res, indent=2))
         os.replace(str(tmp_out), str(out_path))
         return res
     for p in (tmp_out, out_path):
@@ -284,7 +376,7 @@ class Orchestrator:
                  grid_map: dict, env_rates: Optional[list[float]],
                  min_free_gb: float = 20.0, step_min_s: float = 600.0,
                  ceil_mult: float = 20.0, min_method_version: Optional[int] = None,
-                 logf=None) -> None:
+                 engine_failure_retries: int = 1, logf=None) -> None:
         self.campaign_yaml = Path(campaign_yaml)
         self.runs_root = Path(runs_root)
         self.repo_root = Path(repo_root)
@@ -303,6 +395,10 @@ class Orchestrator:
                                    if min_method_version is not None else None)
         self.cooldown_s = cooldown_s
         self.bringup_retries = max(1, int(bringup_retries))
+        # Fresh-stack retries granted to a cell that records an engine_failure
+        # (dead/sick endpoint). Default 1: retry once on a fresh stack, then a
+        # second engine_failure records the cell and moves on.
+        self.engine_failure_retries = max(0, int(engine_failure_retries))
         self.recalibrate = recalibrate
         self.grid_map = grid_map or {}
         self.env_rates = env_rates
@@ -329,6 +425,7 @@ class Orchestrator:
         # containers, so cleanup_after_abort() covers a partial bring-up too).
         self._slot = None
         self._active_engine: Optional[Engine] = None
+        self._last_results: dict[str, dict] = {}
         self._aborting = False
         self._prev_handlers: dict = {}
         self._install_signals = True
@@ -339,6 +436,8 @@ class Orchestrator:
         self._bring_up_fn = self._real_bring_up
         self._sweep_fn = self._real_sweep
         self._teardown_fn = self._real_teardown
+        self._health_fn = self._real_health
+        self._capture_evidence_fn = self._real_capture_evidence
         self._status_fn = self._real_status
         self._dry_run_fn = self._real_dry_run
         self._abort_cleanup = launch_cell.cleanup_after_abort
@@ -483,7 +582,9 @@ class Orchestrator:
 
     # -- sweep --------------------------------------------------------------
 
-    def _real_sweep(self, spec, engine: Engine, grid: list[float]) -> dict:
+    def _real_sweep(self, spec, engine: Engine, grid: list[float], *,
+                    stack_age_s: float = 0.0,
+                    engine_failure_retries: int = 0) -> dict:
         cell = self._render_cell(spec.cell_yaml)
         overrides = cell["workload"]["client_config_overrides"]
         sweep_root = engine.work_dir / "sweeps" / spec.cell_id
@@ -529,7 +630,17 @@ class Orchestrator:
             "--sweep-dir", str(sweep_root / "sweep"),
         ]
         rc = self._invoke_calibrate(cmd, tmp_out)
-        res = publish_calibration(tmp_out, out_path, rc=rc) or {}
+        # Fresh-per-sweep provenance, recorded on EVERY published calibration:
+        # with a fresh stack the age should be ~0, so any non-trivial value in the
+        # data flags a regression back to a shared long-lived stack; the retry
+        # count makes a dead-endpoint episode visible after the fact.
+        orchestration = {
+            "stack_age_at_sweep_start_s": round(max(0.0, float(stack_age_s)), 3),
+            "engine_failure_retries": int(engine_failure_retries),
+            "fresh_stack_per_sweep": True,
+        }
+        res = publish_calibration(tmp_out, out_path, rc=rc,
+                                  orchestration=orchestration) or {}
         status = res.get("status") or "no_output"
         result = {
             "status": status,
@@ -538,6 +649,11 @@ class Orchestrator:
             "rc": rc,
             "grid": list(grid),
             "skipped": False,
+            "stack_age_s": orchestration["stack_age_at_sweep_start_s"],
+            "engine_failure_retries": int(engine_failure_retries),
+            # The published sweep rows, for engine-failure classification (a dead
+            # endpoint shows n_ok==0 at the lowest grid rate).
+            "sweep_rows": res.get("sweep") or [],
         }
         if status != "ok":
             result["suggested_grid"] = suggest_next_grid(status, grid)
@@ -546,6 +662,46 @@ class Orchestrator:
     @staticmethod
     def _real_invoke_calibrate(cmd: list[str], _tmp_out: Path) -> int:
         return subprocess.run(cmd, capture_output=False).returncode
+
+    # -- engine health + failure evidence -----------------------------------
+
+    def _real_health(self, engine: Engine) -> Optional[str]:
+        """Post-sweep engine liveness, using launch_cell's OWN per-lifecycle
+        health_check (container(s) still running, frontend still listing the
+        model, ...). None == healthy, else a short reason. calibrate_dow ran no
+        health check before this batch; that is why the 2026-07-06 stall was only
+        caught after the fact, in the sweep data."""
+        try:
+            return engine.lifecycle.health_check()
+        except Exception as e:  # noqa: BLE001
+            return f"health_check raised {e!r}"
+
+    def _stack_container_names(self, engine: Engine) -> list[str]:
+        lc = engine.lifecycle
+        if hasattr(lc, "stack_containers"):
+            try:
+                return list(lc.stack_containers())
+            except Exception:  # noqa: BLE001
+                return []
+        name = getattr(lc, "container_name", None)
+        return [name] if name else []
+
+    def _real_capture_evidence(self, engine: Engine, spec, reason: str,
+                               ef_retries: int) -> None:
+        """Dump each stack container's docker-logs tail into the calibration work
+        dir BEFORE teardown removes the containers, so a dead-endpoint episode
+        leaves a forensic trail (the finding: calibrate_dow captured nothing, so
+        the stall could only be reconstructed from the sweep rows)."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        ev_dir = engine.work_dir / "engine_failures" / f"{spec.cell_id}_attempt{ef_retries}_{stamp}"
+        try:
+            ev_dir.mkdir(parents=True, exist_ok=True)
+            (ev_dir / "reason.txt").write_text(reason + "\n")
+            for name in self._stack_container_names(engine):
+                launch_cell.save_docker_logs(name, ev_dir / f"docker_{name}.log")
+            self.log(f"{spec.cell_id}: engine-failure evidence captured -> {ev_dir}")
+        except OSError as e:
+            self.log(f"{spec.cell_id}: could not capture engine-failure evidence: {e!r}")
 
     # -- verdict ------------------------------------------------------------
 
@@ -685,58 +841,135 @@ class Orchestrator:
         durations: list[float] = []
         done = 0
         self.log(f"start: {total} cells across {len(groups)} systems "
-                 f"(order: {', '.join(s for s, _ in groups)}); "
-                 f"window={self.window_s}s cooldown={self.cooldown_s}s")
+                 f"(order: {', '.join(s for s, _ in groups)}); FRESH stack per "
+                 f"sweep; step_min={self.step_min_s}s cooldown={self.cooldown_s}s")
 
         for system, cells in groups:
-            todo = []
             for spec in cells:
-                if self.forced(spec.cell_id):
-                    todo.append(spec)
-                    continue
-                ok, reason = self._status_fn(spec)
-                if ok:
-                    done += 1
-                    results[spec.cell_id] = {"status": "ok", "skipped": True,
-                                             "ceiling_rps": None, "rate_calibrated_rps": None}
-                    self.log(f"[{done}/{total}] {spec.cell_id}: already valid ({reason}) -- skip")
-                else:
-                    todo.append(spec)
+                done += 1
+                # Skip a cell whose existing calibration already passes the run's
+                # own gates -- and skip its bring-up too (a skipped cell churns no
+                # stack). --recalibrate forces a re-sweep.
+                if not self.forced(spec.cell_id):
+                    ok, reason = self._status_fn(spec)
+                    if ok:
+                        results[spec.cell_id] = {
+                            "status": "ok", "skipped": True,
+                            "ceiling_rps": None, "rate_calibrated_rps": None}
+                        self.log(f"[{done}/{total}] {spec.cell_id}: already valid "
+                                 f"({reason}) -- skip")
+                        continue
+                try:
+                    results[spec.cell_id] = self._calibrate_cell(
+                        system, spec, done, total, durations)
+                except BringUpFailed as e:
+                    self.log(f"FATAL: {e} -- host precondition, aborting orchestration.")
+                    self._last_results = results
+                    return EXIT_BRINGUP
 
-            if not todo:
-                self.log(f"system {system}: all {len(cells)} calibrations valid -- skipping bring-up")
-                continue
+        self._last_results = results
+        return self._finish(results)
 
-            try:
-                engine = self._bring_up_fn(system, todo[0])
-            except BringUpFailed as e:
-                self.log(f"FATAL: {e} -- host precondition, aborting orchestration.")
-                return EXIT_BRINGUP
+    def _calibrate_cell(self, system: str, spec, done: int, total: int,
+                        durations: list[float]) -> dict:
+        """Calibrate one cell on a FRESH stack. On an engine_failure (dead/sick
+        endpoint) capture evidence, tear down, bring up a fresh stack, and retry
+        up to self.engine_failure_retries times; a final engine_failure is
+        recorded (status engine_failure) and the caller moves on. Only a HEALTHY
+        sweep is allowed to conclude no_stable_point. BringUpFailed propagates to
+        the caller as a hard stop (a host precondition)."""
+        grid = self.resolve_grid(spec)
+        ef_retries = 0
+        while True:
+            # Fresh stack per sweep (methodologically required + the cure for the
+            # long-lived-stack stall). BringUpFailed propagates -> hard stop.
+            engine = self._bring_up_fn(system, spec)
             self._active_engine = engine
-
+            bringup_done_t = self._now()
+            ef_reason: Optional[str] = None
+            res: dict = {}
             try:
-                for spec in todo:
-                    done += 1
-                    grid = self.resolve_grid(spec)
-                    eta = self._eta(durations, total - done)
-                    self.log(f"[{done}/{total}] {spec.cell_id} (system={system}) "
-                             f"calibrating frac={spec.calibration_fraction} grid={grid} {eta}")
-                    t0 = self._now()
-                    res = self._sweep_fn(spec, engine, grid)
-                    durations.append(self._now() - t0)
-                    results[spec.cell_id] = res
-                    extra = ""
-                    if res.get("status") != "ok" and res.get("suggested_grid"):
-                        extra = f"  -> try grid {res['suggested_grid']}"
-                    self.log(f"[{done}/{total}] {spec.cell_id}: status={res.get('status')} "
-                             f"ceiling={res.get('ceiling_rps')} "
-                             f"rate={res.get('rate_calibrated_rps')} "
-                             f"({durations[-1] / 60:.1f} min){extra}")
+                fresh = "" if ef_retries == 0 else f" (engine-failure retry {ef_retries})"
+                eta = self._eta(durations, total - done)
+                self.log(f"[{done}/{total}] {spec.cell_id} (system={system}) "
+                         f"calibrating frac={spec.calibration_fraction} grid={grid} "
+                         f"on a fresh stack{fresh} {eta}")
+                t0 = self._now()
+                stack_age_s = max(0.0, t0 - bringup_done_t)
+                res = self._sweep_fn(spec, engine, grid,
+                                     stack_age_s=stack_age_s,
+                                     engine_failure_retries=ef_retries)
+                durations.append(self._now() - t0)
+                health_reason = self._health_fn(engine)
+                ef_reason = classify_engine_failure(res, health_reason)
+                # Capture the docker-logs trail WHILE the containers still exist
+                # (teardown in the finally removes them).
+                if ef_reason is not None:
+                    self._capture_evidence_fn(engine, spec, ef_reason, ef_retries)
             finally:
                 self._teardown_fn(engine)
                 self._active_engine = None
 
-        return self._finish(results)
+            if ef_reason is None:
+                self._log_result(done, total, spec, res, durations[-1] if durations else 0.0)
+                return res
+
+            res = self._as_engine_failure(spec, res, ef_reason)
+            if ef_retries >= self.engine_failure_retries:
+                self.log(f"[{done}/{total}] {spec.cell_id}: ENGINE FAILURE again "
+                         f"({ef_reason}) after {ef_retries} retr"
+                         f"{'y' if ef_retries == 1 else 'ies'}; recording "
+                         f"engine_failure and moving on")
+                return res
+            ef_retries += 1
+            self.log(f"[{done}/{total}] {spec.cell_id}: ENGINE FAILURE ({ef_reason}); "
+                     f"tore down, bringing up a FRESH stack to retry (retry {ef_retries})")
+
+    def _as_engine_failure(self, spec, res: dict, reason: str) -> dict:
+        """Turn a sweep result into an engine_failure verdict (distinct from the
+        measurement verdicts) and stamp the same classification onto the on-disk
+        calibration JSON so an audit of the calibration files sees engine_failure,
+        not a fabricated no_stable_point. Drops any suggested_grid: a fresh stack,
+        not a wider/narrower grid, is the fix."""
+        out = dict(res)
+        raw_status = out.get("status")
+        out["status"] = "engine_failure"
+        out["engine_failure_reason"] = reason
+        out["raw_status"] = raw_status
+        out.pop("suggested_grid", None)
+        self._stamp_engine_failure_file(spec, reason, raw_status)
+        return out
+
+    def _stamp_engine_failure_file(self, spec, reason: str, raw_status) -> None:
+        """Best-effort: rewrite the published calibration JSON's status to
+        engine_failure (keeping the measurement verdict under raw_status). The
+        campaign pre-flight already refuses any non-ok status, so this is for data
+        clarity, not safety -- a future analyst grepping the calibration files for
+        `status` must see the truth of the episode."""
+        p = Path(spec.calibration_file)
+        try:
+            calib = json.loads(p.read_text()) if p.exists() else {"cell_id": spec.cell_id}
+            calib["status"] = "engine_failure"
+            calib["raw_status"] = raw_status
+            orch = calib.setdefault("orchestration", {})
+            orch["engine_failure_reason"] = reason
+            tmp = p.with_name(p.name + ".engine_failure.tmp")
+            tmp.write_text(json.dumps(calib, indent=2))
+            os.replace(str(tmp), str(p))
+        except OSError as e:
+            self.log(f"{spec.cell_id}: could not stamp engine_failure onto "
+                     f"{spec.calibration_file}: {e!r}")
+
+    def _log_result(self, done: int, total: int, spec, res: dict, dur_s: float) -> None:
+        extra = ""
+        if res.get("status") != "ok" and res.get("suggested_grid"):
+            extra = f"  -> try grid {res['suggested_grid']}"
+        self.log(f"[{done}/{total}] {spec.cell_id}: status={res.get('status')} "
+                 f"ceiling={res.get('ceiling_rps')} "
+                 f"rate={res.get('rate_calibrated_rps')} "
+                 f"stack_age={res.get('stack_age_s')}s "
+                 f"ef_retries={res.get('engine_failure_retries')} "
+                 f"({dur_s / 60:.1f} min){extra}")
 
     @staticmethod
     def _eta(durations: list[float], remaining: int) -> str:
@@ -747,20 +980,36 @@ class Orchestrator:
 
     def _finish(self, results: dict[str, dict]) -> int:
         non_ok = {cid: r for cid, r in results.items() if r.get("status") != "ok"}
+        counts: dict[str, int] = {}
+        for r in results.values():
+            counts[r.get("status")] = counts.get(r.get("status"), 0) + 1
+        # engine_failure is broken out from the measurement verdicts (did_not_
+        # saturate / no_stable_point): a dead/sick endpoint is a different problem
+        # (fix the stack) from a grid that did not bracket the ceiling (fix the
+        # grid), and conflating them is exactly what hid the 2026-07-06 stall.
+        known = ("ok", "did_not_saturate", "no_stable_point", "engine_failure")
+        other = sum(n for s, n in counts.items() if s not in known)
         self.log("=" * 72)
-        self.log(f"SUMMARY: {len(results)} cells, "
-                 f"{len(results) - len(non_ok)} ok, {len(non_ok)} need attention")
-        header = f"{'cell':<30} {'status':<16} {'ceiling':>9} {'rate':>9}  suggested_next_grid"
+        self.log(f"SUMMARY: {len(results)} cells -- "
+                 f"{counts.get('ok', 0)} ok, "
+                 f"{counts.get('did_not_saturate', 0)} did_not_saturate, "
+                 f"{counts.get('no_stable_point', 0)} no_stable_point, "
+                 f"{counts.get('engine_failure', 0)} engine_failure"
+                 + (f", {other} other" if other else ""))
+        header = f"{'cell':<30} {'status':<16} {'ceiling':>9} {'rate':>9}  note (next grid / failure reason)"
         self.log(header)
         for spec in self.specs():
             r = results.get(spec.cell_id)
             if r is None:
                 continue
-            sug = r.get("suggested_grid")
-            sug_s = "" if not sug else ",".join(str(x) for x in sug)
+            if r.get("status") == "engine_failure":
+                note = f"ENGINE FAILURE: {r.get('engine_failure_reason', '')}"
+            else:
+                sug = r.get("suggested_grid")
+                note = "" if not sug else ",".join(str(x) for x in sug)
             skip = " (skipped)" if r.get("skipped") else ""
             self.log(f"{spec.cell_id:<30} {str(r.get('status')) + skip:<16} "
-                     f"{_fmt(r.get('ceiling_rps')):>9} {_fmt(r.get('rate_calibrated_rps')):>9}  {sug_s}")
+                     f"{_fmt(r.get('ceiling_rps')):>9} {_fmt(r.get('rate_calibrated_rps')):>9}  {note}")
 
         self.log("=" * 72)
         self.log("VERDICT: running the campaign pre-flight the runs will use "
@@ -853,6 +1102,7 @@ def build_orchestrator(args) -> Orchestrator:
         min_method_version=min_method_version,
         cooldown_s=args.cooldown_seconds,
         bringup_retries=args.bringup_retries,
+        engine_failure_retries=args.engine_failure_retries,
         recalibrate=recal,
         grid_map=_load_grid_map(args.rate_grids),
         env_rates=_env_rates(),
@@ -884,7 +1134,12 @@ def main() -> None:
                         "the built-in per-system default grids (cell_id wins over system). "
                         "The env var WOSAR_CALIB_RATES=r1,r2,... overrides globally.")
     p.add_argument("--bringup-retries", type=int, default=1,
-                   help="Engine bring-up attempts per system before a hard stop.")
+                   help="Engine bring-up attempts per sweep before a hard stop.")
+    p.add_argument("--engine-failure-retries", type=int, default=1,
+                   help="Fresh-stack retries for a cell that records an "
+                        "engine_failure (dead/sick endpoint). Default 1: retry "
+                        "once on a fresh stack, then record engine_failure and "
+                        "move on. 0 disables the retry.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the grouped plan and each cell's current validity, then exit "
                         "(no lock, no bring-up).")

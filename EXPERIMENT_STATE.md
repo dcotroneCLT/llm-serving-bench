@@ -146,15 +146,41 @@ a cross-anchor against the long test. Strict serialism confirmed. Calendar:
 wk1 calibrations + dry-run; wk2-14 screening (57 runs); wk14-18 finer DoE +
 2x 7-day confirmations; wk19-20 contingency.
 
-**NEXT STEP (resume here): pre-campaign phase, two items left.**
-1. Generate the DoW cells + campaign yaml (Res V 16-run I=ABCDE + 3 center
-   points x 3 systems = 57 runs, 36h each except Dynamo CPs at 48h,
-   fixed-seed interleaved ordering across systems, calibration_required on
-   every cell; levels CONFIRMED 2026-06-29 in the plan) and dry-run it.
-2. Per-cell calibration (30%/85% of the per-cell ceiling) with the
-   validated calibrate_rate path; keep calibration topology in sync with
-   cell topology (dynamo cells calibrate against the same 1+1 stack the
-   run uses); provenance + max-age gates are enforced in code.
+**DoW GENERATION DONE + FIRST CALIBRATION PASS DONE, then a measurement
+bug found and fixed (2026-07-13..16).** The 57-cell campaign is generated
+from a checked-in design matrix (scripts/generate_dow_cells.py, seed
+20260710, I=ABCDE verified independently: 16/16 unique balanced points per
+system, CP sentinels at schedule positions 1/28/55 per system, perfect
+system interleave, Dynamo CPs the only 48h cells) and dry-runs correctly.
+The week-1 calibration orchestrator (scripts/calibrate_dow.py, one
+bring-up per system via the launch_cell lifecycles, run-slot lock held,
+per-cell files with fraction binding) ran the first full pass: 35/57 ok,
+22 no_stable_point. Diagnosis from the sweep JSONs: NOT a grid problem --
+a measurement bias. The v1 sweep sized steps by request count, so on
+long-latency shapes the in-flight tail depressed achieved/offered
+mechanically (cp1 dynamo: ratio 0.83 with 50/50 ok, zero drops, flat
+latency; vllm p16: ratio 0.42 with p50_e2e=25s in a ~100s window). The
+failures were exactly the D=+1/E=+1 quadrant + all center points (long
+latency x bursty). Fix (commit 6b85180, method version 2): wall-duration
+step windows (max(600s, 20 x running p99)), achieved_ratio attributed by
+submission time with drain >= p99, burst-cycle-aligned sub-windows,
+acceptance criteria UNCHANGED, calibration_method_version=2 recorded
+(provenance warns on v1 files). The 35 v1 "ok" ceilings were conservatively
+biased by shape-dependent amounts -> ALL 57 cells will be recalibrated
+under v2 for factor-A uniformity (~78h, fits week 1; single global window
+defaults kept deliberately -- no per-shape knobs, estimator uniformity is
+the point).
+
+**NEXT STEP (resume here):**
+1. Independent read-only audit (Codex) of the calibration subsystem
+   (sweep methodology v2, orchestrator, cell->fraction->rate binding
+   chain); triage findings.
+2. Recalibrate all 57 cells under method v2 (tmux, ~78h):
+   `python3 scripts/calibrate_dow.py --recalibrate all`, then the DoW
+   dry-run must show 57/57 calib=ok.
+3. START THE CAMPAIGN: tmux new -s dow; campaign.py --campaign-yaml
+   campaigns/extension/dow_campaign.yaml --start. Daily operator routine:
+   longtest_status.sh + ALERT.json + campaign_health.sh.
 Backlog (non-blocking): longtest_status.sh must fail loudly when run
 outside the wosar env (today it prints truncated paths); summaries of
 review-fix commits 2322c09/ad18f22 still owed to this file.
