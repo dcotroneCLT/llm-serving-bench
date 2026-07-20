@@ -74,8 +74,13 @@ for cell in "${CELLS[@]}"; do
     echo "==========================================${RESET}"
     LOG="$OUTPUT_DIR/calib_${cell}.log"
 
-    if ! bash "$REPO_ROOT/scripts/calibrate_rate.sh" "$cell" 2>&1 | tee "$LOG"; then
-        echo "${RED}[calib_all] $cell FAILED (rc=$?). Skipping summary line; continuing.${RESET}"
+    # Capture the CALIBRATOR's rc (PIPESTATUS[0]), not tee's, and before any
+    # other command clobbers it -- $? inside `if ! ... | tee; then` reflects the
+    # negated pipeline, not calibrate_rate.sh, so the reported rc was misleading.
+    bash "$REPO_ROOT/scripts/calibrate_rate.sh" "$cell" 2>&1 | tee "$LOG"
+    rc=${PIPESTATUS[0]}
+    if [ "$rc" -ne 0 ]; then
+        echo "${RED}[calib_all] $cell FAILED (rc=$rc). Skipping summary line; continuing.${RESET}"
         echo -e "${cell}\tFAILED\tFAILED\tFAILED" >> "$SUMMARY"
         continue
     fi
