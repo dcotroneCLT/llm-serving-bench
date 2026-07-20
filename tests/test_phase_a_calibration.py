@@ -14,10 +14,11 @@ import calibrate_rate as cr  # noqa: E402
 import launch_cell as lc  # noqa: E402
 
 
-def _row(offered, ratio, drop=0.0, p99=1.0, climb=0.0):
+def _row(offered, ratio, drop=0.0, p99=1.0, climb=0.0, n_ok=1000):
+    # n_ok defaults high so the climb sample-gate is OFF unless a test lowers it.
     return {"offered_rate": offered, "achieved_rps": offered * ratio,
             "achieved_ratio": ratio, "drop_rate": drop, "p99_e2e_s": p99,
-            "latency_climb_frac": climb}
+            "latency_climb_frac": climb, "n_ok": n_ok}
 
 
 class SelectCeiling(unittest.TestCase):
@@ -35,6 +36,56 @@ class SelectCeiling(unittest.TestCase):
     def test_no_stable_point_when_lowest_unstable(self):
         rows = [_row(1, 0.4, drop=0.5, climb=3.0), _row(2, 0.3, drop=0.6)]
         ceiling, status = cr.select_ceiling(rows)
+        self.assertIsNone(ceiling)
+        self.assertEqual(status, "no_stable_point")
+
+    def test_bracket_recovers_low_rate_climb_anomaly(self):
+        # The field p12 sweep (fresh, healthy engine): 0.25 fails ONLY climb noise,
+        # 0.5 passes everything, 1.0 is the genuine knee (+1.43 climb). The bracket
+        # selector must return ok at 0.5, NOT no_stable_point.
+        rows = [
+            _row(0.25, 0.999, p99=14.0, climb=0.24, n_ok=130),   # climb noise only
+            _row(0.5, 0.999, p99=22.0, climb=0.06, n_ok=270),    # clean
+            _row(1.0, 0.94, drop=0.01, p99=54.0, climb=1.43, n_ok=520),  # real knee
+        ]
+        ceiling, status = cr.select_ceiling(rows)
+        self.assertEqual(status, "ok")
+        self.assertEqual(ceiling["offered_rate"], 0.5)
+        by_rate = {r["offered_rate"]: r for r in rows}
+        # The low-rate failure is recorded as an anomaly, not a disqualifier.
+        self.assertEqual(by_rate[0.25]["failed_criteria"], ["latency_climb"])
+        self.assertTrue(by_rate[0.25]["low_rate_anomaly"])
+        # The genuine +1.43 climb at 1.0 is STILL caught (not gated away).
+        self.assertIn("latency_climb", by_rate[1.0]["failed_criteria"])
+        self.assertFalse(by_rate[1.0].get("low_rate_anomaly", False))
+
+    def test_all_fail_still_no_stable_point(self):
+        rows = [_row(0.25, 0.4, drop=0.5, climb=3.0, n_ok=200),
+                _row(0.5, 0.3, drop=0.6, climb=4.0, n_ok=200)]
+        ceiling, status = cr.select_ceiling(rows)
+        self.assertIsNone(ceiling)
+        self.assertEqual(status, "no_stable_point")
+
+    def test_low_sample_climb_gate_is_inconclusive_pass(self):
+        # A step with too few completions for a meaningful climb trend: the climb
+        # criterion is inconclusive (does not disqualify), flagged in the row. With
+        # a higher rate failing above, the low rate becomes the (conservative)
+        # ceiling.
+        rows = [_row(0.25, 0.999, climb=0.5, n_ok=10),          # climb gated off
+                _row(0.5, 0.4, drop=0.5, climb=3.0, n_ok=200)]  # hard fail above
+        ceiling, status = cr.select_ceiling(rows, climb_min_samples=30)
+        self.assertEqual(status, "ok")
+        self.assertEqual(ceiling["offered_rate"], 0.25)
+        by_rate = {r["offered_rate"]: r for r in rows}
+        self.assertTrue(by_rate[0.25]["climb_inconclusive"])
+        self.assertEqual(by_rate[0.25]["failed_criteria"], [])
+
+    def test_climb_gate_applies_when_samples_sufficient(self):
+        # SAME climb, but enough samples -> the criterion applies and disqualifies,
+        # so nothing passes -> no_stable_point (the gate must not mask real climb).
+        rows = [_row(0.25, 0.999, climb=0.5, n_ok=200),
+                _row(0.5, 0.4, drop=0.5, climb=3.0, n_ok=200)]
+        ceiling, status = cr.select_ceiling(rows, climb_min_samples=30)
         self.assertIsNone(ceiling)
         self.assertEqual(status, "no_stable_point")
 

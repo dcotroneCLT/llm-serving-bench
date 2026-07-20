@@ -200,6 +200,30 @@ class CheckCalibrationProvenance(unittest.TestCase):
             lc.check_calibration_provenance(
                 calib, self._sig(), 14, now, min_method_version=2)
 
+    def test_selector_revision_2_1_accepted_by_min_2(self):
+        # A v2.1 (bracket-selector) file has the SAME measurement as v2, so a
+        # min_method_version=2 gate must accept it (2.1 >= 2), not reject it.
+        now = time.time()
+        calib = _calib(now=now)
+        calib["calibration_method_version"] = 2.1
+        lc.check_calibration_provenance(
+            calib, self._sig(), 14, now, min_method_version=2)  # no raise
+
+    def test_selector_revision_2_1_does_not_warn_against_expected_2(self):
+        # The measurement (integer) part matches expected v2, so the soft warn
+        # must stay silent for a selector-only revision.
+        import io
+        from contextlib import redirect_stderr
+        now = time.time()
+        calib = _calib(now=now)
+        calib["calibration_method_version"] = 2.1
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            lc.check_calibration_provenance(
+                calib, self._sig(), 14, now,
+                warn_method_version=lc.EXPECTED_CALIBRATION_METHOD_VERSION)
+        self.assertNotIn("WARNING", buf.getvalue())
+
 
 class CheckCalibrationBinding(unittest.TestCase):
     """A calibration must be for THIS cell at THIS fraction, else Factor A (rate)

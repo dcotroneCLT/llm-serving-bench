@@ -900,11 +900,13 @@ class CalibrationError(Exception):
 # month-3 run is exactly the staleness this gate exists to stop.
 DEFAULT_CALIBRATION_MAX_AGE_DAYS = 14
 
-# The calibration measurement method this build EXPECTS (mirrors
-# calibrate_rate.CALIBRATION_METHOD_VERSION). A file recorded by an older method
-# is not rejected -- host/image/age still gate it -- but callers can ask
-# check_calibration_provenance to WARN so a v1 (finite-window-biased) ceiling is
-# not silently reused after the v2 fix. Bump in lockstep with calibrate_rate.
+# The calibration MEASUREMENT method this build EXPECTS -- the INTEGER part of
+# calibrate_rate.CALIBRATION_METHOD_VERSION (a selector-only revision like 2 ->
+# 2.1 keeps the same measurement, so it must not trip the soft warn; see the
+# integer-part comparison in check_calibration_provenance). A file recorded by an
+# older method is not rejected -- host/image/age still gate it -- but callers can
+# ask check_calibration_provenance to WARN so a v1 (finite-window-biased) ceiling
+# is not silently reused after the v2 fix. Bump when the MEASUREMENT changes.
 EXPECTED_CALIBRATION_METHOD_VERSION = 2
 
 
@@ -974,20 +976,27 @@ def check_calibration_provenance(calib: dict, current_sig: dict,
         v1 finite-window ceilings this campaign is re-taking as v2).
       - warn_method_version (SOFT): a file whose version differs is only warned
         about on stderr. Ignored when min_method_version already covers it."""
+    # Parse as a FLOAT so a selector-only revision (2 -> 2.1: same measurement,
+    # different verdict logic) is representable and ordered correctly. The integer
+    # part is the MEASUREMENT version; the fractional part is the selector revision
+    # (see calibrate_rate.CALIBRATION_METHOD_VERSION).
     rec_ver_raw = calib.get("calibration_method_version", 1)
     try:
-        rec_ver = int(rec_ver_raw)
+        rec_ver = float(rec_ver_raw)
     except (TypeError, ValueError):
         rec_ver = None  # unparseable -> treat as unknown/too-old below
     if min_method_version is not None:
-        if rec_ver is None or rec_ver < int(min_method_version):
+        if rec_ver is None or rec_ver < float(min_method_version):
             raise CalibrationError(
                 f"calibration_method_version={rec_ver_raw!r} is below the required "
                 f"minimum v{min_method_version}: this ceiling was measured with a "
                 "superseded method (e.g. the v1 finite-window sweep). Re-run "
                 "scripts/calibrate_rate.py to re-calibrate with the current method.")
     elif warn_method_version is not None:
-        if rec_ver is None or rec_ver != int(warn_method_version):
+        # Warn only on a MEASUREMENT-version mismatch (integer part): a v2.1 file
+        # has the same measurement as the expected v2, so it must NOT warn -- only
+        # the biased v1 (or an unparseable version) should.
+        if rec_ver is None or int(rec_ver) != int(warn_method_version):
             print(
                 f"[launch_cell] WARNING: calibration_method_version={rec_ver_raw!r} "
                 f"differs from the expected v{warn_method_version}; this ceiling "

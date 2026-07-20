@@ -162,13 +162,24 @@ def group_by_system(specs: list) -> list[tuple[str, list]]:
     return [(sy, groups[sy]) for sy in ordered]
 
 
-def suggest_next_grid(status: str, grid: list[float]) -> Optional[list[float]]:
+def suggest_next_grid(status: str, grid: list[float],
+                      rows: Optional[list[dict]] = None) -> Optional[list[float]]:
     """The grid to try next for a non-ok sweep.
 
     did_not_saturate: every swept rate stayed stable, so the ceiling is only a
-    LOWER bound -- extend the grid upward. no_stable_point: even the lowest rate
-    was unstable -- the ceiling is below the grid, so drop an order of magnitude.
-    """
+    LOWER bound -- extend the grid upward.
+
+    no_stable_point: no rate passed. Point the grid DOWN only when the LOWEST
+    swept rate failed on a SATURATION signal (drops / achieved_ratio / p99) -- a
+    lower rate then plausibly clears it. If the lowest rate failed only on climb
+    noise (or a load-generator span/rc issue), a lower rate makes the climb
+    estimator NOISIER, not the server healthier, so no downward suggestion is
+    offered (the field p12 lesson: its low-rate failure was climb noise, and the
+    old selector's downward grid pointed exactly the wrong way). With the bracket
+    selector a sweep that has a stable point is now `ok` (no suggestion needed at
+    all), so this branch only fires when genuinely nothing passed. When `rows`
+    carries no per-row failed_criteria (older data), fall back to the historical
+    downward suggestion."""
     g = sorted(float(x) for x in grid)
     if not g:
         return None
@@ -176,6 +187,12 @@ def suggest_next_grid(status: str, grid: list[float]) -> Optional[list[float]]:
         top = g[-1]
         return g + [round(top * 2, 4), round(top * 3, 4)]
     if status == "no_stable_point":
+        if rows:
+            lowest = min(rows, key=lambda r: r.get("offered_rate", float("inf")))
+            failed = lowest.get("failed_criteria")
+            if failed is not None and not (
+                    set(failed) & calibrate_rate.SATURATION_CRITERIA):
+                return None  # low-rate climb/span noise; lower rates won't help
         low = g[0]
         return [round(low / 8, 4), round(low / 4, 4), round(low / 2, 4)]
     return None
@@ -656,7 +673,8 @@ class Orchestrator:
             "sweep_rows": res.get("sweep") or [],
         }
         if status != "ok":
-            result["suggested_grid"] = suggest_next_grid(status, grid)
+            result["suggested_grid"] = suggest_next_grid(
+                status, grid, rows=result["sweep_rows"])
         return result
 
     @staticmethod

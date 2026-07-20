@@ -171,14 +171,58 @@ under v2 for factor-A uniformity (~78h, fits week 1; single global window
 defaults kept deliberately -- no per-shape knobs, estimator uniformity is
 the point).
 
+**SECOND CALIBRATION FINDING (2026-07-17): engine failures were being
+misclassified as measurement verdicts.** The v2 full pass (~72h) left 11
+Dynamo cells "no_stable_point"; the sweep JSONs showed the truth: n_ok=0,
+drop_rate 0.60, latencies NaN at the lowest rate -- a DEAD endpoint, not an
+unstable ceiling. The orchestrator log shows time-contiguous failure
+episodes (4 consecutive ~11-min failures, recovery with 5 consecutive ok,
+then 6 consecutive failures with no recovery) on the single Dynamo stack
+the one-bring-up-per-system optimization kept alive for ~9h: the known
+total-stall pathology (second independent observation after 2026-07-06;
+paper-relevant). calibrate_dow lacked launch_cell's runtime health checks
+and kept sweeping a dead stack. Fix (committed): FRESH STACK PER SWEEP
+(also methodologically required: DoW runs start on fresh stacks, so
+ceilings must be measured on one), engine_failure as a distinct status
+(n_ok==0 at lowest rate or failed health check; evidence captured; one
+fresh-stack retry; never recorded as no_stable_point), and orchestration
+provenance (stack_age_at_sweep_start_s ~0, retry count) in every JSON.
+
+**THIRD CALIBRATION FINDING (2026-07-20): nightly host jobs poisoned two
+center points.** CP verification (the reason replicated CPs exist) showed
+within-system CP disagreement: triton cp1/cp3 = 0.863/0.865 rps but cp2 =
+0.357; vllm cp1/cp2 = 0.863/0.865 but cp3 = 0.357. Provenance cleared the
+cross-assignment suspicion (per-system cfg hashes and base_urls correct;
+Triton==vLLM exact equalities are the same 0.20.1 engine + quantized
+measurement). The two outliers are exactly the two sweeps that ran in the
+~01:20-02:45 EDT window; their sweep rows are healthy at 0.25/0.5 rps and
+degraded at the 1.0 rps knee (8% drops, p99 39s) -- co-located nightly host
+jobs stealing CPU/IO at the saturation knee. Empirical, accidental
+demonstration of ceiling sensitivity to co-tenancy: quantitative support
+for the strict-serialism design decision (use in TTV).
+
+**Host env changes (2026-07-20, REVERT AFTER THE CAMPAIGN):** masked
+apt-daily.timer, apt-daily-upgrade.timer (package drift mid-campaign was a
+standing hazard anyway), fwupd-refresh.timer, update-notifier-download
+.timer, man-db.timer (`sudo systemctl unmask` + re-enable when the campaign
+ends). /etc/cron.d/wdt = `ipmiutil wdt -r` every minute is the IPMI
+HARDWARE WATCHDOG keep-alive: NEVER touch it (masking it reboots the box).
+anacron (07:30 EDT) left active: outside the incriminated window; the CP
+schedule sentinels watch for residual diurnal effects.
+
 **NEXT STEP (resume here):**
-1. Independent read-only audit (Codex) of the calibration subsystem
-   (sweep methodology v2, orchestrator, cell->fraction->rate binding
-   chain); triage findings.
-2. Recalibrate all 57 cells under method v2 (tmux, ~78h):
-   `python3 scripts/calibrate_dow.py --recalibrate all`, then the DoW
-   dry-run must show 57/57 calib=ok.
-3. START THE CAMPAIGN: tmux new -s dow; campaign.py --campaign-yaml
+1. IN PROGRESS: fresh-stack recalibration of the Dynamo block +
+   triton_p16/p09 (~20-24h). VERIFY the running pass actually carries the
+   --recalibrate flags (an earlier same-day launch without flags was
+   Ctrl-C'd; check for spurious "already valid -- skip" on queued cells).
+2. THEN a final residual pass: triton_cp2 + vllm_cp3 (the two
+   night-poisoned CPs, currently status=ok so they need explicit
+   --recalibrate) + vllm_p16 + triton_p02 + vllm_p02 + vllm_p09 (widened
+   grids per the pass-1 suggestions; p16 is the all-high shape, failed
+   no_stable_point on all three systems -- inspect its v2 sweep before
+   choosing the grid).
+3. DoW dry-run must show 57/57 calib=ok, method v2, stack_age ~0.
+4. START THE CAMPAIGN: tmux new -s dow; campaign.py --campaign-yaml
    campaigns/extension/dow_campaign.yaml --start. Daily operator routine:
    longtest_status.sh + ALERT.json + campaign_health.sh.
 Backlog (non-blocking): longtest_status.sh must fail loudly when run

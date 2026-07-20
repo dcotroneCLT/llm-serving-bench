@@ -75,12 +75,87 @@ import yaml
 # submitted-in-window ratio and a p99 drain grace. Bump this whenever the
 # measurement changes so old-method files are identifiable and cross-method
 # ceilings are never mixed. See measure_window_stats() for the bias fix.
-CALIBRATION_METHOD_VERSION = 2
+# Measurement method version: integer part = how the sweep ROWS are produced
+# (v2 wall-duration steps + unbiased submitted-in-window ratio; see
+# measure_window_stats), fractional part = SELECTOR revision. v2.1 is the bracket
+# selector below -- SAME measurement as v2, so a v2.0 file and a v2.1 file carry
+# identical rows and differ only in how the verdict was derived (a v2.0 file can
+# be re-verdicted from its recorded rows by scripts/reeval_calibration.py without
+# re-running the sweep). Bump the integer part only when the measurement changes.
+CALIBRATION_METHOD_VERSION = 2.1
+
+# Selector revision recorded alongside the verdict. 1 = the legacy contiguous-
+# stable-prefix selector (rejected a sweep the moment the LOWEST rate failed,
+# even on low-rate estimator noise); 2 = the bracket selector below.
+CALIBRATION_SELECTOR_VERSION = 2
+
+# Below this many completed requests a rate step's latency_climb_frac is computed
+# from too few points for its first/second-half means to be meaningful, so the
+# climb criterion is treated as INCONCLUSIVE (does not disqualify) and flagged.
+# See select_ceiling for why this is a SELECTOR gate (using the recorded n_ok),
+# not a change to how climb is measured.
+DEFAULT_CLIMB_MIN_SAMPLES = 30
 
 
 # ---------------------------------------------------------------------------
 # Pure ceiling-selection logic (unit-tested without a server)
 # ---------------------------------------------------------------------------
+
+
+def _climb_sample_count(r: dict) -> Optional[int]:
+    """Effective number of completed requests behind a row's latency_climb_frac.
+    Prefer an explicit climb_samples if a row records one, else fall back to n_ok
+    (the count of ok requests in the measurement sub-window, which is what the
+    climb estimator is computed over). None when neither is recorded (older unit
+    rows) -> the caller treats the climb criterion as fully applicable."""
+    for key in ("climb_samples", "n_ok"):
+        v = r.get(key)
+        if v is not None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def row_failures(
+    r: dict,
+    achieved_ratio_min: float,
+    drop_max: float,
+    p99_bound: float,
+    climb_frac: float,
+    offered_span_min: float,
+    climb_min_samples: int,
+) -> tuple[list[str], bool]:
+    """Which acceptance criteria a row fails, as short names, plus whether the
+    climb criterion was INCONCLUSIVE (too few samples). A row is stable iff the
+    returned failure list is empty. The names are stable identifiers recorded on
+    the row (failed_criteria) so the orchestrator can tell a saturation failure
+    (drops/ratio/p99 -> a real ceiling below the grid) from low-rate climb noise
+    -- the two want opposite grid moves.
+
+    Saturation signals: achieved_ratio, drop_rate, p99_e2e_s. Load-generator
+    integrity: offered_span, client_rc. Backlog trend: latency_climb -- gated on a
+    minimum completed-sample count (see climb_min_samples)."""
+    failures: list[str] = []
+    if r["achieved_ratio"] < achieved_ratio_min:
+        failures.append("achieved_ratio")
+    if r["drop_rate"] > drop_max:
+        failures.append("drop_rate")
+    if r["p99_e2e_s"] > p99_bound:
+        failures.append("p99_e2e_s")
+    if r.get("offered_span_frac", 1.0) < offered_span_min:
+        failures.append("offered_span")
+    if int(r.get("client_rc", 0)) != 0:
+        failures.append("client_rc")
+    n = _climb_sample_count(r)
+    climb_inconclusive = (n is not None and n < int(climb_min_samples))
+    if not climb_inconclusive and r["latency_climb_frac"] > climb_frac:
+        failures.append("latency_climb")
+    return failures, climb_inconclusive
+
+
+SATURATION_CRITERIA = frozenset({"achieved_ratio", "drop_rate", "p99_e2e_s"})
 
 
 def select_ceiling(
@@ -90,44 +165,67 @@ def select_ceiling(
     p99_bound: float = 60.0,
     climb_frac: float = 0.20,
     offered_span_min: float = 0.5,
+    climb_min_samples: int = DEFAULT_CLIMB_MIN_SAMPLES,
 ) -> tuple[Optional[dict], str]:
-    """Pick the conservative ceiling from ascending-rate sweep rows.
+    """Pick the conservative ceiling from ascending-rate sweep rows (BRACKET
+    selector, v2.1). ANNOTATES each row in place with:
+      stable (bool), failed_criteria (list), climb_inconclusive (bool),
+      and low_rate_anomaly (bool) on a sub-threshold failure BELOW the ceiling.
 
-    Each row must have: offered_rate, achieved_rps, achieved_ratio,
-    drop_rate, p99_e2e_s, latency_climb_frac. Returns (ceiling_row, status).
-    status in {"ok", "no_stable_point", "did_not_saturate"}.
+    Each row must have: offered_rate, achieved_rps, achieved_ratio, drop_rate,
+    p99_e2e_s, latency_climb_frac. Returns (ceiling_row, status); status in
+    {"ok", "no_stable_point", "did_not_saturate"}.
 
-    offered_span_frac and client_rc are OPTIONAL (older rows / unit rows omit
-    them): a row lacking them defaults to full span / rc 0, so the acceptance bar
-    is unchanged for callers that don't record them. When present they reject a
-    step whose load generator did not submit across the whole sub-window (a
-    mid-step stall/death) or whose client exited non-zero -- a step that did not
-    actually test the requested offer must not become a ceiling under the v2
-    completed/submitted ratio."""
+    The ceiling is the HIGHEST offered rate that passes every criterion. If a
+    failing rate sits above it (which is always the case when the highest passing
+    rate is not the top of the grid, since every rate above the highest passing
+    one has failed) the knee is bracketed -> "ok". If the highest passing rate IS
+    the top of the grid -> "did_not_saturate" (the ceiling is only a lower bound;
+    extend the grid up). If NO rate passes -> "no_stable_point".
+
+    Why bracket, not the old contiguous-stable-prefix: the prefix logic required
+    stability from the LOWEST rate upward, so a single sub-threshold failure at a
+    low rate (field: dow_dynamo_disagg_p12 on a fresh, healthy engine -- rate 0.25
+    failed ONLY latency_climb by +0.04 over ~130 requests, pure low-rate estimator
+    noise, while 0.5 passed everything and 1.0 failed hard with a +1.43 climb)
+    made the selector return no_stable_point even though a clean stable point (0.5)
+    existed with the knee (1.0) bracketed above it. Such a below-ceiling failure is
+    recorded as a low_rate_anomaly and logged, but does NOT disqualify the sweep.
+    No individual criterion is weakened.
+
+    Climb estimator robustness (climb_min_samples): the climb criterion is gated
+    on a minimum completed-sample count -- below it the row's first/second-half
+    latency means are too few to trend and the criterion is inconclusive-pass
+    (flagged). This is done as a SELECTOR gate on the recorded n_ok, NOT by
+    switching the climb estimate from mean to median: median would change the
+    MEASUREMENT (the recorded latency_climb_frac), which (a) would break the v2.1
+    'selector-only, measurement unchanged' guarantee and (b) is not recomputable
+    by reeval from the recorded rows (the raw per-request timeline is not stored),
+    whereas the sample gate uses only recorded scalars and so applies identically
+    to fresh sweeps and to offline re-evaluation. The gate deliberately does NOT
+    rescue the genuine +1.43 climb at p12's rate 1.0 (hundreds of samples, far
+    above the gate) -- that is a real knee and must still fail."""
     ordered = sorted(rows, key=lambda r: r["offered_rate"])
-
-    def stable(r: dict) -> bool:
-        return (
-            r["achieved_ratio"] >= achieved_ratio_min
-            and r["drop_rate"] <= drop_max
-            and r["p99_e2e_s"] <= p99_bound
-            and r["latency_climb_frac"] <= climb_frac
-            and r.get("offered_span_frac", 1.0) >= offered_span_min
-            and int(r.get("client_rc", 0)) == 0
-        )
-
-    # Top of the contiguous stable prefix from the lowest rate upward.
-    ceiling = None
     for r in ordered:
-        if stable(r):
-            ceiling = r
-        else:
-            break
-    if ceiling is None:
+        failures, climb_inconclusive = row_failures(
+            r, achieved_ratio_min, drop_max, p99_bound, climb_frac,
+            offered_span_min, climb_min_samples)
+        r["failed_criteria"] = failures
+        r["climb_inconclusive"] = climb_inconclusive
+        r["stable"] = not failures
+        r.pop("low_rate_anomaly", None)  # recomputed below; clear a stale flag
+
+    passing = [r for r in ordered if r["stable"]]
+    if not passing:
         return None, "no_stable_point"
+
+    ceiling = passing[-1]  # highest offered rate that passes every criterion
+    for r in ordered:
+        if r["offered_rate"] < ceiling["offered_rate"] and not r["stable"]:
+            r["low_rate_anomaly"] = True
     if ceiling is ordered[-1]:
-        # Every swept rate stayed stable: the sweep never reached the knee,
-        # so this ceiling is a lower bound. Caller should extend the rates.
+        # Every rate up to the top passed: the sweep never bracketed the knee,
+        # so this ceiling is only a lower bound. Caller should extend the rates.
         return ceiling, "did_not_saturate"
     return ceiling, "ok"
 
@@ -559,6 +657,11 @@ def main() -> None:
     p.add_argument("--drop-max", type=float, default=0.02)
     p.add_argument("--p99-bound", type=float, default=60.0)
     p.add_argument("--latency-climb-frac", type=float, default=0.20)
+    p.add_argument("--climb-min-samples", type=int, default=DEFAULT_CLIMB_MIN_SAMPLES,
+                   help="Minimum completed requests for a step's latency_climb_frac "
+                        "to be trusted; below it the climb criterion is inconclusive "
+                        "(does not disqualify) and flagged. The bracket selector, not "
+                        "this gate, is the primary defense against low-rate climb noise.")
     p.add_argument("--offered-span-min", type=float, default=0.5,
                    help="A rate step's submissions must span at least this fraction "
                         "of the measurement sub-window (last-minus-first submit / "
@@ -652,7 +755,23 @@ def main() -> None:
         p99_bound=args.p99_bound,
         climb_frac=args.latency_climb_frac,
         offered_span_min=args.offered_span_min,
+        climb_min_samples=args.climb_min_samples,
     )
+    # Surface the bracket selector's annotations: a low-rate anomaly (a
+    # sub-threshold failure BELOW the chosen ceiling, e.g. climb noise at a low
+    # rate) is recorded and logged but did not disqualify the sweep; an
+    # inconclusive-climb step is flagged too.
+    for r in sorted(rows, key=lambda x: x["offered_rate"]):
+        if r.get("low_rate_anomaly"):
+            print(f"[calibrate]   NOTE low-rate anomaly at {r['offered_rate']} rps: "
+                  f"failed {r.get('failed_criteria')} BELOW the ceiling "
+                  f"{ceiling['offered_rate'] if ceiling else None} rps "
+                  "-- recorded, not disqualifying (knee bracketed above).",
+                  flush=True)
+        if r.get("climb_inconclusive"):
+            print(f"[calibrate]   NOTE climb inconclusive at {r['offered_rate']} rps "
+                  f"(< {args.climb_min_samples} completed samples); climb criterion "
+                  "skipped for this step.", flush=True)
 
     out = {
         "cell_id": args.cell_id,
@@ -662,15 +781,18 @@ def main() -> None:
         "status": status,
         # Identifies the measurement method so v1 (short-fixed-window, biased on
         # long-latency/bursty shapes) files are distinguishable and never mixed
-        # with v2 ceilings. launch_cell.check_calibration_provenance can warn on a
-        # mismatch against the version it expects.
+        # with v2 ceilings. The fractional part is the SELECTOR revision (see
+        # CALIBRATION_METHOD_VERSION); launch_cell.check_calibration_provenance
+        # warns on a measurement (integer-part) mismatch.
         "calibration_method_version": CALIBRATION_METHOD_VERSION,
+        "selector_version": CALIBRATION_SELECTOR_VERSION,
         "criteria": {
             "achieved_ratio_min": args.achieved_ratio_min,
             "drop_max": args.drop_max,
             "p99_bound_s": args.p99_bound,
             "latency_climb_frac": args.latency_climb_frac,
             "offered_span_min": args.offered_span_min,
+            "climb_min_samples": args.climb_min_samples,
         },
         # Step-sizing / sub-window provenance: how each rate step's wall window
         # was sized and partitioned (per-row window_seconds/warmup_s/drain_s/

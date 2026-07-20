@@ -86,6 +86,26 @@ class SuggestNextGrid(unittest.TestCase):
     def test_ok_has_no_suggestion(self):
         self.assertIsNone(cdow.suggest_next_grid("ok", [1, 2, 4]))
 
+    def test_no_stable_point_down_only_on_saturation_failure(self):
+        # Lowest rate failed on a SATURATION signal (drops) -> point the grid DOWN.
+        rows_sat = [{"offered_rate": 0.25, "failed_criteria": ["drop_rate", "achieved_ratio"]},
+                    {"offered_rate": 0.5, "failed_criteria": ["drop_rate"]}]
+        g = cdow.suggest_next_grid("no_stable_point", [0.25, 0.5], rows=rows_sat)
+        self.assertIsNotNone(g)
+        self.assertTrue(g[0] < 0.25)
+
+    def test_no_stable_point_climb_noise_gives_no_downward_grid(self):
+        # Lowest rate failed ONLY on climb noise -> a lower rate makes it worse,
+        # so NO downward suggestion (the p12 lesson).
+        rows_climb = [{"offered_rate": 0.25, "failed_criteria": ["latency_climb"]},
+                      {"offered_rate": 0.5, "failed_criteria": ["latency_climb"]}]
+        self.assertIsNone(
+            cdow.suggest_next_grid("no_stable_point", [0.25, 0.5], rows=rows_climb))
+
+    def test_no_stable_point_without_row_info_keeps_legacy_down(self):
+        # No per-row failure info -> fall back to the historical downward grid.
+        self.assertIsNotNone(cdow.suggest_next_grid("no_stable_point", [0.25, 0.5]))
+
 
 class ClassifyEngineFailure(unittest.TestCase):
     """The 2026-07-06 finding in one function: a dead endpoint (n_ok==0 at the
