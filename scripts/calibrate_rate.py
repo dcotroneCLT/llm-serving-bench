@@ -190,6 +190,29 @@ def row_failures(
 SATURATION_CRITERIA = frozenset({"achieved_ratio", "drop_rate", "p99_e2e_s"})
 
 
+def past_knee(stats: dict, climb_min_samples: int) -> bool:
+    """Whether a just-completed rate step is CLEARLY past the knee, so the sweep
+    can stop early to save GPU-h. Deliberately LOOSER than the acceptance bar --
+    this is a budget heuristic, not the ceiling verdict (select_ceiling decides
+    that from all the rows afterward). Two independent triggers:
+
+      - achieved_ratio < 0.90 -- UNGATED: a completed/offered ratio is meaningful
+        at any sample count, and it independently catches the deeply-backlogged
+        case (measure_s<=0 emits ratio 0.0 with climb inf and n_ok 0).
+      - latency_climb_frac > 1.0 -- but ONLY when the climb is trustworthy, i.e.
+        computed over >= climb_min_samples completions (the SAME gate the ceiling
+        selector applies in row_failures). A noisy climb over too few completions
+        must not halt the sweep before the real stable point / knee, or we would
+        stop at a rate the selector itself would later treat as inconclusive-pass.
+    """
+    if _as_float(stats.get("achieved_ratio")) < 0.90:
+        return True
+    n_climb = _climb_sample_count(stats)
+    climb_trustworthy = (n_climb is None or n_climb >= int(climb_min_samples))
+    climb_val = _as_float(stats.get("latency_climb_frac"))
+    return climb_trustworthy and math.isfinite(climb_val) and climb_val > 1.0
+
+
 def select_ceiling(
     rows: list[dict],
     achieved_ratio_min: float = 0.98,
@@ -774,21 +797,9 @@ def main() -> None:
                 p99_est = max(p99_est, float(p99))
         except (TypeError, ValueError):
             pass
-        # Early stop once clearly past the knee, to save GPU-h. The climb-based
-        # stop is gated on the SAME minimum completed-sample count the SELECTOR
-        # uses (climb_min_samples): a noisy climb over too few completions must
-        # not halt the sweep before the real knee -- otherwise we would stop at a
-        # rate the selector itself would later treat as inconclusive-pass, and the
-        # stable point / knee would go unmeasured. The achieved_ratio branch needs
-        # no gate (a completed/offered ratio is meaningful at any sample count, and
-        # it independently catches the deeply-backlogged case where climb is inf
-        # but n_ok is 0).
-        n_climb = _climb_sample_count(stats)
-        climb_trustworthy = (n_climb is None or n_climb >= args.climb_min_samples)
-        climb_val = _as_float(stats.get("latency_climb_frac"))
-        past_knee_climb = (climb_trustworthy and math.isfinite(climb_val)
-                           and climb_val > 1.0)
-        if _as_float(stats.get("achieved_ratio")) < 0.90 or past_knee_climb:
+        # Early stop once clearly past the knee, to save GPU-h (see past_knee:
+        # the climb trigger uses the SAME sample gate as the ceiling selector).
+        if past_knee(stats, args.climb_min_samples):
             print("[calibrate]   past the knee, stopping sweep early", flush=True)
             break
         time.sleep(args.cooldown_seconds)

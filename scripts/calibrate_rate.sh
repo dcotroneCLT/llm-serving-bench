@@ -1,21 +1,44 @@
 #!/usr/bin/env bash
-# calibrate_rate.sh - saturation throughput sweep for one cell.
+# calibrate_rate.sh - LEGACY / baseline-only saturation sweep for one cell.
 #
-# Launches the cell's container once, then sends the client workload at
-# increasing offered rates for short windows. For each rate, reports the
-# achieved throughput (completed-OK requests / window) and the achieved/offered
-# ratio. The saturation point is where achieved/offered drops below ~0.95
-# AND latency takes off; 85% of saturation is the recommended steady-state
-# rate for the long aging run.
+# ===========================================================================
+# RETIRED BASELINE-PROTOCOL CALIBRATOR -- DO NOT USE FOR THE CURRENT PIPELINE.
+# ===========================================================================
+# This is the ORIGINAL calibrator: short fixed windows, saturation at
+# achieved/offered >= 0.95, and a printed "recommended rate" the operator
+# hand-copies into a campaigns/wosar2026 cell YAML. It writes NO calibration
+# JSON and produces numbers METHODOLOGICALLY INCOMPATIBLE with the current
+# pipeline (v2 wall-duration measurement + unbiased submitted-in-window ratio,
+# v2.1 bracket selector, provenance/host/image gate, engine_failure gating).
 #
-# Usage:
-#   bash scripts/calibrate_rate.sh <cell_id>
+# The ACTIVE calibrators are the Python tools, which write a versioned JSON:
+#   one cell     : scripts/calibrate_rate.py
+#   DoW campaign : scripts/calibrate_dow.py   (fresh-stack orchestrator)
+#
+# Kept only for deliberate reproduction of the retired baseline protocol; it
+# refuses to run unless WOSAR_ALLOW_LEGACY_CALIB=1 is set explicitly.
+#
+# Usage (baseline reproduction only):
+#   WOSAR_ALLOW_LEGACY_CALIB=1 bash scripts/calibrate_rate.sh <cell_id>
 #
 # Wallclock: ~30 min (cold load + 5 rates x 4min + cooldowns + teardown).
 
 set -uo pipefail
 
-CELL_ID="${1:?usage: calibrate_rate.sh <cell_id>}"
+# --- LEGACY guard: fail closed so the old method is never run by accident ---
+if [ "${WOSAR_ALLOW_LEGACY_CALIB:-0}" != "1" ]; then
+    echo "[calib] REFUSING: this is the LEGACY baseline-protocol calibrator" >&2
+    echo "[calib] (short windows, ratio>=0.95, no versioned JSON) -- its numbers" >&2
+    echo "[calib] are methodologically incompatible with the current pipeline." >&2
+    echo "[calib] Use the active calibrators instead:" >&2
+    echo "[calib]   one cell     : scripts/calibrate_rate.py" >&2
+    echo "[calib]   DoW campaign : scripts/calibrate_dow.py" >&2
+    echo "[calib] To run this old method anyway for deliberate baseline" >&2
+    echo "[calib] reproduction, set WOSAR_ALLOW_LEGACY_CALIB=1." >&2
+    exit 2
+fi
+
+CELL_ID="${1:?usage: WOSAR_ALLOW_LEGACY_CALIB=1 calibrate_rate.sh <cell_id>}"
 case "$CELL_ID" in
     e1|e2|e3|e3b|a1|a2) ;;
     *) echo "invalid cell_id '$CELL_ID'"; exit 1 ;;

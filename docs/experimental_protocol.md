@@ -2,6 +2,17 @@
 
 WoSAR 2026 submission. Working document, v0.2.
 
+> ⚠️ **RETIRED BASELINE PROTOCOL.** This document describes the original
+> `campaigns/wosar2026` campaign (three parallel GPU slots; per-cell target
+> rate calibrated with the legacy `scripts/calibrate_rate.sh` and hand-copied
+> into each cell YAML). It is kept for provenance and baseline reproduction
+> only. The **active** study is the strictly-serial DoW screening/extension
+> campaign under `campaigns/extension/` (one fresh engine bring-up per sweep,
+> versioned calibration via `scripts/calibrate_dow.py` / `scripts/calibrate_rate.py`
+> — method v2 wall-duration measurement + v2.1 bracket selector, with
+> provenance/host/image and engine_failure gating). Do not calibrate or run the
+> current campaign from this document.
+
 ## 1. Research Questions
 
 RQ1. Do modern LLM serving stacks exhibit statistically significant

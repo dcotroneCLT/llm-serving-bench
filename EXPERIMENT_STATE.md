@@ -210,24 +210,41 @@ HARDWARE WATCHDOG keep-alive: NEVER touch it (masking it reboots the box).
 anacron (07:30 EDT) left active: outside the incriminated window; the CP
 schedule sentinels watch for residual diurnal effects.
 
+**SELECTOR STATUS (2026-07-20): method v2 measurement, selector v2.1 (bracket).**
+The measurement (sweep rows) is unchanged v2; only the ceiling SELECTOR was
+fixed to the bracket logic (commit 4abec29) and then hardened over two
+independent review rounds (commit 60629b3): an `ok` sweep hiding a dead
+lowest-rate step / a post-sweep health failure now reclassifies as
+engine_failure; required criteria fail CLOSED on NaN/missing; the early-stop
+uses the same climb sample-gate as the selector; reeval skips future/malformed
+files without aborting the batch. Because the fix is selector-only, an
+already-recorded v2 sweep can be RE-VERDICTED OFFLINE with no GPU-h via
+`scripts/reeval_calibration.py --calibration '<glob>'` (dry-run first) instead
+of re-sweeping -- use this for any completed-but-mis-verdicted cells.
+
 **NEXT STEP (resume here):**
 1. IN PROGRESS: fresh-stack recalibration of the Dynamo block +
    triton_p16/p09 (~20-24h). VERIFY the running pass actually carries the
    --recalibrate flags (an earlier same-day launch without flags was
    Ctrl-C'd; check for spurious "already valid -- skip" on queued cells).
+   NOTE: cells that already produced a healthy v2 sweep need only reeval
+   (above), not a re-sweep.
 2. THEN a final residual pass: triton_cp2 + vllm_cp3 (the two
    night-poisoned CPs, currently status=ok so they need explicit
    --recalibrate) + vllm_p16 + triton_p02 + vllm_p02 + vllm_p09 (widened
    grids per the pass-1 suggestions; p16 is the all-high shape, failed
    no_stable_point on all three systems -- inspect its v2 sweep before
    choosing the grid).
-3. DoW dry-run must show 57/57 calib=ok, method v2, stack_age ~0.
+3. DoW dry-run must show 57/57 calib=ok, method v2 (selector v2.1), stack_age ~0.
 4. START THE CAMPAIGN: tmux new -s dow; campaign.py --campaign-yaml
    campaigns/extension/dow_campaign.yaml --start. Daily operator routine:
    longtest_status.sh + ALERT.json + campaign_health.sh.
 Backlog (non-blocking): longtest_status.sh must fail loudly when run
 outside the wosar env (today it prints truncated paths); summaries of
-review-fix commits 2322c09/ad18f22 still owed to this file.
+review-fix commits 2322c09/ad18f22 still owed to this file. Calibrator review
+fixes recorded above (4abec29 bracket selector + reeval; 60629b3 two-round
+hardening). Legacy scripts/calibrate_rate.sh + calibrate_all_cells.sh now
+fail closed unless WOSAR_ALLOW_LEGACY_CALIB=1 (baseline reproduction only).
 
 ---
 

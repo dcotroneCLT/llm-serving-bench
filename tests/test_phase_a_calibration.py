@@ -102,6 +102,35 @@ class SelectCeiling(unittest.TestCase):
         self.assertEqual(status, "no_stable_point")
 
 
+class PastKnee(unittest.TestCase):
+    """The sweep's early-stop heuristic, extracted so the sample-gate on the
+    climb trigger is regression-proof (it mirrors the selector's climb gate)."""
+
+    def _stats(self, ratio, climb, n_ok):
+        return {"achieved_ratio": ratio, "latency_climb_frac": climb, "n_ok": n_ok}
+
+    def test_low_ratio_stops_regardless_of_samples(self):
+        # A collapsed completed/offered ratio is a knee signal at any count.
+        self.assertTrue(cr.past_knee(self._stats(0.5, 0.0, 5), climb_min_samples=30))
+
+    def test_big_climb_with_enough_samples_stops(self):
+        self.assertTrue(cr.past_knee(self._stats(0.99, 1.5, 200), climb_min_samples=30))
+
+    def test_big_climb_below_sample_gate_does_not_stop(self):
+        # THE regression guard: a huge but low-sample climb must NOT early-stop
+        # the sweep -- the selector would treat that same climb as an
+        # inconclusive-pass, so stopping here would leave the real knee unmeasured.
+        self.assertFalse(cr.past_knee(self._stats(0.99, 5.0, 10), climb_min_samples=30))
+
+    def test_healthy_step_does_not_stop(self):
+        self.assertFalse(cr.past_knee(self._stats(0.99, 0.05, 300), climb_min_samples=30))
+
+    def test_backlogged_inf_climb_stops_via_ratio(self):
+        # measure_s<=0 emits ratio 0.0 + climb inf + n_ok 0: the (ungated) ratio
+        # branch still stops even though the inf climb is below the sample gate.
+        self.assertTrue(cr.past_knee(self._stats(0.0, float("inf"), 0), climb_min_samples=30))
+
+
 class ExitCodes(unittest.TestCase):
     def test_mapping(self):
         self.assertEqual(cr.exit_code_for_status("ok"), 0)

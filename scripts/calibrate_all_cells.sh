@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# calibrate_all_cells.sh - run calibrate_rate.sh on every cell, sequentially.
+# calibrate_all_cells.sh - LEGACY / baseline-only: run calibrate_rate.sh on
+# every cell, sequentially.
+#
+# ===========================================================================
+# RETIRED BASELINE-PROTOCOL CALIBRATOR -- DO NOT USE FOR THE CURRENT PIPELINE.
+# ===========================================================================
+# Drives the legacy scripts/calibrate_rate.sh (short windows, ratio>=0.95, no
+# versioned JSON) over the retired wosar2026 baseline cells and prints
+# recommended rates to hand-copy into cell YAMLs. Methodologically incompatible
+# with the current pipeline; the active calibrator for the whole DoW campaign
+# is scripts/calibrate_dow.py (fresh-stack orchestrator writing versioned JSON).
 #
 # Calibrates e1, a1, e2, a2, e3 in order, then derives e3b's rate as
 # 0.287 * e3_recommended (the n=1 ratio between e3b 0.050 rps and e3
@@ -8,18 +18,33 @@
 # Each cell: ~30 min (one container cold load + 6 rates x 4 min + cooldowns).
 # Total wallclock: ~3 hours (sequential, single GPU per cell).
 #
-# Usage:
-#   bash scripts/calibrate_all_cells.sh
+# Usage (baseline reproduction only; the flag propagates to the child script):
+#   WOSAR_ALLOW_LEGACY_CALIB=1 bash scripts/calibrate_all_cells.sh
 #
 # Run in tmux to survive SSH disconnect:
 #   tmux new -d -s calib_all '
 #     source ~/miniconda3/etc/profile.d/conda.sh && \
 #     conda activate wosar && \
 #     cd ~/wosar/llm-serving-bench && \
+#     WOSAR_ALLOW_LEGACY_CALIB=1 \
 #     bash scripts/calibrate_all_cells.sh > ~/wosar/runs/calib_all.log 2>&1
 #   '
 
 set -uo pipefail
+
+# --- LEGACY guard: fail closed so the old method is never run by accident.
+# The child calibrate_rate.sh has its own guard; refuse here too so a direct
+# invocation gives one clear message instead of a per-cell FAILED cascade.
+if [ "${WOSAR_ALLOW_LEGACY_CALIB:-0}" != "1" ]; then
+    echo "[calib_all] REFUSING: this is the LEGACY baseline-protocol calibrator." >&2
+    echo "[calib_all] The current pipeline uses scripts/calibrate_dow.py (DoW" >&2
+    echo "[calib_all] campaign) / scripts/calibrate_rate.py (one cell), which" >&2
+    echo "[calib_all] write versioned calibration JSON (method v2, selector v2.1)." >&2
+    echo "[calib_all] For deliberate baseline reproduction, set" >&2
+    echo "[calib_all] WOSAR_ALLOW_LEGACY_CALIB=1 (it propagates to the child)." >&2
+    exit 2
+fi
+export WOSAR_ALLOW_LEGACY_CALIB
 
 if [ -t 1 ]; then
     BOLD=$'\033[1m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; RESET=$'\033[0m'
