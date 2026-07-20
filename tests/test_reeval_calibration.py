@@ -86,6 +86,16 @@ class Reevaluate(unittest.TestCase):
             rc.reevaluate(_calib(method=1, rows=[dict(r) for r in P12_ROWS]),
                           climb_min_samples=None, now_unix=NOW)
 
+    def test_future_measurement_version_is_skipped_not_downgraded(self):
+        # A v>2 file must be SKIPPED, never re-verdicted and stamped down to 2.1:
+        # its rows are a newer measurement this v2-only tool cannot interpret.
+        calib = _calib(method=3, rows=[dict(r) for r in P12_ROWS])
+        with self.assertRaises(rc.Skip):
+            rc.reevaluate(calib, climb_min_samples=None, now_unix=NOW)
+        # Untouched: version not downgraded, status not recomputed.
+        self.assertEqual(calib["calibration_method_version"], 3)
+        self.assertEqual(calib["status"], "no_stable_point")
+
     def test_no_rows_is_skipped(self):
         with self.assertRaises(rc.Skip):
             rc.reevaluate(_calib(rows=[]), climb_min_samples=None, now_unix=NOW)
@@ -123,6 +133,24 @@ class PublishAndDriver(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 rc.main()
             self.assertEqual(ctx.exception.code, 1)
+
+    def test_malformed_file_errors_but_batch_continues(self):
+        # A structurally broken sweep row (no offered_rate) makes select_ceiling
+        # raise mid-batch. The tool must log ERROR, count it, keep re-verdicting
+        # the rest, and exit non-zero -- not blow up the whole glob on one file.
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "cal_a_bad.json"   # sorts BEFORE the good file
+            bad.write_text(json.dumps(_calib(rows=[{"achieved_ratio": 0.99}])))
+            good = Path(tmp) / "cal_b_good.json"
+            good.write_text(json.dumps(_calib(rows=[dict(r) for r in P12_ROWS])))
+            sys.argv = ["reeval", "--calibration", str(bad),
+                        "--calibration", str(good)]
+            with self.assertRaises(SystemExit) as ctx:
+                rc.main()
+            self.assertEqual(ctx.exception.code, 1)                 # errored -> non-zero
+            self.assertEqual(json.loads(good.read_text())["status"], "ok")  # not aborted
+            # The broken file was left untouched (not partially rewritten).
+            self.assertEqual(json.loads(bad.read_text())["status"], "no_stable_point")
 
 
 if __name__ == "__main__":

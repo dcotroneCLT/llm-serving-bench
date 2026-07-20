@@ -80,6 +80,18 @@ class SelectCeiling(unittest.TestCase):
         self.assertTrue(by_rate[0.25]["climb_inconclusive"])
         self.assertEqual(by_rate[0.25]["failed_criteria"], [])
 
+    def test_nan_required_metric_fails_closed(self):
+        # A row with NaN p99 (n_ok>0 but no usable e2e samples) must NOT read
+        # stable: Python's NaN comparisons are all False, so without a finite
+        # guard `NaN > p99_bound` is False and the row would slip through.
+        rows = [_row(1, 0.999, p99=float("nan")),
+                _row(2, 0.4, drop=0.5, climb=3.0)]
+        ceiling, status = cr.select_ceiling(rows)
+        self.assertIsNone(ceiling)
+        self.assertEqual(status, "no_stable_point")
+        by_rate = {r["offered_rate"]: r for r in rows}
+        self.assertIn("p99_e2e_s", by_rate[1]["failed_criteria"])
+
     def test_climb_gate_applies_when_samples_sufficient(self):
         # SAME climb, but enough samples -> the criterion applies and disqualifies,
         # so nothing passes -> no_stable_point (the gate must not mask real climb).

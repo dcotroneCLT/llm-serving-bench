@@ -207,10 +207,16 @@ def classify_engine_failure(res: dict, health_reason: Optional[str]) -> Optional
     stable operating point. It found none because NOTHING completed, which is an
     engine failure, not a ceiling below the grid.
 
-    An `ok` sweep is never an engine failure: an ok verdict requires a full
-    contiguous stable prefix ending in a graceful knee, so the endpoint
-    demonstrably served throughout -- a dead engine breaks the prefix with an
-    n_ok==0 step and can never read `ok`. For a NON-ok sweep two signals apply:
+    Evaluated on EVERY sweep, regardless of the measurement verdict -- including
+    an `ok` one. The original version short-circuited to None on status == "ok",
+    reasoning that an ok verdict required a full CONTIGUOUS STABLE PREFIX and so
+    proved the endpoint served throughout. The v2.1 bracket selector broke that
+    premise: it takes the HIGHEST passing rate as the ceiling even when a LOWER
+    rate failed (recorded as a low_rate_anomaly), so an `ok` sweep can now hide a
+    dead lowest-rate step (n_ok==0) below the ceiling -- exactly the dead-endpoint
+    signature this function exists to catch. The two liveness signals below are
+    physical facts about the endpoint, independent of the verdict, so they are
+    checked on ok sweeps too:
 
       1. The LOWEST offered grid rate ended with n_ok == 0: a dead endpoint.
          A healthy-but-slow server still completes SOME requests at its lowest
@@ -224,12 +230,13 @@ def classify_engine_failure(res: dict, health_reason: Optional[str]) -> Optional
       2. `health_reason` is set: the post-sweep engine health check (which
          launch_cell runs continuously and this orchestrator now runs too) found
          the stack lost a container or stopped serving during/around the sweep.
+         One fresh bring-up is negligible against publishing a ceiling measured
+         around a sick stack, so a health failure overrides even an ok verdict.
 
-    Only a HEALTHY sweep may conclude no_stable_point -- this is what stops a
-    sick-episode sample from being recorded as a real unstable ceiling."""
-    status = (res.get("status") or "").strip().lower()
-    if status == "ok":
-        return None
+    A dead/sick endpoint is thus never published as a clean measurement: the cell
+    is retried on a fresh stack and, failing that, recorded engine_failure (which
+    the campaign pre-flight refuses). Only a HEALTHY sweep that completed at its
+    lowest rate may conclude no_stable_point."""
     rows = res.get("sweep_rows") or []
     if rows:
         # The ascending sweep runs the lowest offered rate first; pick it by

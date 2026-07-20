@@ -31,9 +31,13 @@ rate for which ALL hold within the measurement sub-window:
     than climb_frac (default 0.20) above the first half (a rising latency
     within a fixed-rate window means the server is accumulating backlog and
     the rate is already unsustainable).
-The ceiling is the top of the contiguous stable prefix (ascending sweep);
-the first unstable rate is the knee. rate_calibrated = fraction x achieved
-throughput at the ceiling.
+The ceiling is the HIGHEST swept rate that passes every criterion (bracket
+selector); a failing rate above it brackets the knee. rate_calibrated =
+fraction x achieved throughput at the ceiling. A sub-threshold failure BELOW
+the ceiling (e.g. low-rate climb-estimator noise) is recorded as a
+low_rate_anomaly and does NOT disqualify the sweep -- so an `ok` verdict no
+longer implies a contiguous stable prefix from the lowest rate; see
+select_ceiling and, downstream, calibrate_dow.classify_engine_failure.
 
 Calibrate at t0 and FIX the rate for the whole run. Capacity erosion over
 48h is a result to observe, not to absorb by re-calibrating mid-run.
@@ -102,6 +106,25 @@ DEFAULT_CLIMB_MIN_SAMPLES = 30
 # ---------------------------------------------------------------------------
 
 
+def _as_float(v) -> float:
+    """Coerce a recorded metric to float; missing/non-numeric -> NaN so the
+    caller's math.isfinite() guard fails the row CLOSED. Python's NaN comparisons
+    are all False, so a bare `r["p99_e2e_s"] > bound` silently passes a NaN."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _as_int(v) -> int:
+    """Coerce a recorded integer field (client_rc); unparseable -> a non-zero
+    sentinel so a corrupt rc fails closed (treated as a non-zero client exit)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return -1
+
+
 def _climb_sample_count(r: dict) -> Optional[int]:
     """Effective number of completed requests behind a row's latency_climb_frac.
     Prefer an explicit climb_samples if a row records one, else fall back to n_ok
@@ -137,20 +160,29 @@ def row_failures(
     Saturation signals: achieved_ratio, drop_rate, p99_e2e_s. Load-generator
     integrity: offered_span, client_rc. Backlog trend: latency_climb -- gated on a
     minimum completed-sample count (see climb_min_samples)."""
+    # Required numeric criteria FAIL CLOSED: a NaN/inf/missing value is a real
+    # measurement gap, not a pass. Without the math.isfinite() guard a row with
+    # e.g. p99_e2e_s=NaN (n_ok>0 but no usable e2e samples) would slip past every
+    # threshold (NaN comparisons are always False) and read stable.
     failures: list[str] = []
-    if r["achieved_ratio"] < achieved_ratio_min:
+    ar = _as_float(r.get("achieved_ratio"))
+    if not math.isfinite(ar) or ar < achieved_ratio_min:
         failures.append("achieved_ratio")
-    if r["drop_rate"] > drop_max:
+    dr = _as_float(r.get("drop_rate"))
+    if not math.isfinite(dr) or dr > drop_max:
         failures.append("drop_rate")
-    if r["p99_e2e_s"] > p99_bound:
+    p99 = _as_float(r.get("p99_e2e_s"))
+    if not math.isfinite(p99) or p99 > p99_bound:
         failures.append("p99_e2e_s")
-    if r.get("offered_span_frac", 1.0) < offered_span_min:
+    span = _as_float(r.get("offered_span_frac", 1.0))
+    if not math.isfinite(span) or span < offered_span_min:
         failures.append("offered_span")
-    if int(r.get("client_rc", 0)) != 0:
+    if _as_int(r.get("client_rc", 0)) != 0:
         failures.append("client_rc")
     n = _climb_sample_count(r)
     climb_inconclusive = (n is not None and n < int(climb_min_samples))
-    if not climb_inconclusive and r["latency_climb_frac"] > climb_frac:
+    climb = _as_float(r.get("latency_climb_frac"))
+    if not climb_inconclusive and (not math.isfinite(climb) or climb > climb_frac):
         failures.append("latency_climb")
     return failures, climb_inconclusive
 
@@ -742,8 +774,21 @@ def main() -> None:
                 p99_est = max(p99_est, float(p99))
         except (TypeError, ValueError):
             pass
-        # Early stop once clearly past the knee, to save GPU-h.
-        if stats["achieved_ratio"] < 0.90 or stats["latency_climb_frac"] > 1.0:
+        # Early stop once clearly past the knee, to save GPU-h. The climb-based
+        # stop is gated on the SAME minimum completed-sample count the SELECTOR
+        # uses (climb_min_samples): a noisy climb over too few completions must
+        # not halt the sweep before the real knee -- otherwise we would stop at a
+        # rate the selector itself would later treat as inconclusive-pass, and the
+        # stable point / knee would go unmeasured. The achieved_ratio branch needs
+        # no gate (a completed/offered ratio is meaningful at any sample count, and
+        # it independently catches the deeply-backlogged case where climb is inf
+        # but n_ok is 0).
+        n_climb = _climb_sample_count(stats)
+        climb_trustworthy = (n_climb is None or n_climb >= args.climb_min_samples)
+        climb_val = _as_float(stats.get("latency_climb_frac"))
+        past_knee_climb = (climb_trustworthy and math.isfinite(climb_val)
+                           and climb_val > 1.0)
+        if _as_float(stats.get("achieved_ratio")) < 0.90 or past_knee_climb:
             print("[calibrate]   past the knee, stopping sweep early", flush=True)
             break
         time.sleep(args.cooldown_seconds)

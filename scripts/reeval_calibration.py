@@ -9,9 +9,11 @@ place -- so the fresh sweeps of a running calibration pass can be re-verdicted
 WITHOUT re-running any GPU-hours.
 
 It is deliberately conservative about what it will touch:
-  - Only measurement v2 files (integer method version 2). A v1 (finite-window-
-    biased) file is SKIPPED: re-verdicting a biased measurement is unsound -- it
-    must be re-SWEPT, not re-selected.
+  - Only measurement v2 files (integer method version EXACTLY 2). A v1 (finite-
+    window-biased) file is SKIPPED: re-verdicting a biased measurement is unsound
+    -- it must be re-SWEPT, not re-selected. A v>2 file is SKIPPED too: its rows
+    are a newer measurement this v2-only tool does not understand, so re-verdicting
+    would silently down-stamp it to 2.1 -- upgrade the tool instead.
   - A file with no recorded sweep rows is SKIPPED (nothing to select from).
   - An `engine_failure` file is SKIPPED: that status is a dead/sick-endpoint
     classification the orchestrator makes (calibrate_dow), not a verdict derivable
@@ -113,9 +115,18 @@ def reevaluate(calib: dict, climb_min_samples: Optional[int],
     if (calib.get("status") or "").strip().lower() == "engine_failure":
         raise Skip("engine_failure (needs a fresh sweep, not a re-verdict)")
     mv = _measurement_version(calib)
-    if mv is None or mv < 2:
-        raise Skip(f"measurement version {calib.get('calibration_method_version')!r} "
-                   "< 2 (must be re-swept, not re-selected)")
+    if mv is None:
+        raise Skip(f"unparseable method version "
+                   f"{calib.get('calibration_method_version')!r}")
+    if mv < 2:
+        raise Skip(f"measurement version {mv} < 2 "
+                   "(must be re-swept, not re-selected)")
+    if mv > 2:
+        # A future measurement carries rows this v2-only selector does not
+        # understand; re-verdicting would silently down-stamp it to 2.1.
+        raise Skip(f"measurement version {mv} > 2 (newer than this reeval tool, "
+                   "which understands only v2 rows -- upgrade the tool, do not "
+                   "down-verdict a future measurement)")
     rows = calib.get("sweep")
     if not rows:
         raise Skip("no recorded sweep rows")
@@ -199,7 +210,23 @@ def main() -> None:
             print(f"[reeval] SKIP   {path}: {s}")
             skipped += 1
             continue
+        except Exception as e:  # noqa: BLE001
+            # One malformed file (e.g. a KeyError on an incomplete sweep row) must
+            # NOT abort the whole glob: log it, count it, carry on so the other
+            # calibrations of a running pass still get re-verdicted. The batch
+            # exits non-zero at the end (errored != 0) so the failure is not lost.
+            print(f"[reeval] ERROR  {path}: re-evaluation failed "
+                  f"({type(e).__name__}: {e})")
+            errored += 1
+            continue
         new_status = calib.get("status")
+        if not args.dry_run:
+            try:
+                publish(path, calib)
+            except OSError as e:
+                print(f"[reeval] ERROR  {path}: publish failed ({e})")
+                errored += 1
+                continue
         verb = "DRY-RUN" if args.dry_run else "WROTE  "
         arrow = f"{old_status} -> {new_status}"
         detail = ""
@@ -210,8 +237,6 @@ def main() -> None:
         print(f"[reeval] {verb} {path}: {arrow}{detail}{flip}")
         if old_status != new_status:
             changed += 1
-        if not args.dry_run:
-            publish(path, calib)
 
     print(f"[reeval] {'(dry-run) ' if args.dry_run else ''}"
           f"{len(paths)} matched: {changed} status-changed, {skipped} skipped, "

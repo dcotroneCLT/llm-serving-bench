@@ -138,11 +138,32 @@ class ClassifyEngineFailure(unittest.TestCase):
                               self._row(0.5, 100, 60, drop=0.40)]}
         self.assertIsNone(cdow.classify_engine_failure(res, health_reason=None))
 
-    def test_ok_sweep_is_never_engine_failure(self):
-        # An ok verdict implies a full stable prefix -> the engine served; even a
-        # (spurious) post-sweep health blip must not override it.
+    def test_ok_sweep_alive_and_healthy_is_not_engine_failure(self):
+        # An ok sweep whose lowest rate actually completed requests, with a clean
+        # post-sweep health check, is a genuine measurement -- not a failure.
         res = {"status": "ok", "sweep_rows": [self._row(0.25, 100, 100)]}
-        self.assertIsNone(cdow.classify_engine_failure(res, health_reason="blip"))
+        self.assertIsNone(cdow.classify_engine_failure(res, health_reason=None))
+
+    def test_ok_sweep_hiding_dead_lowest_rate_is_engine_failure(self):
+        # The v2.1 bracket selector can return `ok` with a DEAD lowest rate
+        # (n_ok==0) below the ceiling, recorded as a low_rate_anomaly. An ok
+        # verdict no longer proves the endpoint served throughout, so the
+        # dead-endpoint signal must still fire (the stale-premise bug).
+        res = {"status": "ok",
+               "sweep_rows": [self._row(0.25, 159, 0, drop=0.60),      # dead, sub-ceiling
+                              self._row(0.5, 100, 99),                 # ceiling
+                              self._row(1.0, 100, 40, drop=0.50)]}     # knee above
+        reason = cdow.classify_engine_failure(res, health_reason=None)
+        self.assertIsNotNone(reason)
+        self.assertIn("dead endpoint", reason)
+
+    def test_health_failure_overrides_ok_verdict(self):
+        # A post-sweep health failure reclassifies even an ok sweep: a ceiling
+        # measured around a sick stack must not be published (one retry is cheap).
+        res = {"status": "ok", "sweep_rows": [self._row(0.25, 100, 100)]}
+        reason = cdow.classify_engine_failure(res, health_reason="stack container down")
+        self.assertIsNotNone(reason)
+        self.assertIn("health check", reason)
 
     def test_health_check_failure_on_non_ok_is_engine_failure(self):
         res = {"status": "no_stable_point",
