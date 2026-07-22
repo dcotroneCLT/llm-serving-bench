@@ -91,6 +91,7 @@ Recommended deployment (survives ssh disconnect; the log file survives tmux loss
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -100,6 +101,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -1046,6 +1048,26 @@ class Campaign:
         return launch_cell.current_calibration_signature(
             socket.gethostname(), gpu_name, driver, image_tag, image_digest)
 
+    def _current_client_config_hash(self, spec: RunSpec) -> Optional[str]:
+        """SHA-256 of the client config THIS run would materialize for `spec`,
+        reproduced exactly as calibrate_rate hashed it (calibrate_dow renders the
+        cell with replica='01' then materializes with replica=1 -- the same two
+        steps launch_cell's real run performs, so the bytes match). Best-effort:
+        any failure (unreadable cell, missing corpus, absent client/config.yaml
+        off the launch host) returns None, which the signature check treats as
+        'cannot determine -> do not compare' rather than a spurious mismatch."""
+        try:
+            raw = yaml.safe_load(Path(spec.cell_yaml).read_text())
+            cell = launch_cell.render_in_obj(
+                raw, repo_root=str(self.repo_root),
+                hf_cache_host=str(self.hf_cache_host), replica="01")
+            with tempfile.TemporaryDirectory() as td:
+                cfg = launch_cell.materialize_client_config(
+                    self.repo_root, Path(td), cell, 1)
+                return hashlib.sha256(Path(cfg).read_bytes()).hexdigest()
+        except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError, AttributeError):
+            return None
+
     def check_calibration_provenance(self, spec: RunSpec, now_unix: float) -> tuple[bool, str]:
         """Return (ok, message) for a spec's calibration staleness / host / image
         signature. Only meaningful when the spec has a calibration_file that
@@ -1070,7 +1092,30 @@ class Campaign:
         except launch_cell.CalibrationError as e:
             return False, f"STALE/MISMATCH: {e}"
         age = launch_cell.calibration_age_days(calib, now_unix)
-        return True, (f"fresh (age={age:.1f}d)" if age is not None else "fresh")
+        msg = f"fresh (age={age:.1f}d)" if age is not None else "fresh"
+        # F6: the calibration records the SHA-256 of the materialized client
+        # config it swept (provenance.client_config_hash). The host/image gate
+        # above does NOT cover it, so a cell whose workload bytes changed after
+        # calibration -- same cell id and fraction -- would otherwise reuse the
+        # old ceiling and measure the wrong operating point SILENTLY. We recompute
+        # the hash this run would materialize and, on a mismatch, WARN loudly
+        # rather than campaign-fatal: the reproduction depends on the on-host
+        # corpus/paths, which cannot be validated off-box, so a false mismatch
+        # must never kill a 13-week run. Promote to a hard gate once the dry-run
+        # confirms 57/57 hashes reproduce on the launch host. Either side unknown
+        # -> skip (never a spurious warning).
+        rec_hash = (calib.get("provenance") or {}).get("client_config_hash")
+        cur_hash = self._current_client_config_hash(spec)
+        if rec_hash and cur_hash and str(rec_hash) != str(cur_hash):
+            warn = (f"client_config_hash MISMATCH "
+                    f"(calibrated={rec_hash[:12]}..., current={cur_hash[:12]}...): "
+                    "the workload materialized for this run differs from the one "
+                    "calibrated -- the ceiling may be for the wrong shape. "
+                    "Re-calibrate this cell, or confirm the cell YAML was not "
+                    "edited after calibration.")
+            log(f"WARNING {spec.run_key}: {warn}")
+            msg += f"; WARNING: {warn}"
+        return True, msg
 
     def pending_specs(self) -> list[RunSpec]:
         """Specs that still need to run: everything whose persisted status is not

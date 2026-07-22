@@ -222,23 +222,44 @@ already-recorded v2 sweep can be RE-VERDICTED OFFLINE with no GPU-h via
 `scripts/reeval_calibration.py --calibration '<glob>'` (dry-run first) instead
 of re-sweeping -- use this for any completed-but-mis-verdicted cells.
 
+**PRE-LAUNCH DOUBLE REVIEW (2026-07-22): NO-GO with one systemic root
+cause, now being fixed.** Two independent reviews converged: the campaign
+policy fields (calibration_min_method_version, and the missing
+calibration_max_age_days override) were HAND-EDITED into the generated
+DO-NOT-EDIT dow_campaign.yaml; the generator omits them, so any routine
+regeneration silently erases the policy (same error class paid twice
+already: truth living outside its source of truth). Also: operator tooling
+defaults (longtest_status.sh / campaign_health.sh / README) still point at
+the 3-cell validation campaign, not the DoW. No silent-data-corruption path
+found by either review; 458 tests green; matrix invariants independently
+re-verified.
+
+**DECISION (Domenico, 2026-07-22): calibration_max_age_days = 120, encoded
+in the GENERATOR.** One calibration epoch for the whole screening is
+scientifically preferable to per-block recalibration: all 57 rates stay
+anchored to the same week-1 host state (a mid-campaign re-anchor would be
+confounded with the schedule). Temporal ceiling drift is covered by the CP
+sentinels (positions 1/28/55 per system -- already proven able to catch
+even the nightly-job interference) and environment drift by the
+per-dispatch baseline gate. Record in the paper's TTV exactly in these
+terms.
+
 **NEXT STEP (resume here):**
-1. IN PROGRESS: fresh-stack recalibration of the Dynamo block +
-   triton_p16/p09 (~20-24h). VERIFY the running pass actually carries the
-   --recalibrate flags (an earlier same-day launch without flags was
-   Ctrl-C'd; check for spurious "already valid -- skip" on queued cells).
-   NOTE: cells that already produced a healthy v2 sweep need only reeval
-   (above), not a re-sweep.
-2. THEN a final residual pass: triton_cp2 + vllm_cp3 (the two
-   night-poisoned CPs, currently status=ok so they need explicit
-   --recalibrate) + vllm_p16 + triton_p02 + vllm_p02 + vllm_p09 (widened
-   grids per the pass-1 suggestions; p16 is the all-high shape, failed
-   no_stable_point on all three systems -- inspect its v2 sweep before
-   choosing the grid).
-3. DoW dry-run must show 57/57 calib=ok, method v2 (selector v2.1), stack_age ~0.
-4. START THE CAMPAIGN: tmux new -s dow; campaign.py --campaign-yaml
-   campaigns/extension/dow_campaign.yaml --start. Daily operator routine:
-   longtest_status.sh + ALERT.json + campaign_health.sh.
+1. Residual calibration pass IN PROGRESS (7 did_not_saturate cells with
+   up-extended grids, the 2 night-poisoned CPs, triton_p16 at doubled
+   window with a 0.125 grid escape). Expected: 57/57 ok.
+2. Fix batch from the pre-launch review: F1+F2 (policy fields into
+   generate_dow_cells.py + tests + regeneration, --check clean), F4
+   (operator tooling defaults -> dow_campaign.yaml), F5 (README labels),
+   F6 (enforce client_config_hash in the dispatch signature).
+3. Launch-gate audit ON THE HOST (F3): 57/57 status=ok, v2/v2.1,
+   fraction binding, provenance complete, stack_age ~0, fresh timestamps
+   and ~0.86 ceilings on triton_cp2/vllm_cp3, intra-system ceiling
+   monotonicity. Plus F7: snapshot systemctl list-timers, /etc/cron.d/wdt,
+   timedatectl into the campaign state dir as the host-freeze evidence.
+4. DoW dry-run 57/57 green -> START: tmux new -s dow; campaign.py
+   --campaign-yaml campaigns/extension/dow_campaign.yaml --start. Daily
+   operator routine: longtest_status.sh + ALERT.json + campaign_health.sh.
 Backlog (non-blocking): longtest_status.sh must fail loudly when run
 outside the wosar env (today it prints truncated paths); summaries of
 review-fix commits 2322c09/ad18f22 still owed to this file. Calibrator review

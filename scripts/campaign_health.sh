@@ -104,8 +104,9 @@ HEALTH_RESPAWN_TOLERANCE_S="${HEALTH_RESPAWN_TOLERANCE_S:-90}"
 
 # ---------- CLI ----------
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# Default to the extension (DoW) campaign; --campaign-yaml overrides.
-CAMPAIGN_YAML="$REPO_ROOT/campaigns/extension/campaign.yaml"
+# Default to the extension (DoW) SCREENING campaign; --campaign-yaml overrides.
+# (campaign.yaml is the 3-cell VALIDATION campaign, not the 57-run DoW.)
+CAMPAIGN_YAML="$REPO_ROOT/campaigns/extension/dow_campaign.yaml"
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --campaign-yaml) CAMPAIGN_YAML="${2:?--campaign-yaml requires a path}"; shift 2 ;;

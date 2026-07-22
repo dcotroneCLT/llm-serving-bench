@@ -6,15 +6,32 @@
 # ALWAYS exits 0. Every step degrades gracefully (missing file -> say so, keep
 # going) so a half-written run dir never makes the viewer fail.
 #
-# Usage:  bash scripts/longtest_status.sh
+# Usage:  bash scripts/longtest_status.sh [--campaign-yaml <path>]
+#
+# Defaults to the DoW SCREENING campaign (the 13-week unattended run); pass
+# --campaign-yaml to view the long test or the validation campaign instead.
 
 # Deliberately NOT set -e: a viewer must never abort on a missing/partial file.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CAMPAIGN_YAML="$REPO_ROOT/campaigns/extension/longtest_campaign.yaml"
+# Default to the DoW screening campaign -- the one the operator actually babysits
+# for 13 weeks. --campaign-yaml overrides (long test / validation).
+CAMPAIGN_YAML="$REPO_ROOT/campaigns/extension/dow_campaign.yaml"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --campaign-yaml) CAMPAIGN_YAML="${2:?--campaign-yaml requires a path}"; shift 2 ;;
+        --campaign-yaml=*) CAMPAIGN_YAML="${1#*=}"; shift ;;
+        -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
+    esac
+done
 STATE_DIR="$REPO_ROOT/campaigns/extension/state"
-STATE_FILE="$STATE_DIR/longtest_campaign_state.json"
+# The state file basename comes from the campaign yaml (state_file:), so the
+# viewer follows whichever campaign it was pointed at -- never a hardwired name
+# that would silently show the wrong queue (longtest_ vs dow_ state).
+STATE_BASENAME="$(python3 -c "import yaml,os; print(os.path.basename(yaml.safe_load(open('$CAMPAIGN_YAML')).get('state_file','') or 'dow_campaign_state.json'))" 2>/dev/null || echo dow_campaign_state.json)"
+STATE_FILE="$STATE_DIR/$STATE_BASENAME"
 LOG_DIR="$STATE_DIR/logs"
 
 section() { echo ""; echo "== $* =="; }

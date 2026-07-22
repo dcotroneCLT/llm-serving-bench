@@ -404,6 +404,8 @@ def _campaign_yaml_text(order: list[tuple[str, str]], seed: int,
     lines.append("# --min-inodes-free-mid-run. Explicit for a 57-run unattended campaign rather")
     lines.append("# than relying on the code default; kept in sync with the validation campaign.")
     lines.append(f"min_inodes_free_mid_run: {min_inodes}")
+    lines.append("calibration_min_method_version: 2   # v1 finite-window ceilings REFUSED")
+    lines.append("calibration_max_age_days: 120        # copre lo screening 57-run da calib wk1 unica")
     lines.append("retry_policy:")
     lines.append("  max_retries: 1")
     lines.append("")

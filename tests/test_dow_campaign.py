@@ -313,6 +313,17 @@ class CampaignLoads(unittest.TestCase):
         self.assertEqual(self.campaign["min_inodes_free_mid_run"],
                          val["min_inodes_free_mid_run"])
 
+    def test_calibration_policy_is_generated_not_hand_edited(self):
+        # The v1 finite-window ceilings are REFUSED (hard method floor), and the
+        # 13-week serial schedule needs a max-age wide enough that a wk1
+        # calibration is still fresh for the tail run (~85 days out) -- see the
+        # arithmetic in the 2026-07-10 amendment. Both knobs MUST be emitted by
+        # the generator: a value hand-added to this DO-NOT-EDIT file would be
+        # silently stripped by the next regeneration (the exact class of bug that
+        # once let a leftover v1 ceiling downgrade to a warning).
+        self.assertEqual(self.campaign.get("calibration_min_method_version"), 2)
+        self.assertGreaterEqual(self.campaign.get("calibration_max_age_days", 0), 90)
+
     def test_dynamo_center_points_are_the_only_48h_runs_in_schedule(self):
         sched = camp.build_schedule(self.campaign, self.yaml_path)
         long_runs = [s.cell_id for s in sched if s.duration_s == gen.DUR_48H]
