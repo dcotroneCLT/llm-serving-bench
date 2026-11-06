@@ -1,0 +1,54 @@
+# Hand-written SUBSET of dow_campaign.yaml (NOT generated): the 4 Dynamo
+# cells of the DoW screening still pending when the main campaign was
+# stopped on 2026-11-06 (positions 46/49/52/55 of the original schedule).
+#
+# Why: on 2026-11-06 the Triton and vLLM-standalone cells were found to be
+# monitored with an incomplete process scope (Triton: backend/engine only,
+# tritonserver not sampled; vLLM: API server only, EngineCore not sampled),
+# so their remaining runs would be redone anyway with whole-container-tree
+# scoping. Dynamo scoping (all component PGIDs) is correct, so the Dynamo
+# design is completed here, with the SAME cells, SAME calibration files,
+# SAME policy and the SAME relative order as in the main campaign.
+#
+# Same campaign_id as the main campaign on purpose: run dirs keep the
+# naming of the 15 completed Dynamo runs
+# (extension_dow_screening_dow_dynamo_disagg_<cell>_r01). Separate state
+# file so the main campaign's state stays untouched as a record.
+
+campaign_id: extension_dow_screening
+mode: serial
+description: |
+  Completion of the Dynamo-disaggregated arm of the DoW screening: the 4
+  cells still pending at the 2026-11-06 stop (p16, p09, p05, cp3).
+state_file: state/dow_dynamo_tail_state.json
+replicas_per_cell: 1
+order: cell_at_a_time
+inter_run_cooldown_s: 600
+min_free_gb: 50
+min_free_gb_mid_run: 25
+min_inodes_free_mid_run: 200000
+calibration_min_method_version: 2
+calibration_max_age_days: 120
+retry_policy:
+  max_retries: 1
+runs_root: /home/dcotrone/wosar/runs
+paths:
+  hf_cache_host: /home/dcotrone/wosar/hf_cache
+  repo_root: /home/dcotrone/wosar/llm-serving-bench
+cells:
+  - id: dow_dynamo_disagg_p16
+    yaml: cells/dow/dow_dynamo_disagg_p16.yaml
+    calibration_file: state/calibration/dow_dynamo_disagg_p16.json
+    calibration_required: true
+  - id: dow_dynamo_disagg_p09
+    yaml: cells/dow/dow_dynamo_disagg_p09.yaml
+    calibration_file: state/calibration/dow_dynamo_disagg_p09.json
+    calibration_required: true
+  - id: dow_dynamo_disagg_p05
+    yaml: cells/dow/dow_dynamo_disagg_p05.yaml
+    calibration_file: state/calibration/dow_dynamo_disagg_p05.json
+    calibration_required: true
+  - id: dow_dynamo_disagg_cp3
+    yaml: cells/dow/dow_dynamo_disagg_cp3.yaml
+    calibration_file: state/calibration/dow_dynamo_disagg_cp3.json
+    calibration_required: true

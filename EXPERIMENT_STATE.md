@@ -4,11 +4,114 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-07-05 (ET).
+Last updated: 2026-11-06 (ET).
 
 ---
 
-## ⏸️ RESUME HERE (2026-07-06) — PHASE B items 2+4 and reliability batches R1-R3 DONE and box-validated
+## ⏸️ RESUME HERE (2026-11-06): DoW screening at 44/57, scoping finding, calibration-age DEADLINE Nov 13-14
+
+**Read this block first. Everything below it is history, kept for the record.**
+
+### 1. Where we are
+- The DoW screening campaign (campaign_id `extension_dow_screening`,
+  campaigns/extension/dow_campaign.yaml) has been running since
+  2026-08-30 23:17 UTC: monolithic, strictly serial, 57 runs (54 x 36h +
+  3 Dynamo center points x 48h). It lives in tmux session `dow` on
+  cci-csgpu11.
+- Status 2026-11-06: **44/57 completed, all at attempt 1, zero alerts**;
+  run 45 (dow_vllm_p05) in flight. Disk 504G used / 6.2T free, inodes 1%.
+- Dynamo arm: **15/19 completed**. Pending: p16 (pos 46), p09 (pos 49),
+  p05 (pos 52), cp3 (pos 55, 48h).
+
+### 2. Results so far (CP sentinels, USS slope)
+| System | cp1 (Sep) | cp2 (Oct) | Note |
+|---|---|---|---|
+| Dynamo | +7.30 MB/h | +7.09 MB/h | like-for-like replication within 3% |
+| Triton | +3.414 MB/h | +3.408 MB/h | identical: no host drift |
+| vLLM | +568 B/h | +547 B/h | frontend only, see section 3 |
+The July long test (+7.60 MB/h) used the validation shape at 0.30x: it is a
+cross-shape agreement, not a replication.
+
+### 3. SCOPING FINDING (2026-11-06): the response variable is not the same quantity across systems
+| System | Monitored today | Orchestration | Engine |
+|---|---|---|---|
+| Dynamo | all component PGIDs (frontend + prefill + decode, children incl.) | yes | yes |
+| Triton | backend/EngineCore process only; `tritonserver` main process NOT sampled | NO | yes |
+| vLLM | `vllm serve` (container pid1, API server) only; `VLLM::EngineCore` child NOT sampled | yes | NO |
+Verified on a live vLLM container: pid1 RSS 1.19 GB, EngineCore child RSS
+2.38 GB never sampled. The 19 Dynamo runs are valid and complete; the
+Triton/vLLM runs each measure half of the system, and different halves.
+The paper's central claim (aging lives in the orchestration layer, not in
+the inference path, tested identically on three systems) can only be
+tested today on Dynamo.
+- WoSAR baseline n=3: e1 (vLLM V1) and a1 (vLLM V0) were also
+  frontend-only (pid1, 2 children); a2 measured EngineCore; e3 naive whole
+  process. WoSAR is accepted and published (workshop): this is a
+  DISCUSSION POINT only, no corrective action planned.
+
+### 4. Direction for the Transactions paper (Domenico, 2026-11-06)
+Keep the paper's story unchanged: no patches, no escape routes that
+complicate the claim. Proxy (system.mem) and sidecar approaches DROPPED.
+Plan under discussion (option 1, recommended, Domenico's final go still
+pending on the full scope/calendar):
+1. Complete the Dynamo arm (4 pending cells, see section 5).
+2. Implement whole-container-tree scoping with per-component breakdown
+   (orchestration vs engine) for the single_container lifecycles, i.e. the
+   Dynamo standard; add a validator check that the model-holding process
+   is inside the scope (fail loud otherwise).
+3. Early host reboot (~Nov 16, after Dynamo), validate the new scoping with
+   short runs, recalibrate the 38 Triton/vLLM cells.
+4. Rerun the 38 Triton/vLLM cells interleaved, plus 2 Dynamo center points
+   as bridge between blocks (~63 days, to ~end of January); then 7-day
+   confirmations (to ~mid-February). Host window extension needed.
+
+### 5. CRITICAL DEADLINE: calibration age (120-day policy)
+Calibrations date from Jul 17-22. Ages on 2026-11-06 (dry-run):
+vllm_p12 111.4d, triton_p12 112.0d, dynamo_cp3 108.7d. If the main
+campaign is left alone it will campaign-fatal (exit 5) around **Nov 15**
+when vllm_p12 is dispatched at ~120.4d, and **dynamo cp3 (scheduled ~Nov
+21, ~123.7d) will never run**. The 6-week host hiatus consumed the margin;
+this was not flagged at the Aug 30 restart (oversight, review chat).
+Domenico decided on 2026-11-06 not to touch the campaign for now.
+- **LATEST SAFE INTERVENTION: Nov 13-14, right after dynamo p09
+  completes.** Ctrl-C the main campaign in tmux `dow` (graceful teardown),
+  then start a tail campaign with ONLY p05 + cp3 (dispatch at ~116 and
+  ~118 days).
+- campaigns/extension/dow_dynamo_tail.yaml currently lists 4 cells
+  (p16, p09, p05, cp3) for an immediate stop. **If used on Nov 13-14 it
+  MUST be trimmed to p05 + cp3**: p16 and p09 will already have run dirs,
+  and re-dispatching them would hit the run-dir freshness guard (rc=6,
+  campaign-fatal).
+- After the tail: remove the stale ALERT.json written by the intentional
+  Ctrl-C; check with `bash scripts/longtest_status.sh --campaign-yaml
+  campaigns/extension/dow_dynamo_tail.yaml`.
+
+### 6. Host maintenance coordination
+- CCI TSO (Steven) asked on Oct 26 to update + reboot before 90 days of
+  uptime (Nov 23; up since Aug 25). A Gmail draft reply proposing Nov 30
+  exists in the thread "cci-csgpu11 needs updates and reboot": **DO NOT
+  SEND as is**. The date must become ~Nov 16 (after the Dynamo tail) and
+  the email must also ask for the host until ~mid-February, once the plan
+  in section 4 is confirmed.
+- Wired network change in Woodward Hall, evening of Nov 23: judged
+  irrelevant (all runs are localhost; a link flap at most drops SSH).
+- After the campaign: unmask apt-daily, apt-daily-upgrade, fwupd-refresh,
+  update-notifier-download, man-db timers. Never touch /etc/cron.d/wdt
+  (IPMI hardware watchdog keep-alive).
+
+### 7. Operator routine and backlog
+- Daily, wosar env, never inside the campaign tmux pane:
+  `bash scripts/longtest_status.sh`, `cat campaigns/extension/state/ALERT.json`,
+  `bash scripts/campaign_health.sh`.
+- Backlog: rescoping implementation (section 4.2); heartbeat re-reads the
+  cumulative client CSVs (slow on high-rate cells; read only the last
+  segment); --resume should clear consumed alerts; orchestrator ETA should
+  count only cells it will actually sweep; batch validation script for
+  the full run set; the vLLM p05 run dir interrupted on stop is void.
+
+---
+
+## RESUME (2026-07-06, historical) — PHASE B items 2+4 and reliability batches R1-R3 DONE and box-validated
 
 **Where we are.** After the repass gate went green (see the 2026-07-05 block
 below), PHASE B advanced and a three-round external reliability review was
@@ -244,22 +347,163 @@ even the nightly-job interference) and environment drift by the
 per-dispatch baseline gate. Record in the paper's TTV exactly in these
 terms.
 
-**NEXT STEP (resume here):**
-1. Residual calibration pass IN PROGRESS (7 did_not_saturate cells with
-   up-extended grids, the 2 night-poisoned CPs, triton_p16 at doubled
-   window with a 0.125 grid escape). Expected: 57/57 ok.
-2. Fix batch from the pre-launch review: F1+F2 (policy fields into
-   generate_dow_cells.py + tests + regeneration, --check clean), F4
-   (operator tooling defaults -> dow_campaign.yaml), F5 (README labels),
-   F6 (enforce client_config_hash in the dispatch signature).
-3. Launch-gate audit ON THE HOST (F3): 57/57 status=ok, v2/v2.1,
-   fraction binding, provenance complete, stack_age ~0, fresh timestamps
-   and ~0.86 ceilings on triton_cp2/vllm_cp3, intra-system ceiling
-   monotonicity. Plus F7: snapshot systemctl list-timers, /etc/cron.d/wdt,
-   timedatectl into the campaign state dir as the host-freeze evidence.
-4. DoW dry-run 57/57 green -> START: tmux new -s dow; campaign.py
-   --campaign-yaml campaigns/extension/dow_campaign.yaml --start. Daily
-   operator routine: longtest_status.sh + ALERT.json + campaign_health.sh.
+**RESUMPTION RE-ASSESSMENT (2026-08-30) after a ~6-week host hiatus
+(July DMAR/IOMMU crash + assorted host trouble; box rebooted 2026-08-25):
+ALL LAUNCH GATES GREEN.**
+- Residual calibration pass HAD completed before the hiatus: corpus audit
+  57/57 status=ok, method v2/v2.1, full provenance.
+- The two night-poisoned CPs (triton_cp2 / vllm_cp3) were re-swept
+  2026-07-22 and now read 0.865 / 0.863 -- matching their sibling CPs to
+  the third decimal; the nightly-interference diagnosis is confirmed.
+- Host signature: driver unchanged (580.159.03) so the calibration
+  provenance gate passes; kernel now 7.0.0-30 (noted; campaign baseline
+  freezes at --start); nightly timers still masked (verified per-unit);
+  IOMMU/VT-d remains ENABLED (Dell BIOS offers no clean disable; sysadmin
+  "good to go", one DMAR incident on record -- ACCEPTED RISK, contact:
+  Steven). Per-run kernel-log capture (journalctl) wired into teardown for
+  DMA-event correlation.
+- Calibration ages ~39-45d, within the 120d single-epoch policy (covers
+  through mid-November).
+- Dry-run: exit=0, 57 runs scheduled, free space 6.26TB.
+- Watch-item: the six light re-calibrated cells (p02/p09 x 3 systems) run
+  at 7-20 rps -> millions of client rows per 36h run; heartbeat's
+  cumulative client-CSV re-read will slow near the end of those runs
+  (tolerable; "read only the last segment" optimization in the back
+  pocket).
+
+**CAMPAIGN STARTED 2026-08-30T23:17UTC (monolithic; tranches remain plan B
+if the admins reclaim a maintenance window).** Pre-start cleanup done
+(validation/longtest/calib run dirs archived to
+~/wosar/archive_prelaunch/*.tar.gz then removed; docker clean; ledger
+reset; baseline: 497G used / 6.2T free on /home). One 19-second hiccup at
+start (stop signal at 23:17:32, operator terminal action; resumed
+immediately; stale ALERT cleared; backlog: --resume should clear consumed
+alerts itself).
+
+**STATUS AS OF 2026-09-03:** runs 1-2 COMPLETED at attempt 1 (dynamo cp1
+48h, triton cp1 36h), run 3 (vllm cp1) in flight at 26% with 17k/17k ok,
+health OK throughout, disk flat. Schedule: 57 runs, ~13 weeks, ETA late
+November. Daily operator routine: longtest_status.sh + ALERT.json +
+campaign_health.sh (wosar env, never in the campaign tmux pane).
+
+**DECISION (2026-11-06): stop the main DoW campaign after 44/57 and
+complete ONLY the Dynamo arm (15/19 done; pending p16, p09, p05, cp3).**
+Triton and vLLM cells will be redone with whole-container-tree scoping
+(orchestration + engine, per component, i.e. the Dynamo standard) so the
+paper's claim (aging localized in orchestration vs inference path, tested
+identically on all three systems) holds without patches; proxy/sidecar
+approaches dropped. Tail campaign: campaigns/extension/dow_dynamo_tail.yaml
+(hand-written subset, same campaign_id so run dirs keep the naming of the
+15 completed Dynamo runs, separate state file, same calibrations/policy/
+order). Calibration age margin: Dynamo calibrations ~Jul 20-22, cp3
+dispatch ~Nov 12 -> ~115 of 120 days: start promptly. The interrupted
+vLLM p05 run dir (extension_dow_screening_dow_vllm_p05_r01) is void.
+Next: rescoping implementation for single-container lifecycles + a
+validator check that the model-holding process is inside the scope;
+early reboot (~Nov 16) after the Dynamo tail; then recalibrate and rerun
+the 38 Triton/vLLM cells interleaved, with 2 Dynamo CPs as bridge to the
+first block (~63 days). Host window extension to ~mid-February needed.
+
+**SCOPING FINDING (2026-11-06) -- vLLM standalone engine NOT monitored.**
+Sentinels: Triton cp1/cp2 USS +3.414/+3.408 MB/h (identical -> no host
+drift); vLLM cp1/cp2 +568/+547 BYTES/h (flat). Cause verified on a live
+vLLM container: pid_strategy container_pid1 tracks `vllm serve` (API
+server, RSS 1.19 GB); the engine `VLLM::EngineCore` is a CHILD process
+(RSS 2.38 GB) that is never sampled (num_children=2 in the CSVs). The 15
+completed vLLM DoW runs therefore carry a per-process series of the HTTP
+frontend only. Scoping is heterogeneous across systems (Dynamo: all PGIDs
+incl. EngineCore; Triton: EngineCore|stub regex; vLLM: pid1 only).
+Data not corrupted, but incomplete for the cross-system comparison.
+Options: (A) analysis-only salvage via system.mem_used as SUT proxy,
+valid under strict serialism, proxy calibrated on Dynamo/Triton where both
+series exist; (B) sidecar EngineCore monitor for the 4 remaining vLLM
+runs (separate tmux, no campaign code change) to validate the proxy on
+vLLM itself; (C) rerun the 19 vLLM cells post-screening (~30 box-days).
+Recommendation A+B now, decide C on proxy evidence. Phase 2: new
+pid strategy summing the whole container process tree for every system.
+BASELINE IMPACT -- VERIFIED on the synced baseline CSVs (2026-11-06):
+  e1 vLLM V1 standalone: pid1 `vllm serve`, RSS ~1345 MB, 2 children ->
+     FRONTEND ONLY (engine child never sampled).
+  a1 vLLM V0 standalone: pid1 API server, RSS ~733 MB, 2 children ->
+     FRONTEND ONLY.
+  e2 Triton+vLLM V0: resolved triton_python_backend_stub (849 MB, 2
+     children) -> backend, engine probably in-process (to confirm).
+  a2 Triton+vLLM V1: resolved EngineCore leaf (1890 MB, 0 children) ->
+     engine.
+  e3/e3b naive PyTorch: single process -> whole SUT.
+Consequence for the WoSAR paper: the 2x2 factorial's HOSTING factor is
+fully confounded with measurement scope (standalone = frontend; Triton =
+backend/engine); hosting-effect and engine x hosting interaction claims
+are unsupported as stated; the V0 lockstep RSS/VMS steps (a1) belong to
+the V0 API-server process, not the engine. Baseline ran 3 cells in
+PARALLEL, so no system-memory proxy salvage is possible there. Still
+valid: aging present in every monitored process, stepness methodology,
+n=3, naive cell, Triton V1 engine cells. Recommended (Domenico decides,
+possibly with Bojan): draft the corrected scope text now; camera-ready +
+arXiv v2 with a correction note if accepted; consider informing the
+chairs. For the extension: rerunning the 19 vLLM DoW cells
+post-screening with whole-container-tree scoping (option C) becomes
+NECESSARY, and per-process scoping (frontend vs engine) becomes a
+reported finding.
+Earlier note, kept for history: baseline cells e1 (vLLM V1) AND a1 (vLLM V0)
+also used container_pid1. e1 very likely measured the API frontend only
+(consistent with its ~7 KB/h slope); a1 depends on V0 frontend
+multiprocessing -- verify on the baseline CSVs (rss level + num_children).
+If confirmed: disclose in the WoSAR camera-ready + arXiv v2 (scope
+statement: for vLLM standalone the monitored process is the serving
+frontend, not the engine core). Decision on communication: Domenico.
+Proxy first read: system.mem slope minus per-system background (~2 MB/h
+from Triton/Dynamo) puts the vLLM engine at ~1-2.5 MB/h, same order as
+Triton's EngineCore (+3.4 MB/h); proxy is order-of-magnitude grade only
+(cp1/cp2 differ by 45%, rho 0.86-0.96) -> not sufficient for vLLM factor
+effects. Sidecar EngineCore monitor commissioned for the 5 remaining
+vLLM runs.
+
+**HOST MAINTENANCE COORDINATION (2026-11-06):** CCI TSO (Steven) asked
+on Oct 26 to update+reboot cci-csgpu11 (their target: before 90 days
+uptime = Nov 23; up since Aug 25). Reboot with updates mid-campaign would
+trip the drift gate and invalidate the calibration signature for the last
+runs (the three CP3 sentinels). Proposed Monday Nov 30 (draft reply in
+Gmail, thread "cci-csgpu11 needs updates and reboot"). The reboot then
+falls at the screening -> phase-2 boundary, where a new baseline and new
+calibrations are needed anyway. Separate notice: wired network change in
+Woodward Hall the evening of Nov 23 -- judged irrelevant (all runs are
+localhost; a link flap at most drops SSH; worst case fail-loud + retry).
+
+**CHECKPOINT 2026-11-06 (day 68): 44/57 completed, ALL at attempt 1;
+run 45 in flight; zero alerts; disk 504G (+5G campaign total). Real
+overhead ~20 min/run; screening ETA Nov 26-27 confirmed.**
+Sentinel reading, Dynamo CP USS slope: cp1 (Sep) +7.30 MB/h, cp2 (Oct)
++7.09 MB/h -> like-for-like replication within -3%. CORRECTION to the
+Sep entry: the July long test (+7.60) used the VALIDATION shape at 0.30x,
+not the center-point shape at 0.575x, so Jul-vs-CP is a cross-shape
+agreement (suggestive: Dynamo aging rate weakly shape-sensitive), not a
+replication. WATCH ITEM: the three values are monotone decreasing
+(7.60 / 7.30 / 7.09; system.mem 10.2 -> 8.5 MB/h), cp2 sits at the lower
+edge of cp1's CI. Not yet a drift claim; cp3 (pos 55, late Nov) decides:
+>~6.8 = run-to-run variance; further decline = temporal drift to declare
+in TTV and model as a block effect. Cross-check pending: triton/vllm
+cp1 vs cp2 (common decline -> host-level cause, e.g. seasonal thermal;
+Dynamo-only -> SUT-specific).
+
+**MID-CAMPAIGN CHECKPOINT (2026-10-08, day 38):** 24/57 runs completed,
+ALL at attempt 1 (zero retries, zero failures, zero alerts in five weeks,
+across all three systems including the high-rate cells); run 25
+(dynamo_p13) in flight, exactly on schedule, ETA ~Nov 27 intact. Disk
++4 GB over 38 days, inodes 1%. Notable: the NIXL total-stall pathology has
+NOT recurred in production (conservative calibrated rates + fresh stack
+per run; or the stall is specific to aggressive sweep loads -- either way,
+a datum). Next milestone: second sentinel triplet (positions 28-30,
+~Oct 11-12) -> mid-campaign drift reading vs the September CP values.
+
+**First science check DONE (2026-09-03): cross-month replication
+CONFIRMED.** dynamo cp1 (48h, campaign) USS slope +7.30 MB/h, CI
+[7.08, 8.04] vs the July long test's +7.60 MB/h, CI [7.07, 8.03]:
+agreement within ~4% with overlapping CIs, across a host crash, a reboot
+and a kernel build change (system mem +10.2 vs +9.1 MB/h; even the gpu0
+power micro-drift replicates, +0.0042 vs +0.0034 W/h). The Dynamo aging
+signal is a stable property of the system, and the measurement chain
+reproduces across months.
 Backlog (non-blocking): longtest_status.sh must fail loudly when run
 outside the wosar env (today it prints truncated paths); summaries of
 review-fix commits 2322c09/ad18f22 still owed to this file. Calibrator review
