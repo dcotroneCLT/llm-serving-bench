@@ -43,9 +43,26 @@ engine:
     url: http://localhost:8600/v2/health/ready
     timeout_s: 900
   pid_strategy:
-    type: triton_child
-    process_pattern: EngineCore|triton_python_backend_stub
+    type: container_tree
 monitors:
+  components:
+    scope_type: container_tree
+    engine_group: triton
+    engine_pattern: EngineCore
+    orchestration_pattern: triton_python_backend_stub
+    components:
+    - label: triton_orchestration
+      role: orchestration
+      group: engine
+      pattern: tritonserver|triton_python_backend_stub
+    - label: triton_engine
+      role: engine
+      group: engine
+      pattern: EngineCore
+    - label: triton_auxiliary
+      role: auxiliary
+      group: engine
+      pattern: resource_tracker
   gpu_index_inherits_from_engine: true
   proc:
     label: triton_vllm_020

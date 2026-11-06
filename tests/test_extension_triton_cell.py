@@ -155,11 +155,12 @@ class TritonEngineBlock(unittest.TestCase):
             ["8600:8000", "8601:8001", "8602:8002"],
         )
 
-    def test_pid_strategy_is_triton_child(self):
+    def test_pid_strategy_covers_whole_container(self):
         ps = self.eng["pid_strategy"]
-        self.assertEqual(ps["type"], "triton_child")
-        # The daemon regex must name the memory-holding python child.
-        self.assertIn("EngineCore", ps["process_pattern"])
+        self.assertEqual(ps["type"], "container_tree")
+        spec = _load_cell(TRITON_CELL)["monitors"]["components"]
+        self.assertEqual(spec["scope_type"], "container_tree")
+        self.assertIn("EngineCore", spec["engine_pattern"])
 
     def test_gpu_device_zero(self):
         self.assertEqual(self.eng["gpu_device"], 0)
@@ -237,7 +238,7 @@ class DistinctFromOtherExtensionCells(unittest.TestCase):
                          f"duplicate proc_prefix: {prefixes}")
         self.assertEqual(len(set(names.values())), len(names),
                          f"duplicate container name: {names}")
-        self.assertEqual(prefixes["val_triton"], "triton_vllm_020")
+        self.assertEqual(prefixes["val_triton"], "agg_triton")
         self.assertEqual(names["val_triton"], "val_triton_r{replica}")
 
     def test_host_ports_do_not_collide_with_other_cells(self):

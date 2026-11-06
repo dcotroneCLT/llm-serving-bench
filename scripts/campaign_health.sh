@@ -1174,6 +1174,9 @@ PY
         continue
     fi
 
+    if [ "$PID_STRATEGY" = "container_tree" ]; then
+        LABEL=$(json_get "$manifest" "proc_prefix")
+    fi
     if [ -z "$CELL_ID" ] || [ -z "$GPU_INDEX" ] || [ -z "$LABEL" ] || [ -z "$CONTAINER_NAME" ]; then
         record FAIL "${section}.manifest" "missing required fields after fallback (cell=$CELL_ID gpu=$GPU_INDEX label=$LABEL container=$CONTAINER_NAME kind=$MANIFEST_KIND)"
         continue
@@ -1197,7 +1200,18 @@ PY
 
     # ---- B.1 required output files ----
     files_missing=()
-    [ -s "$run_dir/engine.pid" ] || files_missing+=("engine.pid")
+    if [ "$PID_STRATEGY" = "container_tree" ]; then
+        [ -s "$run_dir/components.json" ] || files_missing+=("components.json")
+        if [ ! -s "$run_dir/scope_identity.json" ]; then
+            if [ "$IS_RUNNING" -eq 1 ] && [ "${ELAPSED:-0}" -lt "$HEALTH_MONITOR_WARMUP_S" ]; then
+                record WARN "${section}.proc.scope" "container identity not written yet (monitor warming up)"
+            else
+                files_missing+=("scope_identity.json")
+            fi
+        fi
+    else
+        [ -s "$run_dir/engine.pid" ] || files_missing+=("engine.pid")
+    fi
     [ -s "$run_dir/image_digest.txt" ] || files_missing+=("image_digest.txt")
     [ -s "$run_dir/docker_inspect.json" ] || files_missing+=("docker_inspect.json")
     [ -d "$run_dir/logs" ] || files_missing+=("logs/")
@@ -1311,6 +1325,26 @@ print('descendant' if pids & compute else 'no')
 
     # ---- B.5 proc_monitor data quality ----
     proc_csvs=$(find_proc_csvs "$run_dir" "$LABEL")
+    if [ "$PID_STRATEGY" = "container_tree" ] && [ -n "$proc_csvs" ]; then
+        scope_bad=$(awk -F, '
+            FNR==1 {
+                a=0; m=0; c=0
+                for(i=1;i<=NF;i++) {
+                    if($i=="process_alive") a=i
+                    if($i=="model_scope_complete") m=i
+                    if($i=="membership_complete") c=i
+                }
+                next
+            }
+            a && ($a=="True" || $a=="true") {
+                if(!m || !c || ($m!="True" && $m!="true") || ($c!="True" && $c!="true")) bad++
+            }
+            END { print bad+0 }
+        ' $proc_csvs)
+        if [ "$scope_bad" -gt 0 ]; then
+            record FAIL "${section}.proc.scope" "$scope_bad alive ticks lack complete model/container coverage"
+        fi
+    fi
     if [ -z "$proc_csvs" ]; then
         record FAIL "${section}.proc.csv" "no proc CSV found"
     else

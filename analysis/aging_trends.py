@@ -391,6 +391,21 @@ def main() -> None:
     else:
         print("  [warn] no proc monitor CSV found", file=progress); proc_ds = None
 
+    # Whole-container roles are sampled coherently with the canonical proc
+    # aggregate. Expose their trends without replacing the total response.
+    component_series = []
+    monitor_spec = load_manifest(run_dir).get("monitors")
+    component_spec = (monitor_spec.get("components") or {}) if isinstance(monitor_spec, dict) else {}
+    if component_spec.get("scope_type") == "container_tree":
+        for component in component_spec["components"]:
+            frame = load_csvs(run_dir, component["label"])
+            if frame is not None:
+                frame = frame[truthy_series(frame["membership_complete"])]
+                frame = filter_warmup(frame, "ts_unix", warmup_s)
+                if not frame.empty:
+                    component_series.append(("component." + component["role"],
+                                             downsample_to_minutes(frame, "ts_unix", args.downsample_seconds)))
+
     system = load_csvs(run_dir, "system")
     if system is None:
         print("  [warn] no system CSVs found", file=sys.stderr); system_ds = None
@@ -416,6 +431,10 @@ def main() -> None:
                     "ecc_db_volatile", "ecc_sb_volatile"]:
             if col in gpu_ds.columns:
                 catalog.append((source, col, gpu_ds[col], gpu_ds["_t_hours"]))
+    for source, frame in component_series:
+        for col in ("rss_bytes", "uss_bytes", "pss_bytes", "vms_bytes"):
+            if col in frame:
+                catalog.append((source, col, frame[col], frame["_t_hours"]))
     if proc_ds is not None:
         for col in ["rss_bytes", "vms_bytes", "uss_bytes", "pss_bytes",
                     "num_threads", "num_fds", "cpu_percent",

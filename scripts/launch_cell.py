@@ -59,6 +59,7 @@ import argparse
 import csv
 import errno
 import json
+import math
 import os
 import platform
 import shutil
@@ -1470,8 +1471,19 @@ class EngineLifecycle:
         raise NotImplementedError
 
 
+def prepare_container_scope(cell: dict, root_pid: int) -> None:
+    """Bind a template to this container instance, for launch and attach paths."""
+    import psutil
+    components = cell["monitors"].get("components", {})
+    if components.get("scope_type") != "container_tree":
+        die("container_tree strategy requires whole-container component spec", rc=6)
+    components.update({"root_pid": root_pid,
+                       "root_create_time": psutil.Process(root_pid).create_time(),
+                       "gpu_devices": gpu_devices_for_cell(cell)})
+
+
 class SingleContainerLifecycle(EngineLifecycle):
-    """The historical single-container path, verbatim. Manifest byte-identical."""
+    """Single container, with opt-in whole-container component monitoring."""
 
     kind = "single_container"
 
@@ -1482,6 +1494,10 @@ class SingleContainerLifecycle(EngineLifecycle):
         self.baseline_mib = 0
         self.container_pid = 0
         self.docker_cmd: list[str] = []
+        self.scope_started_mono = time.monotonic()
+        self.scope_monitoring = False
+        self.scope_last_ts = None
+        self.scope_last_advance = self.scope_started_mono
 
     def bring_up(self) -> None:
         # 3. Tear down any stale container with the same name.
@@ -1515,6 +1531,15 @@ class SingleContainerLifecycle(EngineLifecycle):
         gpu_sanity_check(self.container_pid, self.gpu_device)
 
     def resolve_pid_identity(self) -> tuple[Optional[Path], Optional[subprocess.Popen]]:
+        strategy = self.cell["engine"].get("pid_strategy", {}).get("type")
+        components = self.cell["monitors"].get("components", {})
+        if strategy == "container_tree":
+            prepare_container_scope(self.cell, self.container_pid)
+            self.scope_started_mono = self.scope_last_advance = time.monotonic()
+            self.scope_monitoring = True
+            return None, None
+        if components.get("scope_type") == "container_tree":
+            die("whole-container component spec requires container_tree PID strategy", rc=6)
         pidfile = self.run_dir / "engine.pid"
         if pidfile.exists():
             pidfile.unlink()
@@ -1548,6 +1573,27 @@ class SingleContainerLifecycle(EngineLifecycle):
     def health_check(self) -> Optional[str]:
         if not container_running(self.container_name):
             return f"engine container {self.container_name} is not running"
+        if self.scope_monitoring:
+            row = read_latest_membership_tick(self.run_dir, proc_prefix_for_cell(self.cell))
+            now = time.monotonic()
+            if row:
+                try:
+                    stamp = float(row.get("ts_unix", ""))
+                    if not math.isfinite(stamp):
+                        return "container scope monitor has non-finite timestamp"
+                    if self.scope_last_ts is None or stamp > self.scope_last_ts:
+                        self.scope_last_ts, self.scope_last_advance = stamp, now
+                except (ValueError, TypeError):
+                    return "container scope monitor has invalid timestamp"
+            if now - self.scope_last_advance > MEMBERSHIP_STALE_S:
+                return "container scope monitor missing/stale (no fresh complete scope evidence)"
+            if row is None:
+                return None  # CSV rotation warmup; bounded by the stale clock.
+            for field in ("membership_complete", "model_scope_complete", "process_alive"):
+                if str(row.get(field, "")).strip().lower() != "true":
+                    return f"container scope {field} is not true: {row.get('scope_error', '')}"
+            if str(row.get("n_pids_unexpected", "")).strip() != "0":
+                return "container scope has missing/invalid/unexpected process count"
         return None
 
     def wait_quiescence(self) -> None:

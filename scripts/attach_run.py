@@ -127,6 +127,11 @@ def main() -> None:
         pidfile = run_dir / "engine.pid"
         pidfile.write_text(f"{args.engine_pid}\n")
         lc.log(f"single-process: engine.pid={args.engine_pid}")
+    elif components.get("scope_type") == "container_tree":
+        if args.engine_pid is None:
+            lc.die("container_tree attach requires --engine-pid = container host PID1", rc=6)
+        lc.prepare_container_scope(cell, args.engine_pid)
+        lc.gpu_sanity_check(args.engine_pid, lc.gpu_devices_for_cell(cell)[0])
     else:
         # Multi-process: scope the monitor to the PGIDs the bring-up recorded,
         # not a host-wide cmdline regex. Mutates cell["monitors"]["components"]

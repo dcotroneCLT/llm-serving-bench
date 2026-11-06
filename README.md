@@ -103,13 +103,15 @@ campaign descriptor (or a specific run directory) and the run root.
 
 ### Active campaign (extension)
 
-Per-run integrity checks. `validation_check.py` is for single-process cells
-(e.g. `val_vllm`); a multi-process / Dynamo cell (`val_dynamo_disagg`) has an
-aggregate proc series and must use the extension validator, which the
-single-process checker also redirects to:
+New Triton/vLLM runs measure the whole container, with separate orchestration,
+engine and auxiliary series and explicit GPU-process coverage checks. Dynamo
+keeps its existing per-component PGID scope. See
+[the scoping and restart runbook](docs/container_scope.md) for the measurement
+contract, short validation commands and Dynamo-only restart after maintenance.
+Use the extension validator for all these aggregate runs:
 
 ```bash
-python3 analysis/validation_check.py --run-dir /home/dcotrone/wosar/runs/extension_dow_val_vllm_r01
+python3 analysis/validate_extension_run.py --run-dir /home/dcotrone/wosar/runs/extension_dow_val_vllm_r01
 python3 analysis/validate_extension_run.py --run-dir /home/dcotrone/wosar/runs/extension_dow_val_dynamo_disagg_r01
 ```
 

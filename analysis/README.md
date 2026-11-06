@@ -14,6 +14,14 @@ python3 -m pip install -r analysis/requirements.txt
 
 ## Inputs
 
+New extension Triton/vLLM runs use whole-container `agg_vllm` / `agg_triton`
+series as the canonical `proc.*` response. `aging_trends.py` also emits
+`component.orchestration.*`, `component.engine.*` and `component.auxiliary.*`
+memory trends. The manifest's recorded scope, not a current template, determines
+how archived runs are interpreted. Run `validate_extension_run.py --scope-only`
+for a short whole-container evidence gate, or without that flag for the full
+extension gate. See [the scope contract](../docs/container_scope.md).
+
 Each run directory is self-contained:
 
 ```text

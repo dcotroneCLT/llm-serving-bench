@@ -13,11 +13,8 @@
 # or via scripts/launch_cell.py which manages the container directly (default
 # single_container lifecycle, same as standalone vLLM).
 #
-# PID strategy note (inherited from the baseline Triton cell). Container PID 1 is
-# `tritonserver`, but the engine state (KV cache, scheduler, generation loop)
-# lives in a Python child the Triton vLLM backend spawns. proc_monitor must track
-# that child, not tritonserver, else RSS/FD/thread slopes under-estimate the leak;
-# find_engine_pid.py walks the descendants and picks the one matching the regex.
+# Scope includes tritonserver, backend stub, EngineCore and auxiliary workers.
+# The model-holding GPU process must be inside the measured container scope.
 #
 # Engine-version note (DIFFERS from the baseline e2/a2 assumption). Triton 25.09
 # defaulted to vLLM V0 and forced V1 via VLLM_USE_V1=1. Triton 26.05 ships vLLM
@@ -77,13 +74,18 @@ engine:
     timeout_s: 900     # vLLM warmup inside Triton can take longer than standalone
 
   pid_strategy:
-    type: triton_child
-    # Regex matched against the cmdline of descendants of tritonserver. The
-    # Triton Python backend stub launches a python process that imports the
-    # vLLM EngineCore; matching either keyword identifies the memory-holding PID.
-    process_pattern: "EngineCore|triton_python_backend_stub"
+    type: container_tree
 
 monitors:
+  components:
+    scope_type: container_tree
+    engine_group: triton
+    engine_pattern: 'EngineCore'
+    orchestration_pattern: 'triton_python_backend_stub'
+    components:
+      - {label: triton_orchestration, role: orchestration, group: engine, pattern: 'tritonserver|triton_python_backend_stub'}
+      - {label: triton_engine, role: engine, group: engine, pattern: 'EngineCore'}
+      - {label: triton_auxiliary, role: auxiliary, group: engine, pattern: 'resource_tracker'}
   gpu_index_inherits_from_engine: true
   proc:
     label: triton_vllm_020

@@ -1,0 +1,2 @@
+# Shell scripts are executed on Linux, including from Windows/WSL checkouts.
+*.sh text eol=lf

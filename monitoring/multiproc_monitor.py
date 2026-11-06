@@ -255,6 +255,12 @@ def main() -> None:
     components = [Component(c) for c in spec["components"]]
     root_pid = spec.get("root_pid")
     engine_group = spec.get("engine_group", "engine")
+    container_sampler = None
+    scope_fields = []
+    if spec.get("scope_type") == "container_tree":
+        from container_scope import ContainerSampler, SCOPE_FIELDS
+        container_sampler = ContainerSampler(spec, args.output_dir)
+        scope_fields = SCOPE_FIELDS
 
     # One writer per component + one per group aggregate (agg_<group>).
     comp_writers = {
@@ -268,7 +274,7 @@ def main() -> None:
         g: CsvRotatingWriter(WriterConfig(
             output_dir=args.output_dir,
             base_name=(f"agg_{engine_group}" if g == "engine" else f"agg_{g}"),
-            rotation_seconds=args.rotation_seconds, fieldnames=AGG_FIELDS))
+            rotation_seconds=args.rotation_seconds, fieldnames=AGG_FIELDS + scope_fields))
         for g in groups
     }
 
@@ -289,7 +295,8 @@ def main() -> None:
                     break
             ts = time.time()
             t0 = time.monotonic()
-            result = watchdog.call(lambda: tick(components, root_pid, ts))
+            result = watchdog.call(lambda: container_sampler.tick(ts) if container_sampler
+                                   else tick(components, root_pid, ts))
             dur = time.monotonic() - t0
             wall = time.time()
             if result is None:
@@ -330,6 +337,7 @@ def main() -> None:
                     "n_components_complete": agg["n_components_complete"],
                     "n_pids_sampled": agg["n_pids_sampled"],
                     "n_pids_unexpected": agg["n_pids_unexpected"],
+                    **{field: agg.get(field) for field in scope_fields},
                     "uss_bytes": agg["uss_bytes"], "rss_bytes": agg["rss_bytes"],
                     "vms_bytes": agg["vms_bytes"], "pss_bytes": agg["pss_bytes"],
                     "_sample_duration_s": dur, "_wall_clock_unix": wall,

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -125,7 +126,10 @@ class RunEscalation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             w = FakeWriter(fail=True)
             eng = make_engine(tmp, writer=w)
-            with self.assertRaises(bm.WriterFatalError):
+            # The adapter never uses HTTP. SSL/client initialization can exceed
+            # the entire 0.3s window on WSL, leaving no request to exercise the
+            # writer. Keep this test about writer escalation, not startup speed.
+            with mock.patch.object(bm.httpx, "AsyncClient"), self.assertRaises(bm.WriterFatalError):
                 asyncio.run(eng.run(duration_seconds=0.3))
             marker = Path(tmp) / "client_fatal.json"
             self.assertTrue(marker.exists())

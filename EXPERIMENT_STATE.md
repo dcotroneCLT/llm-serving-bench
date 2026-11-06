@@ -8,7 +8,76 @@ Last updated: 2026-11-06 (ET).
 
 ---
 
-## ⏸️ RESUME HERE (2026-11-06): DoW screening at 44/57, scoping finding, calibration-age DEADLINE Nov 13-14
+## RESUME HERE (2026-11-06, latest operator decision): stop now, fix scoping, reboot, complete Dynamo, analyze, then restart Triton/vLLM
+
+**This decision supersedes the wait-until-Nov-13/14 and reboot-after-Dynamo
+instructions below. It records the requested plan, NOT actions already
+executed on the server.**
+
+Domenico's latest instruction is:
+1. Stop the main DoW campaign now with graceful teardown. Preserve its state,
+   logs, calibrations, completed runs, and the interrupted run as evidence;
+   exclude the interrupted run from the completed-run analysis. Last reported
+   state was 44/57 complete with vLLM p05 running; verify live state first.
+2. Fix single-container measurement scope for Triton and standalone vLLM:
+   include the whole container process tree, report orchestration and engine
+   components separately, and validate that the model-holding process is
+   included. Require complete, non-overlapping component membership and
+   fail loudly on an incomplete scope. Retain Dynamo's validated scope.
+3. Reboot the host BEFORE completing the Dynamo arm. Record pre/post host
+   environment and code versions. Any maintenance updates must be recorded;
+   preserve pinned images and the common vLLM version. Run short hardware and
+   harness checks after reboot before any long run.
+4. Run ONLY the remaining Dynamo cells, then stop automatically at queue end.
+   If none has completed since the last checkpoint, the existing
+   `campaigns/extension/dow_dynamo_tail.yaml` has the correct four-cell order:
+   p16, p09, p05 (36h each), cp3 (48h), about 6.5 days plus overhead/retries.
+   Verify pending run directories before dispatch. The tail uses its own
+   state file; never overwrite or restart the original campaign state.
+5. Collect and validate the full Dynamo dataset, analyze USS trends,
+   component localization, stepness, workload effects, and CP consistency.
+   Treat the reboot as an explicit environment block; cp3 is a post-reboot
+   sentinel, not proof that every workload response is unchanged. Add matched
+   bridge measurements if the environment or sentinel evidence requires it.
+6. Only AFTER the Dynamo analysis, recalibrate and launch the corrected
+   Triton/vLLM screening runs, strictly serial and interleaved. Do not chain
+   them automatically onto the Dynamo tail.
+
+**Calibration/baseline checks:** a fresh tail state captures a post-reboot
+environment baseline, but this does not renew calibration provenance or make
+old and new blocks equivalent. Driver/image signature changes require fresh
+calibration; kernel/host changes also require an explicit comparability
+assessment. Check calibration age at projected dispatch, especially cp3;
+do not bypass the 120-day gate or overwrite original calibration evidence.
+The old maintenance email draft and earlier calendar are superseded; no
+maintenance message has been sent by the assistant.
+
+**Stop VERIFIED from operator output (2026-11-06 19:44:56 UTC / 14:44:56 ET).**
+The main campaign received its stop signal at 19:44:47 UTC.
+`dow_vllm_p05_r01` is `interrupted` (attempt 1, rc=2); no run remains
+`running`. All 44 completed runs remain recorded, including 15 Dynamo runs.
+`docker ps` is empty; all four GPUs show 0 MiB used and no running GPU
+processes. `ALERT.json` records the intentional interruption; preserve it
+with the original campaign evidence. Its suggested main-campaign `--resume`
+command does NOT reflect the new Dynamo-only plan. Changes and reboot have
+not yet been performed. The pasted shell is still in conda `(base)`; use
+the `wosar` environment for subsequent Python-dependent operations.
+
+**Implementation update (2026-11-06):** Domenico explicitly authorized the
+assistant to implement the scope correction and commit/push it. Triton/vLLM
+templates and their 38 generated cells now select whole-container sampling,
+with orchestration/engine/auxiliary breakdown, GPU-process coverage evidence,
+runtime completeness checks and offline validation. The Dynamo sampler and
+its cells retain their existing scope/schema. The short-run gate, environment
+snapshot and reboot/Dynamo-tail sequence are in `docs/container_scope.md`.
+This is a local code change; hardware validation and reboot remain pending.
+Local validation: all 490 tests passed under Linux/WSL; generated DoW cells
+are up to date, and the original Dynamo cells/deploy scripts have no content
+changes. See the runbook for the required short checks on the actual server.
+
+---
+
+## Previous snapshot (2026-11-06): DoW screening at 44/57, scoping finding, calibration-age deadline Nov 13-14
 
 **Read this block first. Everything below it is history, kept for the record.**
 

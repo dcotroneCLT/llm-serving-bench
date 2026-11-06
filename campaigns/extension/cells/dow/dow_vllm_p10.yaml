@@ -46,8 +46,26 @@ engine:
     url: http://localhost:8500/health
     timeout_s: 600
   pid_strategy:
-    type: container_pid1
+    type: container_tree
 monitors:
+  components:
+    scope_type: container_tree
+    engine_group: vllm
+    engine_pattern: EngineCore
+    orchestration_pattern: api_server
+    components:
+    - label: vllm_orchestration
+      role: orchestration
+      group: engine
+      pattern: api_server
+    - label: vllm_engine
+      role: engine
+      group: engine
+      pattern: EngineCore
+    - label: vllm_auxiliary
+      role: auxiliary
+      group: engine
+      pattern: resource_tracker
   gpu_index_inherits_from_engine: true
   proc:
     label: vllm_standalone_020

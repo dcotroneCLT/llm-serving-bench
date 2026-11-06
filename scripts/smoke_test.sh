@@ -230,6 +230,14 @@ if [ -f "$INSPECT_JSON" ]; then
 fi
 
 # ---- Check 4: proc_monitor data quality ----
+# Whole-container runs have aggregate/component schemas, not the legacy fixed
+# proc column numbers below. Use the same evidence gate as production analysis.
+SCOPE_TYPE=$(python3 -c "import json; d=json.load(open('$RUN_DIR/manifest.json')); print(((d.get('monitors') or {}).get('components') or {}).get('scope_type',''))")
+if [ "$SCOPE_TYPE" = "container_tree" ]; then
+  python3 "$REPO_ROOT/analysis/validate_extension_run.py" --run-dir "$RUN_DIR" --scope-only
+  echo "[smoke] PASS: whole-container scope verified for $CELL_ID"
+  exit 0
+fi
 echo ""
 echo "[smoke] check 4: proc_monitor data quality"
 

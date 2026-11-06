@@ -211,6 +211,21 @@ class SectionBLifecycle(unittest.TestCase):
         cid = "exthc"
         yaml_path, runs = build_campaign(tmp, cid)
         add_single_container(runs, cid, "scvllm")
+        for name, model_complete in (("treeok", True), ("treebad", False)):
+            rd = add_single_container(runs, cid, name)
+            manifest_path = rd / "manifest.json"
+            m = json.loads(manifest_path.read_text())
+            m["engine"]["pid_strategy"] = {"type": "container_tree"}
+            m["proc_prefix"] = "agg_engine"
+            manifest_path.write_text(json.dumps(m))
+            (rd / "engine.pid").unlink()
+            _write(rd / "components.json", "{}")
+            _write(rd / "scope_identity.json", "{}")
+            _agg_csv(rd)
+            agg_path = rd / "agg_engine_000000.csv"
+            lines = agg_path.read_text().splitlines()
+            _write(agg_path, lines[0] + ",model_scope_complete\n" + "\n".join(
+                line + "," + str(model_complete) for line in lines[1:]) + "\n")
         add_dynamo(runs, cid, "dynok", shape="launch", unexpected=0)
         add_dynamo(runs, cid, "dyncontam", shape="launch", unexpected=1)
         add_dynamo(runs, cid, "dynnocol", shape="launch", with_col=False)
@@ -238,6 +253,14 @@ class SectionBLifecycle(unittest.TestCase):
         # Single-container context carries the single gpu + strategy, no lifecycle.
         self.assertIn("strategy=container_pid1", self.f[self.key("scvllm", "context")][1])
         self.no_fail_for("scvllm")
+
+    def test_whole_container_uses_aggregate_and_needs_no_engine_pidfile(self):
+        self.assertEqual(self.f[self.key("treeok", "files")][0], "PASS")
+        self.assertEqual(self.f[self.key("treeok", "proc.alive")][0], "PASS")
+        self.no_fail_for("treeok")
+
+    def test_whole_container_missing_model_coverage_fails(self):
+        self.assertEqual(self.f[self.key("treebad", "proc.scope")][0], "FAIL")
 
     # ---- dynamo healthy (launch_cell shape) ----
     def test_dynamo_healthy_all_pass(self):

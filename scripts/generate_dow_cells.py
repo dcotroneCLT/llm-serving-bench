@@ -239,6 +239,8 @@ def build_cell_doc(system: str, template: dict, cid: str, kind: str,
                    codes: dict, phys: dict, duration_s: int) -> dict:
     """Assemble one cell dict. engine + monitors are copied VERBATIM from the
     template; only cell_id/short_label/description/workload/durations differ.
+    This includes the whole-container scope and role partition for Triton/vLLM;
+    change their validation templates, never the generated cell files by hand.
 
     calibration_fraction is a top-level METADATA key (factor A): it is read by
     the calibration orchestrator (a separate task) to calibrate this cell's

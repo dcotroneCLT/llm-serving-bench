@@ -1,6 +1,5 @@
 # STEP 1 validation cell: vLLM standalone, vLLM 0.20.1, single GPU.
-# Confirms on real hardware that the single-process monitor/client/manifest/
-# analysis path is byte-compatible after the WS2/WS3/WS4/WS5 changes.
+# Validates whole-container scope: frontend, EngineCore and auxiliary workers.
 #
 # Run it via scripts/attach_run.py against a hand-started vLLM container
 # (pass --engine-pid = the container's host PID), or via scripts/launch_cell.py
@@ -39,9 +38,18 @@ engine:
     url: "http://localhost:8500/health"
     timeout_s: 600
   pid_strategy:
-    type: container_pid1
+    type: container_tree
 
 monitors:
+  components:
+    scope_type: container_tree
+    engine_group: vllm
+    engine_pattern: 'EngineCore'
+    orchestration_pattern: 'api_server'
+    components:
+      - {label: vllm_orchestration, role: orchestration, group: engine, pattern: 'api_server'}
+      - {label: vllm_engine, role: engine, group: engine, pattern: 'EngineCore'}
+      - {label: vllm_auxiliary, role: auxiliary, group: engine, pattern: 'resource_tracker'}
   gpu_index_inherits_from_engine: true
   proc:
     label: vllm_standalone_020

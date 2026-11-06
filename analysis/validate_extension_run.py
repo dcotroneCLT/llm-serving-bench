@@ -27,6 +27,8 @@ import argparse
 import csv
 import glob
 import json
+import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +51,92 @@ def _f(x) -> Optional[float]:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def _pids(value) -> set[int]:
+    return {int(p) for p in re.split(r"[;,]", value or "") if p.strip()}
+
+
+def check_container_scope(run_dir: Path, spec: dict) -> tuple[bool, list[str]]:
+    """Validate saved scope evidence at every complete tick, not just PID unions.
+
+    No live /proc access is required, so this gate also works on archived runs.
+    Incomplete ticks remain explicit; a run with <95% complete ticks fails.
+    """
+    try:
+        identity = json.loads((run_dir / "scope_identity.json").read_text())
+        root_pid = int(spec["root_pid"])
+        if (identity["root_pid"] != root_pid or
+                identity["root_create_time"] != spec["root_create_time"] or
+                not identity.get("pid_namespace") or
+                not any(p != "/" for p in identity.get("cgroups", {}).values())):
+            return False, ["    FAIL: missing/mismatched container namespace/cgroup/root identity"]
+        components = spec["components"]
+        if sorted(c["role"] for c in components) != ["auxiliary", "engine", "orchestration"]:
+            return False, ["    FAIL: component role partition is incomplete"]
+        rows = _read_csvs(run_dir, f"agg_{spec['engine_group']}")
+        complete = [r for r in rows if r.get("process_alive", "").lower() == "true"]
+        if not rows or len(complete) < 0.95 * len(rows):
+            return False, [f"    FAIL: only {len(complete)}/{len(rows)} complete container ticks (minimum 95%)"]
+        by_label = {}
+        for comp in components:
+            indexed = {}
+            for row in _read_csvs(run_dir, comp["label"]):
+                if row["ts_unix"] in indexed:
+                    raise ValueError("duplicate component timestamp")
+                indexed[row["ts_unix"]] = row
+            by_label[comp["label"]] = indexed
+        seen_ts, previous_identities = set(), set()
+        for agg in complete:
+            ts = agg["ts_unix"]
+            if ts in seen_ts:
+                raise ValueError("duplicate aggregate timestamp")
+            seen_ts.add(ts)
+            if (agg.get("model_scope_complete", "").lower() != "true" or
+                    agg.get("membership_complete", "").lower() != "true" or
+                    agg.get("n_pids_unexpected") != "0" or agg.get("scope_error")):
+                raise ValueError(f"incomplete model/scope evidence at {ts}")
+            all_pids, engine_pids = set(), set()
+            sums = {f: 0.0 for f in ("uss_bytes", "rss_bytes", "vms_bytes", "pss_bytes")}
+            for comp in components:
+                row = by_label[comp["label"]][ts]
+                pids = _pids(row["pids"])
+                if (all_pids & pids or row.get("membership_complete", "").lower() != "true" or
+                        len(pids) != int(row["n_pids_sampled"]) or
+                        len(pids) != int(row["n_pids_matched"])):
+                    raise ValueError(f"overlapping/incomplete component membership at {ts}")
+                all_pids |= pids
+                if comp["role"] == "engine":
+                    engine_pids |= pids
+                for field in sums:
+                    value = float(row[field])
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError(f"invalid {field} at {ts}")
+                    sums[field] += value
+            model = _pids(agg.get("model_pids"))
+            if (root_pid not in all_pids or not model or not model <= engine_pids or
+                    all_pids != _pids(agg.get("scope_pids")) or
+                    len(all_pids) != int(agg["n_pids_sampled"])):
+                raise ValueError(f"PID1 or model-holding process missing from partition at {ts}")
+            pairs = [p.split("@", 1) for p in agg["pid_identities"].split(";")]
+            identities = dict(pairs)
+            if (set(map(int, identities)) != all_pids or
+                    len(pairs) != len(all_pids) or
+                    any(not math.isfinite(float(ct)) for ct in identities.values()) or
+                    float(identities[str(root_pid)]) != spec["root_create_time"]):
+                raise ValueError(f"process identity evidence mismatch at {ts}")
+            current_identities = {(int(pid), float(ct)) for pid, ct in identities.items()}
+            if previous_identities - current_identities:
+                raise ValueError(f"accepted memory series spans process loss/replacement at {ts}")
+            previous_identities = current_identities
+            for field, total in sums.items():
+                value = float(agg[field])
+                if not math.isfinite(value) or abs(value - total) > max(1.0, abs(total) * 1e-9):
+                    raise ValueError(f"container {field} != sum of components at {ts}")
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        return False, [f"    FAIL: container scope evidence: {exc}"]
+    return True, [f"    whole-container scope: {len(complete)}/{len(rows)} ticks complete; "
+                  "PID1 + model covered, disjoint components, memory sums verified"]
 
 
 def check_component_pid_map(run_dir: Path, components: list[dict]) -> tuple[bool, list[str]]:
@@ -220,6 +308,8 @@ def main() -> None:
     p.add_argument("--run-dir", type=Path, required=True)
     p.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parent.parent)
     p.add_argument("--target-prefix-frac", type=float, default=0.8)
+    p.add_argument("--scope-only", action="store_true",
+                   help="Short-run gate: whole-container evidence + GPU CSVs only; no trend significance test.")
     args = p.parse_args()
 
     manifest = json.loads((args.run_dir / "manifest.json").read_text())
@@ -229,8 +319,17 @@ def main() -> None:
 
     print(f"== Validation gate: {args.run_dir} ==")
     print(f"proc_prefix = {manifest.get('proc_prefix')}  attach={manifest.get('attach')}")
+    if args.scope_only and (not comp_spec or comp_spec.get("scope_type") != "container_tree"):
+        p.error("--scope-only requires a whole-container run")
 
-    if comp_spec:
+    if comp_spec and comp_spec.get("scope_type") == "container_tree":
+        print("\n[1-2] Whole-container scope, model coverage and component sums:")
+        ok, msgs = check_container_scope(args.run_dir, comp_spec)
+        print("\n".join(msgs)); results.append(("container_scope", ok))
+        devices = comp_spec.get("gpu_devices", [])
+        okg, mg = check_multi_gpu(args.run_dir, devices)
+        print("\n".join(mg)); results.append(("gpu", okg and bool(devices)))
+    elif comp_spec:
         components = comp_spec["components"]
         engine_group = comp_spec.get("engine_group", "engine")
         gpu_devices = manifest.get("engine", {}).get("gpu_devices", [0, 1])
@@ -242,6 +341,11 @@ def main() -> None:
         results.append(("aggregate", ok2)); results.append(("multi_gpu", okg))
         print("\n[2b] No stray processes outside recorded pgids (orphan red flag):")
         oko, mo = check_no_orphans(args.run_dir, components); print("\n".join(mo)); results.append(("no_orphans", oko))
+
+    if args.scope_only:
+        passed = all(ok for _, ok in results)
+        print("SCOPE GATE:", "PASS" if passed else "FAIL")
+        sys.exit(0 if passed else 1)
 
     print("\n[3] Client features (prefix-repeat + burst):")
     okc, mc = check_client_features(args.run_dir, args.target_prefix_frac); print("\n".join(mc)); results.append(("client_features", okc))
