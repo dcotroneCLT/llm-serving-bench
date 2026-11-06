@@ -31,6 +31,11 @@ transition with no intra-PID jumps > 1 MB inflated
 ``steps_per_h_1mb`` to 120 in a synthetic test, when the correct
 value is 0.
 
+For whole-container aggregates, PID/create-time membership replaces the single
+PID axis. Births and other process-set boundaries are masked on both memory
+axes; the identity evidence must be present. This prevents process-count
+growth from being classified as an allocator step.
+
 Five-class taxonomy with a border bucket. See
 ``classify_stepness`` and ``analysis/README.md``:
 
@@ -85,6 +90,7 @@ from aging_io import (
     load_manifest,
     load_proc,
     resolve_warmup,
+    truthy_series,
 )
 
 
@@ -287,9 +293,15 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
     if label is None:
         warn(f"{basename}: no proc_monitor CSV matching known engine labels; skipping")
         return None
-    df = load_proc(run_path, label, columns=["rss_bytes", "vms_bytes", "pid"])
+    df = load_proc(run_path, label, columns=["rss_bytes", "vms_bytes", "pid",
+                                           "pid_identities", "membership_changed"])
     if df is None or df.empty:
         warn(f"{basename}: empty or unreadable proc CSVs; skipping")
+        return None
+    monitors = manifest.get("monitors")
+    component_spec = (monitors.get("components") or {}) if isinstance(monitors, dict) else {}
+    if component_spec.get("scope_type") == "container_tree" and "pid_identities" not in df:
+        warn(f"{basename}: whole-container series lacks process identity evidence; skipping")
         return None
     df = df.drop_duplicates("ts_unix").reset_index(drop=True)
     if warmup_s is None:
@@ -307,7 +319,14 @@ def analyze_run(run_dir, warmup_s, n_bootstrap, seed):
     # the rows where pid changed from the previous sample; dropna()
     # removes both the initial diff (always NaN) and the inter-PID
     # boundaries.
-    if "pid" in df.columns:
+    if "pid_identities" in df.columns:
+        keys = df["pid_identities"].fillna("").astype(str).map(
+            lambda value: ";".join(sorted(value.split(";"))))
+        pid_changes = keys.ne(keys.shift()) | keys.eq("") | keys.shift().eq("")
+        if "membership_changed" in df:
+            pid_changes |= truthy_series(df["membership_changed"])
+        warn(f"{basename}: segmenting differences by sampled process identities")
+    elif "pid" in df.columns:
         pid_changes = df["pid"].ne(df["pid"].shift())
         n_pid_transitions = int(pid_changes.sum()) - 1  # subtract the always-true first row
         if n_pid_transitions > 0:
@@ -543,7 +562,7 @@ def main():
     else:
         targets = discover_runs(args.logs_root)
         if not targets:
-            warn(f"no aging_pilot_* or wosar2026_* subdirs under {args.logs_root}")
+            warn(f"no legacy logs or completed extension DoW runs under {args.logs_root}")
             sys.exit(1)
 
     rows = []

@@ -47,6 +47,7 @@ engine:
 monitors:
   components:
     scope_type: container_tree
+    scope_version: 2
     engine_group: triton
     engine_pattern: EngineCore
     orchestration_pattern: triton_python_backend_stub

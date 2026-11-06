@@ -1,16 +1,19 @@
 # Whole-container monitoring and Dynamo-only restart
 
 Implemented 2026-11-06. Hardware validation on cci-csgpu11 is still required.
-Local validation: 490 tests passed under Linux/WSL, including scope failure
-cases, CSV-to-analysis integration, shell health checks and legacy Dynamo
-regressions. Generated-cell freshness check passed.
+The initial 490-test validation was followed by a scope/integration audit.
+Its seven findings are addressed by the version-2 corrections described in
+[scope_review_fixes.md](scope_review_fixes.md), with regression tests spanning
+the sampler, validators, analysis CLI, discovery and attach supervision.
 The main campaign was stopped deliberately at 19:44:47 UTC, with 44 completed
 runs and vLLM p05 interrupted. Preserve that run and the original campaign
 state; do not resume the original 57-cell queue.
 
 ## Measurement contract
 
-The extension Triton/vLLM validation templates now select `container_tree`.
+The extension Triton/vLLM validation templates select `container_tree` with
+`scope_version: 2`. Regenerate old templates; version-1 role evidence is not
+approved by the corrected validator.
 The DoW generator copies this setting to all 38 corresponding cells. Legacy
 baseline cells retain their historical single-process behavior. Dynamo retains
 its existing PGID sampler, component definitions and CSV schema.
@@ -29,15 +32,19 @@ unavailable memory is an incomplete sample, never a zero-byte contribution.
 
 Components partition the measured scope:
 
-- `*_engine`: EngineCore and GPU compute processes, plus their descendants.
+- `*_engine`: processes matching the verified EngineCore pattern and their
+  descendants, with stable attribution keyed by PID and creation time.
 - `*_orchestration`: PID1 and matching backend/frontend processes outside the
   engine subtrees.
 - `*_auxiliary`: every remaining scoped process, including resource trackers.
 
-Roles are process-level operational labels, not a causal diagnosis. When
-orchestration and inference share one process, its memory cannot be separated
-by this instrumentation; it belongs to the engine component if GPU-bound.
-Inspect scope_membership.jsonl on the box to verify the partition empirically.
+GPU contexts do not determine roles: PID1 can own a CUDA context while remaining
+orchestration. At least one GPU process must belong to a verified engine subtree;
+unclassified GPU processes make the map ambiguous and fail validation. An
+in-process/mixed deployment requires explicit empirical role resolution before
+long runs. Inspect the error CSV, live process map and scope_membership.jsonl on
+the box. Reparenting preserves each previously sampled process's attribution;
+ancestry and GPU-context changes are recorded in the audit.
 
 The total response is `agg_vllm` or `agg_triton` and includes ALL three roles.
 USS is additive; summed RSS/VMS can double-count shared mappings and are
@@ -47,15 +54,17 @@ accepts these indicators in the same test family.
 
 Every tick independently queries GPU compute PIDs on the assigned GPU. At
 least one must exist and every reported compute PID must be in the measured
-scope. Under the strictly serial design, an outside GPU process is a failure,
-not something to ignore. `model_scope_complete` records this check.
+scope. `gpu_pids` records every compute context; `model_pids` records its subset
+inside verified engine subtrees. Under strict serialism an outside GPU process
+is a failure. `model_scope_complete` requires coverage and an identified engine.
 
 Births during a sample invalidate that tick; stable new processes can enter the
 next sample. Loss or replacement of a previously sampled identity is latched
 as incomplete for the rest of the run: memory resets must not masquerade as
 aging steps. The production launcher's existing consecutive-health-failure
-policy aborts the run and preserves its evidence. Monitor stalls and missing
-model-coverage evidence also fail the runtime health check. Calibration sweeps,
+policy aborts the run and preserves its evidence. Managed and attached runs use
+the same completeness/freshness policy, including a final evidence check after
+monitor flush. Monitor stalls and missing model coverage fail that check. Calibration sweeps,
 which do not start the memory monitors, retain container-liveness checks.
 
 Additional evidence:
@@ -67,11 +76,23 @@ Additional evidence:
   membership changes and error reason. Invalid totals are blank and
   `process_alive=False`, so existing analysis excludes them.
 
-The extension validator checks all complete ticks for model/PID1 coverage,
-disjoint components, process identity continuity and memory conservation. It
-requires at least 95% complete ticks; an incomplete run is not paper-ready.
-`--scope-only` runs this evidence gate plus GPU CSV presence for short checks,
-without claiming that a few minutes suffice to test aging statistically.
+Both validator modes first reject unfinished/interrupted runs, failed drain or
+teardown, missing streams, insufficient duration, sparse/duplicate/out-of-order
+monitor data and incomplete client windows. Valid coverage is measured against
+the declared duration and recorded sampling periods, with a 95% sample floor
+and bounded continuity gaps. The scope gate then checks model/PID1 coverage,
+disjoint stable roles, identity continuity and memory conservation.
+`--scope-only` is for complete short checks and omits the aging significance
+pipeline. The full gate requires usable USS statistics from at least ten
+post-warmup bins, but never requires a significant aging trend: stationary data
+are valid. Prefix-repeat expectations come from saved client configuration or
+manifest (CLI override is explicit), including zero and center-point targets.
+
+Stepness masks first differences across process-identity changes, including
+births, so process-count growth is not classified as allocator growth. Batch
+discovery includes finalized, non-interrupted DoW manifests whose run_id matches
+their directory; it excludes live, failed, archived-copy and short validation
+runs. Use explicit --run-dir for diagnostics on those excluded runs.
 
 ## Server validation before reboot
 

@@ -22,6 +22,15 @@ how archived runs are interpreted. Run `validate_extension_run.py --scope-only`
 for a short whole-container evidence gate, or without that flag for the full
 extension gate. See [the scope contract](../docs/container_scope.md).
 
+Both modes require finalized, non-interrupted runs and populated streams with
+duration/sample/continuity coverage. Full validation also requires usable USS
+statistics; a stationary run can pass. Workload expectations are read from the
+saved client config/manifest rather than a hardcoded prefix-repeat target.
+Whole-container stepness uses PID/create-time membership to mask changes in
+the process set. Batch discovery includes completed extension DoW runs and
+excludes live/interrupted/short validation runs; explicit --run-dir remains
+available for diagnostics.
+
 Each run directory is self-contained:
 
 ```text

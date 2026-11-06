@@ -257,16 +257,18 @@ def main() -> None:
     engine_group = spec.get("engine_group", "engine")
     container_sampler = None
     scope_fields = []
+    component_fields = COMPONENT_FIELDS
     if spec.get("scope_type") == "container_tree":
         from container_scope import ContainerSampler, SCOPE_FIELDS
         container_sampler = ContainerSampler(spec, args.output_dir)
         scope_fields = SCOPE_FIELDS
+        component_fields = COMPONENT_FIELDS + ["pid_identities"]
 
     # One writer per component + one per group aggregate (agg_<group>).
     comp_writers = {
         c.label: CsvRotatingWriter(WriterConfig(
             output_dir=args.output_dir, base_name=c.label,
-            rotation_seconds=args.rotation_seconds, fieldnames=COMPONENT_FIELDS))
+            rotation_seconds=args.rotation_seconds, fieldnames=component_fields))
         for c in components
     }
     groups = sorted({c.group for c in components})

@@ -43,6 +43,7 @@ engine:
 monitors:
   components:
     scope_type: container_tree
+    scope_version: 2
     engine_group: vllm
     engine_pattern: 'EngineCore'
     orchestration_pattern: 'api_server'

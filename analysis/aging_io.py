@@ -253,7 +253,11 @@ def resolve_warmup(run_dir: Path, default_s: float = DEFAULT_WARMUP_S) -> float:
 
 
 def discover_runs(logs_root: Path) -> list[Path]:
-    """Return run directories under logs_root matching project naming conventions."""
+    """Discover legacy logs and finalized, non-interrupted extension DoW runs.
+
+    Explicit --run-dir remains the diagnostic path for live/failed/short runs;
+    a batch must not silently mix those into the production screening.
+    """
     logs_root = Path(logs_root)
     out: list[Path] = []
     if not logs_root.is_dir():
@@ -261,6 +265,15 @@ def discover_runs(logs_root: Path) -> list[Path]:
     for entry in sorted(logs_root.iterdir()):
         if entry.is_dir() and (entry.name.startswith("aging_pilot_") or entry.name.startswith("wosar2026_")):
             out.append(entry)
+        elif entry.is_dir() and (entry / "manifest.json").is_file():
+            manifest = load_manifest(entry)
+            if (str(manifest.get("cell_id", "")).startswith("dow_") and
+                    manifest.get("run_id") == entry.name and
+                    (manifest.get("ended_at") or manifest.get("ended_at_unix")) and
+                    manifest.get("interrupted_early") is False and
+                    not manifest.get("teardown_errors") and
+                    not manifest.get("client_forced_kill")):
+                out.append(entry)
     return out
 
 

@@ -215,6 +215,9 @@ def main() -> None:
         lc.die("could not record run children after client spawn", rc=8)
 
     mono_deadline = started_mono + duration_s
+    scope_health = (lc.ContainerScopeHealth(run_dir, lc.proc_prefix_for_cell(cell), started_mono)
+                    if components and components.get("scope_type") == "container_tree" else None)
+    last_scope_check, scope_fail_streak = started_mono, 0
     try:
         while not interrupted:
             time.sleep(5)
@@ -227,6 +230,16 @@ def main() -> None:
                     interrupted = True
                     interruption_reason = interruption_reason or f"early_exit: {name} rc={proc.returncode}"
                     break
+            if scope_health and not interrupted:
+                now_mono = time.monotonic()
+                if now_mono - last_scope_check >= lc.HEALTH_CHECK_EVERY_S:
+                    last_scope_check = now_mono
+                    reason = scope_health.check()
+                    scope_fail_streak = scope_fail_streak + 1 if reason else 0
+                    if scope_fail_streak >= lc.HEALTH_FAIL_CONSECUTIVE:
+                        interrupted = True
+                        interruption_reason = f"health: {reason}"
+                        lc.log(f"FATAL: {interruption_reason}")
     finally:
         if client_proc.poll() is None:
             lc.stop_subprocess(client_proc, "client", grace_s=120.0)
@@ -234,6 +247,11 @@ def main() -> None:
         lc.log(f"client summary: total={client_summary['total']} ok={client_summary['ok']} "
                f"statuses={client_summary['status_counts']}")
         lc.stop_subprocess(monitors_proc, "monitors", grace_s=60.0)
+        if scope_health and not interrupted:
+            reason = scope_health.check(require_evidence=True)
+            if reason:
+                interrupted = True
+                interruption_reason = f"health: {reason}"
         # Deregister from the reaper ledger: this run's children are stopped, so
         # it must not linger as a reap candidate for the next launch.
         for line in reaper.deregister_run(args.runs_root, run_id):

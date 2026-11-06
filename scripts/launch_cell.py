@@ -1471,12 +1471,44 @@ class EngineLifecycle:
         raise NotImplementedError
 
 
+class ContainerScopeHealth:
+    """Shared completeness/freshness policy for managed and attached runs."""
+
+    def __init__(self, run_dir: Path, prefix: str, started_mono=None):
+        self.run_dir, self.prefix = run_dir, prefix
+        self.last_ts = None
+        self.last_advance = time.monotonic() if started_mono is None else started_mono
+
+    def check(self, require_evidence=False) -> Optional[str]:
+        row = read_latest_membership_tick(self.run_dir, self.prefix)
+        now = time.monotonic()
+        if row:
+            try:
+                stamp = float(row.get("ts_unix", ""))
+                if not math.isfinite(stamp):
+                    return "container scope monitor has non-finite timestamp"
+                if self.last_ts is None or stamp > self.last_ts:
+                    self.last_ts, self.last_advance = stamp, now
+            except (ValueError, TypeError):
+                return "container scope monitor has invalid timestamp"
+        if now - self.last_advance > MEMBERSHIP_STALE_S:
+            return "container scope monitor missing/stale (no fresh complete scope evidence)"
+        if row is None:
+            return "container scope has no final evidence" if require_evidence else None
+        for field in ("membership_complete", "model_scope_complete", "process_alive"):
+            if str(row.get(field, "")).strip().lower() != "true":
+                return f"container scope {field} is not true: {row.get('scope_error', '')}"
+        if str(row.get("n_pids_unexpected", "")).strip() != "0":
+            return "container scope has missing/invalid/unexpected process count"
+        return None
+
+
 def prepare_container_scope(cell: dict, root_pid: int) -> None:
     """Bind a template to this container instance, for launch and attach paths."""
     import psutil
     components = cell["monitors"].get("components", {})
-    if components.get("scope_type") != "container_tree":
-        die("container_tree strategy requires whole-container component spec", rc=6)
+    if components.get("scope_type") != "container_tree" or components.get("scope_version") != 2:
+        die("container_tree strategy requires version-2 component spec; regenerate the cells", rc=6)
     components.update({"root_pid": root_pid,
                        "root_create_time": psutil.Process(root_pid).create_time(),
                        "gpu_devices": gpu_devices_for_cell(cell)})
@@ -1496,8 +1528,7 @@ class SingleContainerLifecycle(EngineLifecycle):
         self.docker_cmd: list[str] = []
         self.scope_started_mono = time.monotonic()
         self.scope_monitoring = False
-        self.scope_last_ts = None
-        self.scope_last_advance = self.scope_started_mono
+        self.scope_health = None
 
     def bring_up(self) -> None:
         # 3. Tear down any stale container with the same name.
@@ -1535,7 +1566,8 @@ class SingleContainerLifecycle(EngineLifecycle):
         components = self.cell["monitors"].get("components", {})
         if strategy == "container_tree":
             prepare_container_scope(self.cell, self.container_pid)
-            self.scope_started_mono = self.scope_last_advance = time.monotonic()
+            self.scope_started_mono = time.monotonic()
+            self.scope_health = ContainerScopeHealth(self.run_dir, proc_prefix_for_cell(self.cell), self.scope_started_mono)
             self.scope_monitoring = True
             return None, None
         if components.get("scope_type") == "container_tree":
@@ -1574,26 +1606,9 @@ class SingleContainerLifecycle(EngineLifecycle):
         if not container_running(self.container_name):
             return f"engine container {self.container_name} is not running"
         if self.scope_monitoring:
-            row = read_latest_membership_tick(self.run_dir, proc_prefix_for_cell(self.cell))
-            now = time.monotonic()
-            if row:
-                try:
-                    stamp = float(row.get("ts_unix", ""))
-                    if not math.isfinite(stamp):
-                        return "container scope monitor has non-finite timestamp"
-                    if self.scope_last_ts is None or stamp > self.scope_last_ts:
-                        self.scope_last_ts, self.scope_last_advance = stamp, now
-                except (ValueError, TypeError):
-                    return "container scope monitor has invalid timestamp"
-            if now - self.scope_last_advance > MEMBERSHIP_STALE_S:
-                return "container scope monitor missing/stale (no fresh complete scope evidence)"
-            if row is None:
-                return None  # CSV rotation warmup; bounded by the stale clock.
-            for field in ("membership_complete", "model_scope_complete", "process_alive"):
-                if str(row.get(field, "")).strip().lower() != "true":
-                    return f"container scope {field} is not true: {row.get('scope_error', '')}"
-            if str(row.get("n_pids_unexpected", "")).strip() != "0":
-                return "container scope has missing/invalid/unexpected process count"
+            if self.scope_health is None:
+                self.scope_health = ContainerScopeHealth(self.run_dir, proc_prefix_for_cell(self.cell), self.scope_started_mono)
+            return self.scope_health.check()
         return None
 
     def wait_quiescence(self) -> None:
@@ -2505,6 +2520,11 @@ def main() -> None:
 
         _teardown_step("stop_monitors",
                        lambda: stop_subprocess(monitors_proc, "monitors", grace_s=60.0))
+        if isinstance(lifecycle, SingleContainerLifecycle) and lifecycle.scope_monitoring and not interrupted:
+            scope_reason = lifecycle.scope_health.check(require_evidence=True)
+            if scope_reason:
+                interrupted = True
+                interruption_reason = f"health: {scope_reason}"
         if pid_daemon is not None:
             _teardown_step("stop_pid_daemon", lambda: stop_subprocess(pid_daemon, "pid_daemon"))
         # Engine teardown: dynamo_disagg tears down the whole stack (serve_down +

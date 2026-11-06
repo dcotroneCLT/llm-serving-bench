@@ -212,7 +212,7 @@ class RecordedEvidence(ScopeFixture):
         self.rows, self.agg = self.sample()
         self.agg.update(ts_unix=100.0, process_alive=True, membership_complete=True)
         (self.rd / "scope_identity.json").write_text(json.dumps({
-            "root_pid": 10, "root_create_time": 1.0,
+            "scope_version": 2, "root_pid": 10, "root_create_time": 1.0,
             "pid_namespace": "container", "cgroups": {"": "/docker/test"}}))
 
     def save(self):

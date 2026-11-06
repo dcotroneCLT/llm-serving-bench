@@ -75,6 +75,20 @@ Local validation: all 490 tests passed under Linux/WSL; generated DoW cells
 are up to date, and the original Dynamo cells/deploy scripts have no content
 changes. See the runbook for the required short checks on the actual server.
 
+**Audit follow-up (2026-11-06, supersedes the initial test verdict above):**
+Seven cross-framework gaps were reproduced despite those 490 passing tests.
+The fixes use scope version 2, separate GPU contexts from semantic roles,
+preserve role attribution across reparenting, segment stepness at membership
+changes, and apply common run-integrity checks before scope/full validation.
+Attach shares managed-run scope supervision. Batch discovery includes completed
+DoW manifests; workload targets come from recorded config, including zero.
+Regression coverage and exact behavior are recorded in `docs/scope_review_fixes.md`.
+These are local code fixes; no server reboot or experiment restart has occurred.
+Final local verification: 524 framework tests and 6 standalone statistical
+tests passed; generated cells are current. The regression suite includes the
+real full validator on a stationary complete run, the legacy Dynamo layout,
+batch CLI discovery, interrupted/truncated data and attach supervision.
+
 ---
 
 ## Previous snapshot (2026-11-06): DoW screening at 44/57, scoping finding, calibration-age deadline Nov 13-14

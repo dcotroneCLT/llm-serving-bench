@@ -20,7 +20,7 @@ import psutil
 
 MEMORY_FIELDS = ("uss_bytes", "rss_bytes", "vms_bytes", "pss_bytes")
 SCOPE_FIELDS = ["model_scope_complete", "membership_changed", "scope_error",
-                "pid_identities", "model_pids", "scope_pids"]
+                "pid_identities", "model_pids", "scope_pids", "gpu_pids"]
 
 
 def _cgroups(pid: int) -> dict[str, str]:
@@ -68,6 +68,8 @@ def gpu_compute_pids(devices: list[int]) -> set[int]:
 
 class ContainerSampler:
     def __init__(self, spec: dict, output_dir: Path):
+        if spec.get("scope_version") != 2:
+            raise ValueError("container scope requires version 2; regenerate the cell templates")
         self.spec = spec
         self.root_pid = int(spec["root_pid"])
         self.root_create_time = float(spec["root_create_time"])
@@ -88,6 +90,8 @@ class ContainerSampler:
         self.namespace = None
         self.cgroups = None
         self.previous: set[tuple[int, float]] = set()
+        self.role_history: dict[tuple[int, float], str] = {}
+        self.previous_layout = None
         self.lost_identity_error = ""
         self.output_dir = output_dir
         self.lock = threading.Lock()
@@ -105,7 +109,7 @@ class ContainerSampler:
         if self.namespace is None:
             identity = self.output_dir / "scope_identity.json"
             identity.write_text(json.dumps({
-                "scope_type": "container_tree", "root_pid": self.root_pid,
+                "scope_type": "container_tree", "scope_version": 2, "root_pid": self.root_pid,
                 "root_create_time": self.root_create_time,
                 "pid_namespace": namespace, "cgroups": cgroups,
                 "gpu_devices": self.devices}, indent=2))
@@ -135,9 +139,13 @@ class ContainerSampler:
             raise ValueError("container PID1 missing from scope")
         return found
 
-    def partition(self, inventory: list[dict], model_pids: set[int]) -> dict[int, str]:
+    def partition(self, inventory: list[dict]) -> dict[int, str]:
         by_pid = {p["pid"]: p for p in inventory}
-        engines = {p["pid"] for p in inventory if self.engine_pattern.search(p["cmdline"])} | model_pids
+        # A GPU context proves scope coverage, not a semantic role. In particular
+        # Triton's PID1 can own a context without being the inference worker.
+        engines = {p["pid"] for p in inventory if self.engine_pattern.search(p["cmdline"])}
+        engines |= {p["pid"] for p in inventory
+                    if self.role_history.get((p["pid"], p["create_time"])) == "engine"}
         roles = {}
         for entry in inventory:
             pid = entry["pid"]
@@ -145,7 +153,12 @@ class ContainerSampler:
             while cursor in by_pid and cursor not in visited and cursor not in engines:
                 visited.add(cursor)
                 cursor = by_pid[cursor]["ppid"]
-            if cursor in engines:
+            identity = (pid, entry["create_time"])
+            if identity in self.role_history:
+                roles[pid] = self.role_history[identity]
+                if pid in engines and roles[pid] != "engine":
+                    self.lost_identity_error = f"ambiguous role change for process identity {identity}"
+            elif cursor in engines:
                 roles[pid] = "engine"
             elif pid == self.root_pid or self.orchestration_pattern.search(entry["cmdline"]):
                 roles[pid] = "orchestration"
@@ -165,14 +178,22 @@ class ContainerSampler:
 
     def _tick(self, ts: float) -> tuple[list[dict], dict[str, dict]]:
         error, model_complete, changed = "", False, False
-        before, sampled, model_pids, roles = [], {}, set(), {}
+        before, sampled, model_pids, gpu_pids, roles = [], {}, set(), set(), {}
         try:
             before = self.inventory()
-            model_pids = gpu_compute_pids(self.devices)
+            gpu_pids = gpu_compute_pids(self.devices)
             scope_pids = {p["pid"] for p in before}
-            if not model_pids <= scope_pids:
-                raise ValueError(f"model-holding GPU PIDs outside scope: {sorted(model_pids - scope_pids)}")
-            roles = self.partition(before, model_pids)
+            if not gpu_pids <= scope_pids:
+                raise ValueError(f"GPU PIDs outside scope: {sorted(gpu_pids - scope_pids)}")
+            roles = self.partition(before)
+            if self.lost_identity_error:
+                raise ValueError(self.lost_identity_error)
+            ambiguous = {pid for pid in gpu_pids if roles[pid] == "auxiliary"}
+            if ambiguous:
+                raise ValueError(f"ambiguous inference role for unclassified GPU processes: {sorted(ambiguous)}")
+            model_pids = {pid for pid in gpu_pids if roles[pid] == "engine"}
+            if not model_pids:
+                raise ValueError("ambiguous inference role: no GPU process belongs to a verified engine subtree")
             for entry in before:
                 pid, ctime = entry["pid"], entry["create_time"]
                 if psutil.Process(pid).create_time() != ctime:
@@ -192,20 +213,26 @@ class ContainerSampler:
                 self.lost_identity_error = f"sampled process identity lost/replaced: {sorted(lost)}"
             changed = identities != post_identities or bool(self.previous and identities != self.previous)
             self.previous = post_identities
-            if changed or not (self.output_dir / "scope_membership.jsonl").exists():
+            layout = (tuple(sorted((p["pid"], p["create_time"], p["ppid"], roles[p["pid"]], p["cmdline"])
+                                   for p in before)), tuple(sorted(gpu_pids)))
+            if changed or layout != self.previous_layout:
                 audit = self.output_dir / "scope_membership.jsonl"
                 with audit.open("a") as stream:
                     stream.write(json.dumps({"ts_unix": ts, "model_pids": sorted(model_pids),
+                                             "gpu_pids": sorted(gpu_pids),
                                              "processes": [
                                                  {k: v for k, v in entry.items() if k != "proc"} |
                                                  {"role": roles[entry["pid"]]} for entry in before],
                                              "post_identities": sorted(post_identities)}) + "\n")
                 audit.chmod(0o644)
+                self.previous_layout = layout
             if self.lost_identity_error:
                 raise ValueError(self.lost_identity_error)
             if identities != post_identities:
                 raise ValueError("membership changed during sampling")
             model_complete = model_pids <= set(sampled)
+            if model_complete:
+                self.role_history.update({(p["pid"], p["create_time"]): roles[p["pid"]] for p in before})
         except (OSError, psutil.Error, ValueError, subprocess.SubprocessError) as exc:
             error = str(exc)
 
@@ -220,6 +247,7 @@ class ContainerSampler:
                          "n_pgids_alive": None, "n_pids_unexpected": 0,
                          "membership_complete": complete,
                          "pids": ";".join(map(str, sorted(pids & sampled.keys()))),
+                         "pid_identities": ";".join(sorted(f"{p['pid']}@{p['create_time']}" for p in members)),
                          **values})
         # Semicolons keep all evidence fields safe for the streaming awk health
         # checker, which deliberately uses comma as its field separator.
@@ -231,6 +259,7 @@ class ContainerSampler:
             "pid_identities": ";".join(f"{p['pid']}@{p['create_time']}" for p in before),
             "scope_pids": ";".join(str(p["pid"]) for p in before),
             "model_pids": ";".join(map(str, sorted(model_pids))),
+            "gpu_pids": ";".join(map(str, sorted(gpu_pids))),
             **{f: sum(s[f] for s in sampled.values()) if complete else None for f in MEMORY_FIELDS},
         }
         return rows, {"engine": aggregate}
