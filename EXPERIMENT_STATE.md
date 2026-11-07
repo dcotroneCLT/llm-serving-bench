@@ -8,6 +8,58 @@ Last updated: 2026-11-06 (ET).
 
 ---
 
+## RESUME HERE (2026-11-07): host REBOOTED, Dynamo tail cleared to start
+
+**DYNAMO TAIL STARTED (2026-11-07, tmux `dyntail`).** Post-reboot gate
+run postreboot_20261107T191434Z_val_dynamo_disagg_r01: exit 0, 1439/1439
+ok, clean teardown, VRAM back to baseline on both GPUs. The new common
+integrity gate (bce56dc) FAILED it with "client submission outside
+declared run window": a VALIDATOR BUG, not a data problem. started_at_unix
+is written before monitors/client are spawned and the client counts its
+duration from its own start; measured on hardware: first submission
++1.3 s, last submission +1.5 s past the declared end, vs a +/-1 s
+tolerance. Would fail essentially every real run, including the 15
+completed Dynamo runs. Fix prompt handed to Claude Code (principled
+tolerance anchored on the client's actual start, realistic-delay
+regressions, audit of other window checks). After the fix: re-validate
+the post-reboot gate run and one of the 15 completed Dynamo runs.
+Tail ETA ~Nov 14; cp3 dispatch ~Nov 12 at ~115 d calibration age.
+Status: `bash scripts/longtest_status.sh --campaign-yaml
+campaigns/extension/dow_dynamo_tail.yaml`.
+
+**Post-reboot audit (2026-11-07, box output):** host rebooted 2026-11-06
+15:59 local (~1h after the 19:44 UTC stop), i.e. BEFORE the Dynamo tail.
+Kernel 7.0.0-30 -> **7.0.0-42** (updated). NVIDIA driver unchanged
+(580.159.03); the three image digests identical to the pins; Docker data
+root /home/dcotrone/docker-data, Docker 29.9.3; nightly timers still
+masked; IPMI watchdog cron present; NTP synchronized; monitor sudoers OK;
+code at bce56dc; full test suite OK. Tail dry-run: 4/4 calib=ok
+(signature intact), ages 108.3-110.0 d, exit 0.
+No pre-reboot snapshot was taken; the pre-reboot environment is
+documented by the 44 completed run manifests (kernel/driver at each run
+start), the Aug 30 host_freeze files and the calibration provenance.
+**Scientific bookkeeping:** the Dynamo arm now spans two environment
+blocks (15 runs pre-reboot on 7.0.0-30, 4 runs p16/p09/p05/cp3 on
+7.0.0-42, same driver/images/calibration epoch). cp3 vs cp1/cp2 estimates
+the block shift at the design center; declare it in TTV.
+**Deadline:** tail must start by ~Nov 13 (cp3 <= 120 d); starting Nov 7
+puts cp3 at ~115 d.
+**Sequence:** post-reboot snapshot -> val_dynamo_disagg 25-min gate (must
+pass) -> 300 s scope checks for val_vllm/val_triton (new code on
+hardware; non-blocking for the Dynamo tail) -> tail --start in tmux
+`dyntail`. Longer Triton/vLLM soak (process-churn vs identity latching)
+deferred until the box is free after the tail.
+**Open review items before the Triton/vLLM rerun (2026-11-07 review):**
+(1) block --resume of the original 57-cell campaign in code (mixed-scope
+footgun; ALERT suggests --resume); (2) generate a rerun descriptor with a
+NEW campaign_id and NEW calibration paths; (3) hours-long soak per system
+before 36h runs (identity-loss latching aborts runs on any helper-process
+exit; check num_children constancy in the 30 old runs); (4) report the
+PSS total alongside USS (shared-memory growth); (5) document the
+nvidia-smi-per-tick overhead asymmetry vs the Dynamo sampler.
+
+---
+
 ## RESUME HERE (2026-11-06, latest operator decision): stop now, fix scoping, reboot, complete Dynamo, analyze, then restart Triton/vLLM
 
 **This decision supersedes the wait-until-Nov-13/14 and reboot-after-Dynamo
@@ -88,6 +140,14 @@ Final local verification: 524 framework tests and 6 standalone statistical
 tests passed; generated cells are current. The regression suite includes the
 real full validator on a stationary complete run, the legacy Dynamo layout,
 batch CLI discovery, interrupted/truncated data and attach supervision.
+
+**Integrity-gate timing fix (2026-11-07):** found on the post-reboot
+val_dynamo_disagg run, which the gate rejected despite a clean run. Client
+submissions may land up to 60 s past `started_at + duration_s` (client spawn and
+tokenizer load; `CLIENT_SPAWN_SLACK_S`), lower bound strict. Monitor streams
+may sample until `ended_at_unix + grace` (client drain), while coverage stays
+anchored on the declared window. Analysis/tests only; no runtime files changed.
+Full suite: 528 tests pass.
 
 ---
 

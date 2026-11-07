@@ -33,18 +33,30 @@ def saved_client_config(run_dir: Path, manifest: dict) -> dict:
     return config
 
 
+# started_at_unix is written before monitors and client are spawned, and the
+# client counts duration_seconds from its own start (after process spawn and
+# tokenizer load). The client does not record that start, so its submissions may
+# legitimately land up to this many seconds past started_at + duration_s. Matches
+# the 60 s cap of the monitor-stream grace in _stream_quality.
+CLIENT_SPAWN_SLACK_S = 60.0
+
+
 def _rows(run_dir: Path, prefix: str):
     for path in sorted(run_dir.glob(f"{prefix}_*.csv")):
         with path.open(newline="") as stream:
             yield from csv.DictReader(stream)
 
 
-def _stream_quality(run_dir, prefix, fields, start, duration, period, alive=False):
+def _stream_quality(run_dir, prefix, fields, start, duration, period, ended, alive=False):
     period = finite(period)
     if period <= 0:
         raise ValueError(f"{prefix}: invalid sample period")
     grace = max(3 * period, min(60, duration * 0.05))
     end = start + duration
+    # Monitors keep sampling through the client drain (up to max(120, request_timeout + 90) s
+    # past the declared window), so the upper bound is the manifest end, not start + duration.
+    # Coverage below stays anchored on the declared window.
+    hard_end = max(end, ended)
     previous = None
     count, first, last = 0, None, None
     for row in _rows(run_dir, prefix):
@@ -52,7 +64,7 @@ def _stream_quality(run_dir, prefix, fields, start, duration, period, alive=Fals
         if previous is not None and stamp <= previous:
             raise ValueError(f"{prefix}: duplicate/out-of-order timestamp")
         previous = stamp
-        if stamp < start - grace or stamp > end + grace:
+        if stamp < start - grace or stamp > hard_end + grace:
             raise ValueError(f"{prefix}: sample outside declared run window")
         if alive and str(row.get("process_alive", "")).lower() not in ("true", "1"):
             continue
@@ -97,7 +109,7 @@ def check_run_integrity(run_dir: Path, manifest: dict) -> tuple[bool, list[str]]
             raise ValueError("missing canonical process series")
         messages = [_stream_quality(run_dir, prefix,
                     ["uss_bytes", "rss_bytes", "vms_bytes", "pss_bytes"],
-                    start, duration, monitors["proc"]["period_s"], alive=True)]
+                    start, duration, monitors["proc"]["period_s"], ended, alive=True)]
         engine = manifest.get("engine") or {}
         devices = component_spec.get("gpu_devices") or manifest.get("gpu_devices") or engine.get("gpu_devices")
         if devices is None:
@@ -108,9 +120,9 @@ def check_run_integrity(run_dir: Path, manifest: dict) -> tuple[bool, list[str]]
             raise ValueError("missing monitored GPU device identities")
         for device in sorted(set(devices)):
             messages.append(_stream_quality(run_dir, f"gpu{int(device)}", ["vram_used_bytes"],
-                            start, duration, monitors["gpu"]["period_s"]))
+                            start, duration, monitors["gpu"]["period_s"], ended))
         messages.append(_stream_quality(run_dir, "system", ["mem_used_bytes"],
-                        start, duration, monitors["system"]["period_s"]))
+                        start, duration, monitors["system"]["period_s"], ended))
         config = saved_client_config(run_dir, manifest)
         rate = finite(config["target_rate_rps"])
         if rate <= 0:
@@ -120,7 +132,7 @@ def check_run_integrity(run_dir: Path, manifest: dict) -> tuple[bool, list[str]]
         successful = 0
         for row in _rows(run_dir / "client", "requests"):
             stamp = finite(row["submitted_at_unix"])
-            if stamp < start - 1 or stamp > start + duration + 1:
+            if stamp < start or stamp > start + duration + CLIENT_SPAWN_SLACK_S:
                 raise ValueError("client submission outside declared run window")
             first = stamp if first is None else min(first, stamp)
             last = stamp if last is None else max(last, stamp)

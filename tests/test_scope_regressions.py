@@ -184,6 +184,54 @@ class Integrity(WholeRunFixture):
         self.write_aggregate()
         self.assertFalse(check_run_integrity(self.rd, self.manifest)[0])
 
+    def _shift_client(self, delay, extra=0):
+        """Client started `delay` s after started_at and ran the full duration."""
+        write_csv(self.rd / "client/requests_000000.csv", [
+            {"submitted_at_unix": self.start + delay + t, "status": "ok", "e2e_latency_s": 1,
+             "shared_prefix_applied": (t // 5) % 5 < 2}
+            for t in range(0, self.duration + extra, 5)])
+
+    def test_client_spawn_delay_is_tolerated(self):
+        for delay in (5, 12, 20):
+            self._shift_client(delay)
+            ok, messages = check_run_integrity(self.rd, self.manifest)
+            self.assertTrue(ok, (delay, messages))
+
+    def test_client_running_far_past_window_or_before_start_fails(self):
+        self._shift_client(300)
+        self.assertFalse(check_run_integrity(self.rd, self.manifest)[0])
+        self._shift_client(-5)
+        self.assertFalse(check_run_integrity(self.rd, self.manifest)[0])
+
+    def _extend_monitors(self, until):
+        """Monitors keep sampling until `until` seconds after start."""
+        self.aggregates = [dict(self.agg, ts_unix=self.start + t, process_alive=True,
+                                membership_complete=True) for t in range(0, until, 5)]
+        self.write_aggregate()
+        for row in self.rows:
+            write_csv(self.rd / f"{row['label']}_000000.csv", [
+                dict(row, ts_unix=self.start + t) for t in range(0, until, 5)])
+        write_csv(self.rd / "gpu0_000000.csv", [
+            {"ts_unix": self.start + t, "gpu_index": 0, "vram_used_bytes": 40_000_000_000}
+            for t in range(until)])
+        write_csv(self.rd / "system_000000.csv", [
+            {"ts_unix": self.start + t, "mem_used_bytes": 5_000_000_000}
+            for t in range(0, until, 5)])
+
+    def test_monitors_sampling_through_client_drain_pass(self):
+        for drain in (300, 690):
+            manifest = dict(self.manifest, ended_at_unix=self.start + self.duration + drain + 20,
+                            duration_seconds_actual=self.duration + drain + 20)
+            self._extend_monitors(self.duration + drain)
+            ok, messages = check_run_integrity(self.rd, manifest)
+            self.assertTrue(ok, (drain, messages))
+
+    def test_monitor_sample_after_manifest_end_fails(self):
+        self._extend_monitors(self.duration + 700)
+        manifest = dict(self.manifest, ended_at_unix=self.start + self.duration + 300,
+                        duration_seconds_actual=self.duration + 300)
+        self.assertFalse(check_run_integrity(self.rd, manifest)[0])
+
     def test_missing_and_all_failed_client_streams_fail(self):
         path = self.rd / "client/requests_000000.csv"
         path.write_text(path.read_text().replace(",ok,", ",error,"))
