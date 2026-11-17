@@ -58,11 +58,24 @@ cp3 1.69. Declare in TTV.
   falls back to the MAIN campaign state file. Run it from the `wosar` env.
   Tail state: campaigns/extension/state/dow_dynamo_tail_state.json; runs
   root: /home/dcotrone/wosar/runs (outside the repo).
-- Server repo is still at bce56dc (validator fix d30b76f not pulled) and has
-  four untracked engines/*/image_pin*.json files.
+- Server repo brought up to date on 2026-11-17 (validator fix d30b76f
+  pulled). The four n=3 campaign image pins that were untracked on the box
+  (pytorch_naive, Triton 25.09, vLLM a1 v0.7.3, vLLM e1 latest; pinned
+  2026-05-15) are now committed (865e287). Those images are no longer on
+  the host (only the three extension images plus nats/etcd remain), so the
+  pin files are the only record of their digests; pytorch_naive is a local
+  build and cannot be re-pulled.
+- The server has no GitHub push credentials: commit from the Mac. To bring
+  a commit made on the box, `git pull --rebase
+  dcotrone@cci-csgpu11:wosar/llm-serving-bench main` from the Mac, then push.
+- Server tidy-up 2026-11-17: tail archive removed, tmux `dyntail` closed
+  (campaign log kept in campaigns/extension/state/logs), loose June/July
+  gate files moved to ~/wosar/archive_prelaunch/loose_2026. Nothing removed
+  from runs/, ops/, hf_cache or the Docker images.
 - nvidia-smi on 2026-11-17 reports 0 MiB on all four GPUs, while the run
-  baseline was 610 MiB on GPU 0 and 1. No reboot since 2026-11-07 (tmux
-  session still alive). Cause not identified: check before recalibrating.
+  baseline was 610 MiB on GPU 0 and 1. No reboot since 2026-11-07 (the
+  tmux session created that day was still alive). Cause not identified:
+  check before recalibrating.
 - The Mac holds the only off-box copy of the 19 Dynamo runs.
 
 **Next.** (1) Decide factor E handling (realized CoV alongside the coded
