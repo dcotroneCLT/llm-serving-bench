@@ -1,0 +1,7 @@
+{
+  "image_tag": "pytorch_naive:wosar2026",
+  "image_repo": "pytorch_naive",
+  "source_tag": "pytorch_naive:wosar2026",
+  "digest": "sha256:452c860860870ee50f19575264c12b647a550ac7f0fbaafbfc6d0e33249c7985",
+  "pinned_at": "2026-05-15T20:02:14Z"
+}

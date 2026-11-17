@@ -1,0 +1,7 @@
+{
+  "image_tag": "tritonserver:wosar2026_e2_a2",
+  "image_repo": "nvcr.io/nvidia/tritonserver",
+  "source_tag": "nvcr.io/nvidia/tritonserver:25.09-vllm-python-py3",
+  "digest": "sha256:1fb3d156d4959b83cb7a9bd172f9b86135f97cafcc1b5899292e042536d90141",
+  "pinned_at": "2026-05-15T20:02:14Z"
+}

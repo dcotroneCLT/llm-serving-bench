@@ -1,0 +1,7 @@
+{
+  "image_tag": "vllm/vllm-openai:wosar2026_e1",
+  "image_repo": "vllm/vllm-openai",
+  "source_tag": "vllm/vllm-openai:latest",
+  "digest": "sha256:a230095847e93bd4df9888b33dab956fa9504537b828a23657d2b26fed57b5c9",
+  "pinned_at": "2026-05-15T20:02:14Z"
+}
