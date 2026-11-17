@@ -4,11 +4,118 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-11-06 (ET).
+Last updated: 2026-11-17 (ET).
+
+---
+
+## RESUME HERE (2026-11-17): Dynamo arm COMPLETE (19/19), validated off-box, ready for analysis
+
+**DYNAMO TAIL COMPLETED (2026-11-14 08:27 UTC).** All four tail cells
+completed at attempt 1, rc=0, no ALERT.json, no retries, interrupted=False
+and teardown_errors=0 on each, VRAM back to baseline on both GPUs after
+every run. Source: tail state via `longtest_status.sh` and the full
+`dyntail` tmux scrollback, read on 2026-11-17.
+
+| Cell | Start (UTC) | End (UTC) | Duration | Client ok/total | Target rps | Realized rps | Calib. age at launch |
+|---|---|---|---|---|---|---|---|
+| p16 | 11-07 19:49 | 11-09 07:49 | 36 h | 16216/16216 | 0.1275 | 0.1251 | 110.02 d |
+| p09 | 11-09 08:02 | 11-10 20:02 | 36 h | 918300/918300 | 7.08 | 7.0856 | 109.86 d |
+| p05 | 11-10 20:14 | 11-12 08:14 | 36 h | 76543/76543 | 0.5939 | 0.5906 | 112.96 d |
+| cp3 | 11-12 08:27 | 11-14 08:27 | 48 h | 35487/35487 | 0.2055 | 0.2054 | 114.44 d |
+
+All four ran on the post-reboot block (kernel 7.0.0-42, driver 580.159.03,
+same image digest as the calibration provenance), all under the 120-day
+calibration gate (ages from each run's manifest.json).
+
+**OFF-BOX VALIDATION, FULL DYNAMO ARM: 18/19 GATE PASS (validator d30b76f).**
+The four tail runs were tarred on the server (146 MB, sha256 3ec07d5d...c67ccc
+on the Mac side), copied to the Mac's gitignored runs/ and validated there
+on 2026-11-17: p16, p09, p05, cp3 all GATE PASS on the 8 checks. Realized
+workload matches the DoE levels: p16 prefix 0.80, bursty CoV 1.97; p09
+prefix 0.80, Poisson CoV 1.00; p05 prefix 0.00, Poisson CoV 1.00; cp3
+prefix 0.40, bursty CoV 1.69. p02, pending since 2026-11-07, validated on
+the Mac directly (OOM again in the 4 GB sandbox, peak RSS 3.8 GB): GATE
+PASS, prefix 0.00 of 2599267, Poisson CoV 1.00, 20.06 rps, engine USS range
+6159.5..23287.7 MB over the run. The other 13 PASS and the p11 result are
+those recorded on 2026-11-07 and were not re-run on 2026-11-17.
+p11 remains the only non-PASS, for the fixed CoV >= 1.5 threshold only
+(realized 1.46): see the factor E finding below, decision still open.
+
+**Center points: cp2 and cp3 are rate-matched, cp1 is not.** From the
+manifests: cp1 ceiling 0.3709 rps, rate 0.2133 (2026-08-30, kernel
+7.0.0-30); cp2 ceiling 0.3573, rate 0.2055 (2026-10-11, kernel 7.0.0-30);
+cp3 ceiling 0.3573, rate 0.2055 (2026-11-12, kernel 7.0.0-42). The
+pre/post-reboot block shift at the design center is therefore cleanest on
+cp3 vs cp2 (same absolute rate); cp1 runs about 3.8% higher and its
+contrast with cp2/cp3 mixes rate with time. Realized bursty CoV: cp1 1.70,
+cp3 1.69. Declare in TTV.
+
+**Operational notes.**
+- Run transfer convention: tar the run dirs on the server at nice 19, copy
+  the single archive to the Mac, extract and process there. Do not rsync
+  run dirs file by file (20k+ small files per run).
+- `longtest_status.sh` needs PyYAML: in the conda `base` env it silently
+  falls back to the MAIN campaign state file. Run it from the `wosar` env.
+  Tail state: campaigns/extension/state/dow_dynamo_tail_state.json; runs
+  root: /home/dcotrone/wosar/runs (outside the repo).
+- Server repo is still at bce56dc (validator fix d30b76f not pulled) and has
+  four untracked engines/*/image_pin*.json files.
+- nvidia-smi on 2026-11-17 reports 0 MiB on all four GPUs, while the run
+  baseline was 610 MiB on GPU 0 and 1. No reboot since 2026-11-07 (tmux
+  session still alive). Cause not identified: check before recalibrating.
+- The Mac holds the only off-box copy of the 19 Dynamo runs.
+
+**Next.** (1) Decide factor E handling (realized CoV alongside the coded
+level; validator check on realized vs theoretical CoV), which settles p11.
+(2) Dynamo analysis on 19 runs: USS trends, component localization,
+stepness, workload effects, CP consistency with cp3 as post-reboot
+sentinel. (3) Only after that: recalibrate and launch the corrected
+Triton/vLLM runs (open review items in the 2026-11-07 block still apply).
 
 ---
 
 ## RESUME HERE (2026-11-07): host REBOOTED, Dynamo tail cleared to start
+
+**OFF-BOX VALIDATION OF THE 15 COMPLETED DYNAMO RUNS (2026-11-07).**
+Runs copied to the Mac's gitignored runs/ (rsync/tar at nice 19).
+13/15 GATE PASS on all checks (cp1, cp2, p01, p03, p04, p06, p07, p08,
+p10, p12, p13, p14, p15). p02 NOT validated off-box (the high-rate cell,
+~20 rps, 636 MB, OOM in the 4 GB review sandbox): validate on the Mac or
+on the server after the tail. p11 FAILS only client_features: "bursty CoV
+not >> 1" (realized CoV 1.46 vs fixed threshold 1.5).
+**DESIGN FINDING, factor E (burstiness) realization is rate-dependent.**
+The client's bursty mode is an on/off modulated Poisson: ON ~5 s at
+rate x 4, OFF ~15 s, so arrivals per burst ~ 20 x rate. At low absolute
+rates bursts hold < 1 request and the process is nearly Poisson. Realized
+CoV for the E=+1 Dynamo cells: 1.46 (p11, 0.046 rps), 1.55 (p07,
+0.065), 2.16 (p04, 0.16), 2.58 (p13, 0.25), 3.58 (p06, 0.52), 8.2 (p01
+and p10, 2.9). The realized intensity of E therefore depends on the
+absolute rate, i.e. on A and on each shape's ceiling (B, C, D): within
+Dynamo the E effect mixes burstiness with its realized intensity, and
+across systems (Triton/vLLM have higher ceilings, e.g. CP 0.86 vs 0.37 rps)
+the same nominal level gives stronger bursts. Recommended (Domenico to
+decide): keep the E definition for all three systems (Dynamo cannot be
+redone; a per-system redefinition breaks comparability); analyze E with
+the REALIZED interarrival CoV (client/arrival_stats.json) alongside the
+coded level and declare it in the methods; replace the fixed CoV >= 1.5
+validator threshold with a check of realized vs theoretical CoV for the
+recorded rate/burst_factor/burst_on (the check must verify the generator,
+not the strength of the level). p11 is a correctly generated, weakly
+bursty run, not a defective one.
+
+**VALIDATOR FIXED AND PROVEN ON REAL DATA (2026-11-07, commit d30b76f).**
+Client submissions now bounded by started_at .. started_at + duration +
+60 s (spawn slack; lower bound strict); monitor samples bounded above by
+max(declared end, ended_at_unix) + grace (monitors sample through the
+client drain); coverage still anchored on the declared window. Full suite
+green. Validated OFF-BOX (runs rsync'd to the Mac's gitignored runs/, no
+load on the measuring host): postreboot val_dynamo_disagg, dynamo cp1
+(48h) and dynamo p08 (heaviest shape, longest drain) -> GATE: PASS on all
+8 checks each (integrity, component map, aggregate 200/200, multi-GPU, no
+orphans, client features, analysis, ECC). Realized workload matches the
+DoE levels (cp1 prefix 0.40/bursty CoV 1.70/0.211 vs 0.213 rps; p08 prefix
+0.00/Poisson CoV 1.00/0.361 vs 0.365 rps). Validation time < 1 min even
+for 48h runs. Validator cleared for the 19-run Dynamo analysis.
 
 **DYNAMO TAIL STARTED (2026-11-07, tmux `dyntail`).** Post-reboot gate
 run postreboot_20261107T191434Z_val_dynamo_disagg_r01: exit 0, 1439/1439
