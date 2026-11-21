@@ -81,6 +81,14 @@ Usage:
   python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --dry-run
   python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --start
   python3 scripts/campaign.py --campaign-yaml campaigns/extension/campaign.yaml --resume
+  python3 scripts/campaign.py --campaign-yaml <descriptor> --close --reason "<why>"
+
+Closing a campaign (--close): marks its state file CLOSED with a reason, after
+preserving a byte-identical copy of the original state (and moving that
+campaign's ALERT.json next to it) under state/closed/. A CLOSED state refuses
+--start, --resume and --dry-run with EXIT_CAMPAIGN_CLOSED (11): --start can no
+longer wipe the evidence, and no alert or next-command text suggests resuming
+it. A superseded campaign is re-run under a NEW campaign_id and state file.
 
 Recommended deployment (survives ssh disconnect; the log file survives tmux loss):
 
@@ -91,6 +99,7 @@ Recommended deployment (survives ssh disconnect; the log file survives tmux loss
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -133,6 +142,14 @@ EXIT_CAMPAIGN_FATAL = 5   # a child reported a non-retryable fatal (launch_cell.
 # failures -- inspect them". Not in launch_cell.NONRETRYABLE_EXIT_CODES (6/7/8/9)
 # and above them by design, so it never collides with a child fatal code.
 EXIT_COMPLETED_WITH_FAILURES = 10
+# The campaign's state file is CLOSED (superseded, see --close): --start /
+# --resume / --dry-run are refused. Distinct from every other code so a wrapper
+# script can tell "closed on purpose" from a pre-flight problem.
+EXIT_CAMPAIGN_CLOSED = 11
+
+# Value of the state file's "state" field once a campaign is closed. Absent on
+# every open campaign (so open state files keep their historical layout).
+STATE_CLOSED = "CLOSED"
 
 # TERMINAL run statuses are never re-queued by pending_specs(): a run either
 # completed, or FAILED after exhausting its (persisted) attempt budget. Every
@@ -428,6 +445,15 @@ class State:
     # image_digests}. Persisted so every subsequent dispatch (across resumes) can
     # fail campaign-fatal if the host drifted. None for pre-hardening state files.
     baseline: Optional[dict] = None
+    # Lifecycle marker: None while the campaign is open, STATE_CLOSED once
+    # superseded (written only by close_campaign_state). Never serialized when
+    # None, so open state files keep their historical layout.
+    state: Optional[str] = None
+    closed_reason: Optional[str] = None
+
+    @property
+    def closed(self) -> bool:
+        return self.state == STATE_CLOSED
 
     def to_dict(self) -> dict:
         d = {
@@ -437,6 +463,9 @@ class State:
         }
         if self.baseline is not None:
             d["baseline"] = self.baseline
+        if self.state is not None:
+            d["state"] = self.state
+            d["closed_reason"] = self.closed_reason
         return d
 
     @classmethod
@@ -446,6 +475,8 @@ class State:
             started_at=d.get("started_at", utc_iso()),
             runs={k: RunStatus(**v) for k, v in d.get("runs", {}).items()},
             baseline=d.get("baseline"),
+            state=d.get("state"),
+            closed_reason=d.get("closed_reason"),
         )
 
 
@@ -467,6 +498,175 @@ class CampaignInterrupted(Exception):
 
 class PreflightError(Exception):
     """Something the operator must fix before the campaign can start."""
+
+
+# ---------------------------------------------------------------------------
+# Campaign closure (a superseded campaign must never be started or resumed)
+# ---------------------------------------------------------------------------
+
+
+class CampaignClosed(Exception):
+    """The campaign's state file is CLOSED; carries the recorded reason."""
+
+
+class StateLocked(Exception):
+    """Another campaign.py process (a live --start/--resume, or a --close in
+    progress) holds the state file's lock."""
+
+
+def state_lock_path(state_path: Path) -> Path:
+    return state_path.with_name(state_path.name + ".lock")
+
+
+def acquire_state_lock(state_path: Path) -> int:
+    """Exclusive, non-blocking flock on <state>.lock; returns the fd (release
+    with release_state_lock). Serializes --close against --start/--resume: a
+    live orchestrator holds it for its whole life, so the closure check and
+    every later state write are atomic with respect to a concurrent close, and
+    a running campaign cannot be closed under it. The lock dies with the
+    process (no stale-lock cleanup); the fd is not inherited by children
+    (PEP 446). The holder's pid and argv are written into the file for the
+    refusal message."""
+    path = state_lock_path(state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            holder = path.read_text().strip() or "unknown holder"
+        except OSError:
+            holder = "unknown holder"
+        os.close(fd)
+        raise StateLocked(f"state lock {path} is held by another campaign.py process "
+                          f"({holder})") from None
+    os.ftruncate(fd, 0)
+    os.write(fd, f"pid={os.getpid()} argv={' '.join(sys.argv)[:300]}\n".encode())
+    return fd
+
+
+def release_state_lock(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def state_closure(state_path: Path) -> Optional[dict]:
+    """Return {"reason", "closed_at", "evidence_dir"} if the state file at
+    state_path is CLOSED, else None. An absent state file is not closed. An
+    unreadable one is NOT treated as open: it raises, so a corrupt state can
+    never slip past the closure gate (the caller fails loud)."""
+    if not state_path.exists():
+        return None
+    d = json.loads(state_path.read_text())
+    if d.get("state") != STATE_CLOSED:
+        return None
+    return {"reason": d.get("closed_reason"), "closed_at": d.get("closed_at"),
+            "evidence_dir": d.get("closed_evidence_dir")}
+
+
+def closure_message(state_path: Path, closure: dict) -> str:
+    return (f"campaign state {state_path} is CLOSED "
+            f"(closed_at={closure.get('closed_at')}; reason: {closure.get('reason')}). "
+            "It must not be started or resumed: its runs and calibrations are "
+            "preserved as evidence (see closed_evidence_dir in the state file). "
+            "Run the superseding campaign's own descriptor instead.")
+
+
+def close_campaign_state(state_path: Path, campaign_id: str, reason: str,
+                         now_iso: Optional[str] = None) -> dict:
+    """Mark a campaign state file CLOSED, preserving the original evidence.
+
+    1. The original state file is copied BYTE-IDENTICAL to
+       state/closed/<state-stem>_<stamp>/<state-name> (with its sha256).
+    2. A state/ALERT.json belonging to this campaign_id is MOVED next to it:
+       its next_command suggests --resume, which must never be shown again.
+    3. The state file gets state=CLOSED, closed_reason, closed_at and
+       closed_evidence_dir, every other key (runs, baseline, ...) untouched,
+       written atomically.
+
+    Refuses (CampaignClosed / PreflightError) when the state file is missing,
+    belongs to another campaign, has a run still marked running, or is already
+    closed with a DIFFERENT reason. Closing again with the same reason is a
+    no-op that returns the existing record. Raises StateLocked, touching
+    nothing, while another campaign.py process holds the state lock (a live
+    orchestrator, or a --start/--resume between its closure check and its
+    first state write)."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise PreflightError("--close requires a non-empty --reason")
+    if not state_path.exists():           # checked again under the lock
+        raise PreflightError(f"no state file at {state_path}: nothing to close")
+    fd = acquire_state_lock(state_path)
+    try:
+        return _close_locked(state_path, campaign_id, reason, now_iso)
+    finally:
+        release_state_lock(fd)
+
+
+def _close_locked(state_path: Path, campaign_id: str, reason: str,
+                  now_iso: Optional[str]) -> dict:
+    if not state_path.exists():
+        raise PreflightError(f"no state file at {state_path}: nothing to close")
+    raw = state_path.read_bytes()
+    d = json.loads(raw)
+    if d.get("campaign_id") != campaign_id:
+        raise PreflightError(
+            f"state at {state_path} belongs to campaign {d.get('campaign_id')!r}, "
+            f"not {campaign_id!r}; refusing to close it")
+    if d.get("state") == STATE_CLOSED:
+        if d.get("closed_reason") == reason:
+            return {"already_closed": True, "reason": reason,
+                    "closed_at": d.get("closed_at"),
+                    "evidence_dir": d.get("closed_evidence_dir")}
+        raise CampaignClosed(
+            f"already CLOSED with a different reason: {d.get('closed_reason')!r}")
+    running = sorted(k for k, v in (d.get("runs") or {}).items()
+                     if (v or {}).get("status") == "running")
+    if running:
+        raise PreflightError(
+            f"runs still marked running: {running}. Stop the campaign (or let "
+            "--resume recover a stale run) before closing it.")
+
+    now_iso = now_iso or utc_iso()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    evidence = state_path.parent / "closed" / f"{state_path.stem}_{stamp}"
+    evidence.mkdir(parents=True, exist_ok=False)
+    copy_path = evidence / state_path.name
+    copy_path.write_bytes(raw)
+    moved_alert = None
+    alert = state_path.parent / "ALERT.json"
+    if alert.exists():
+        try:
+            alert_campaign = json.loads(alert.read_text()).get("campaign_id")
+        except (OSError, json.JSONDecodeError):
+            alert_campaign = None
+        if alert_campaign == campaign_id:
+            moved_alert = evidence / "ALERT.json"
+            os.replace(alert, moved_alert)
+    record = {
+        "campaign_id": campaign_id,
+        "closed_at": now_iso,
+        "reason": reason,
+        "state_file": str(state_path),
+        "state_sha256_before_close": hashlib.sha256(raw).hexdigest(),
+        "preserved_state_copy": copy_path.name,
+        "moved_alert": moved_alert.name if moved_alert else None,
+    }
+    (evidence / "CLOSED.json").write_text(json.dumps(record, indent=2) + "\n")
+
+    d["state"] = STATE_CLOSED
+    d["closed_reason"] = reason
+    d["closed_at"] = now_iso
+    d["closed_evidence_dir"] = str(evidence.relative_to(state_path.parent))
+    tmp = state_path.with_suffix(state_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(d, indent=2))
+    os.replace(tmp, state_path)
+    return {"already_closed": False, "reason": reason, "closed_at": now_iso,
+            "evidence_dir": str(evidence), "moved_alert": record["moved_alert"]}
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +892,11 @@ class Campaign:
         return self.state_path.parent / "ALERT.json"
 
     def _next_command(self, event: str) -> str:
+        if self.state.closed:
+            # Unreachable in practice (a closed campaign never runs), but the
+            # contract is absolute: no text may suggest resuming it.
+            return (f"none: campaign {self.campaign_id} is CLOSED "
+                    f"({self.state.closed_reason}); run its superseding campaign")
         base = (f"python3 scripts/campaign.py --campaign-yaml {self.campaign_path} "
                 f"--resume")
         # A failure needs an explicit opt-in to retry (failed is TERMINAL); a
@@ -715,6 +920,7 @@ class Campaign:
             "event": event,
             "run_key": run_key,
             "reason": reason,
+            "state_file": str(self.state_path),
             "next_command": self._next_command(event),
         }
         path = self._alert_path()
@@ -750,9 +956,26 @@ class Campaign:
 
     def clear_alert(self) -> None:
         """Remove a stale ALERT.json: on a fresh --start, and on a clean
-        completion (the incident, if any, is resolved). Best-effort."""
+        completion (the incident, if any, is resolved). Best-effort.
+
+        Several campaigns share one state dir (and so one ALERT.json path). An
+        alert written by ANOTHER campaign is evidence of that campaign, not ours
+        to delete: it is moved to state/alerts_archive/ instead."""
+        path = self._alert_path()
         try:
-            self._alert_path().unlink()
+            owner = json.loads(path.read_text()).get("campaign_id")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            owner = None
+        try:
+            if owner is not None and owner != self.campaign_id:
+                archive = path.parent / "alerts_archive"
+                archive.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                dest = archive / f"ALERT_{owner}_{stamp}.json"
+                os.replace(path, dest)
+                log(f"ALERT.json of campaign {owner!r} archived to {dest} (not ours to clear)")
+            else:
+                path.unlink()
         except OSError:
             pass
 
@@ -1281,7 +1504,13 @@ class Campaign:
                 log(f"** PRIOR ALERT ({alert_path}): event={a.get('event')} "
                     f"run={a.get('run_key')} ts={a.get('ts')}")
                 log(f"**   reason: {a.get('reason')}")
-                log(f"**   next:   {a.get('next_command')}")
+                if a.get("campaign_id") not in (None, self.campaign_id):
+                    # Never echo another campaign's next command (it may be a
+                    # --resume of a campaign that has since been CLOSED).
+                    log(f"**   (alert belongs to campaign {a.get('campaign_id')!r}, "
+                        "not this one; its next command is not shown)")
+                else:
+                    log(f"**   next:   {a.get('next_command')}")
             except (OSError, json.JSONDecodeError) as e:
                 log(f"** PRIOR ALERT present at {alert_path} but unreadable: {e}")
         log(
@@ -1419,11 +1648,31 @@ def setup_logfile(state_path: Path) -> Path:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    """Entry point; releases the state lock _main may hold, however it exits."""
+    global _STATE_LOCK_FD
+    try:
+        return _main(argv)
+    finally:
+        release_state_lock(_STATE_LOCK_FD)
+        _STATE_LOCK_FD = None
+
+
+_STATE_LOCK_FD: Optional[int] = None
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
+    global _STATE_LOCK_FD
     p = argparse.ArgumentParser(description="Serial orchestrator for the extension (DoW) campaign.")
     p.add_argument("--campaign-yaml", type=Path, required=True)
     p.add_argument("--start", action="store_true", help="Start fresh (delete existing state file).")
     p.add_argument("--resume", action="store_true", help="Resume from the state file.")
     p.add_argument("--dry-run", action="store_true", help="Run pre-flight (schedule + gates) and exit.")
+    p.add_argument("--close", action="store_true",
+                   help="Mark this campaign's state file CLOSED (superseded), preserving "
+                        "the original state and its ALERT.json under state/closed/. A "
+                        "CLOSED state refuses --start/--resume/--dry-run (exit 11).")
+    p.add_argument("--reason", default=None,
+                   help="Required with --close: why the campaign is closed.")
     p.add_argument("--rerun-failed", action="store_true",
                    help="Reset FAILED runs (attempts->0, status->pending) so --resume "
                         "re-queues them with a full attempt budget. failed is otherwise "
@@ -1433,12 +1682,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.start and args.resume:
         print("--start and --resume are mutually exclusive", file=sys.stderr)
         return EXIT_USAGE
+    if args.close and (args.start or args.resume or args.dry_run or args.rerun_failed):
+        print("--close cannot be combined with --start/--resume/--dry-run/--rerun-failed",
+              file=sys.stderr)
+        return EXIT_USAGE
+    if args.reason is not None and not args.close:
+        print("--reason only applies to --close", file=sys.stderr)
+        return EXIT_USAGE
     if args.rerun_failed and not args.resume:
         print("--rerun-failed only applies to --resume (failed runs live in an "
               "existing state file)", file=sys.stderr)
         return EXIT_USAGE
-    if not (args.start or args.resume or args.dry_run):
-        print("must specify --start, --resume, or --dry-run", file=sys.stderr)
+    if not (args.start or args.resume or args.dry_run or args.close):
+        print("must specify --start, --resume, --dry-run or --close", file=sys.stderr)
         return EXIT_USAGE
 
     campaign_path = args.campaign_yaml.resolve()
@@ -1450,6 +1706,46 @@ def main(argv: Optional[list[str]] = None) -> int:
         return EXIT_PREFLIGHT
 
     state_path = (campaign_path.parent / campaign.get("state_file", "state/campaign_state.json")).resolve()
+
+    if args.close:
+        try:
+            res = close_campaign_state(state_path, campaign["campaign_id"], args.reason)
+        except (PreflightError, CampaignClosed, StateLocked, OSError,
+                json.JSONDecodeError) as e:
+            print(f"[campaign] CLOSE REFUSED: {e}", file=sys.stderr)
+            return EXIT_PREFLIGHT
+        if res["already_closed"]:
+            log(f"{state_path} already CLOSED at {res['closed_at']} with this reason; nothing to do")
+        else:
+            log(f"CLOSED {state_path}: reason={res['reason']!r}")
+            log(f"  original state preserved byte-identical in {res['evidence_dir']}")
+            if res.get("moved_alert"):
+                log(f"  this campaign's ALERT.json moved to {res['evidence_dir']}")
+        return EXIT_OK
+
+    # A writing invocation (--start / --resume) takes the state lock FIRST and
+    # keeps it for its whole life: the closure gate below and the --start
+    # delete are then atomic with respect to a concurrent --close (which needs
+    # the same lock), and a running campaign cannot be closed under it.
+    # --dry-run never writes or deletes state, so it does not lock.
+    if not args.dry_run:
+        try:
+            _STATE_LOCK_FD = acquire_state_lock(state_path)
+        except StateLocked as e:
+            print(f"[campaign] REFUSED: {e}", file=sys.stderr)
+            return EXIT_PREFLIGHT
+
+    # Closure gate BEFORE anything can touch the state: --start would otherwise
+    # delete a closed campaign's state (its evidence) and re-run it.
+    try:
+        closure = state_closure(state_path)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[campaign] PREFLIGHT ERROR: unreadable state file {state_path}: {e}",
+              file=sys.stderr)
+        return EXIT_PREFLIGHT
+    if closure is not None:
+        print(f"[campaign] REFUSED: {closure_message(state_path, closure)}", file=sys.stderr)
+        return EXIT_CAMPAIGN_CLOSED
 
     # --start wipes prior state; --resume loads it; --dry-run neither writes nor deletes.
     if args.start and state_path.exists() and not args.dry_run:

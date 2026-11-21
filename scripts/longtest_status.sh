@@ -51,7 +51,18 @@ import json
 a = json.load(open('$ALERT_FILE'))
 print(f\"  ** {a.get('event','?')} on {a.get('run_key') or '-'} at {a.get('ts','?')}\")
 print(f\"     reason: {a.get('reason','?')}\")
-print(f\"     next:   {a.get('next_command','?')}\")
+closed = False
+try:
+    st = json.load(open('$STATE_FILE'))
+    closed = st.get('state') == 'CLOSED' and st.get('campaign_id') == a.get('campaign_id')
+except Exception:
+    pass
+if a.get('campaign_id') not in (None, '$CAMPAIGN_ID'):
+    print(f\"     (alert belongs to campaign {a.get('campaign_id')}, not $CAMPAIGN_ID; next command not shown)\")
+elif closed:
+    print('     next:   none -- this campaign is CLOSED (do not resume)')
+else:
+    print(f\"     next:   {a.get('next_command','?')}\")
 " 2>/dev/null || note "ALERT.json present but unreadable ($ALERT_FILE)"
 else
     note "no ALERT.json (no campaign-fatal / failure / interrupt recorded)"
@@ -63,6 +74,9 @@ if [ -f "$STATE_FILE" ]; then
     python3 -c "
 import json
 s = json.load(open('$STATE_FILE'))
+if s.get('state') == 'CLOSED':
+    print(f\"  ** CLOSED at {s.get('closed_at')}: {s.get('closed_reason')}\")
+    print(f\"  ** do NOT start or resume this campaign; evidence preserved in {s.get('closed_evidence_dir')}\")
 runs = s.get('runs', {})
 if not runs:
     print('  (no runs recorded yet)')

@@ -253,6 +253,7 @@ case "$CAMPAIGN_RC" in
     5) MEANING="CAMPAIGN-FATAL (non-retryable precondition: disk / host / image-pin)" ;;
     3) MEANING="PRE-FLIGHT ERROR (should have stopped in phase c)" ;;
     10) MEANING="COMPLETED_WITH_FAILURES (queue drained but >=1 run FAILED; inspect, then --resume --rerun-failed)" ;;
+    11) MEANING="CAMPAIGN CLOSED (superseded; never start or resume it, use its successor descriptor)" ;;
     *) MEANING="unexpected (see campaign log)" ;;
 esac
 log "campaign exit code: $CAMPAIGN_RC -- $MEANING"

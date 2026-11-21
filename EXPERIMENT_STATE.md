@@ -87,6 +87,64 @@ Triton/vLLM runs (open review items in the 2026-11-07 block still apply).
 
 ---
 
+## RESUME HERE (2026-11-20): DYNAMO ARM COMPLETE (19/19), first-look results
+
+**Tail done.** p16, p09, p05, cp3 all completed at attempt 1 (Nov 7-14,
+kernel 7.0.0-42), no alerts, GATE PASS on all four (validated on the box
+while idle). All 19 Dynamo runs copied to the Mac (gitignored runs/).
+Host rebooted again on 2026-11-17 11:19 local: CLEAN, ADMINISTRATIVE
+shutdown (orderly systemd unmount sequence, `last -x` shutdown record,
+same kernel), three days after the tail ended. Not a crash; no DMAR
+errors (the DMAR lines in the boot log are normal init messages).
+
+**First-look analysis (review-chat script outputs/dyn_slopes.py, NOT yet
+the paper pipeline):** post-warmup, membership-complete ticks, 5-min
+medians, Theil-Sen + Mann-Kendall per run; growth per request = engine
+USS growth over the post-warmup window / requests served in it.
+- Every run ages, linear, no saturation: slopes +2.3 to +447.6 MB/h; p02
+  (20 rps) engine USS 6.3 -> 21.7 GiB in 36 h, hourly slope constant
+  (457, 453, 445, 442, 442, 444 MB/h by 6-h segment).
+- LOAD-DRIVEN: ~6.3 KB per request with short prompts, identical from
+  0.25 to 20 rps; log-log exponent of slope vs request rate = 1.01.
+- Factor screening on growth per request, full 16-point design: prompt
+  length B +8.8 KB/req (t = 9.9; ~6.3 KB at 512 tokens, 9.3 at 3256,
+  ~15 at 6000); C +1.2 (t 1.4), E +1.4 (t 1.5), A -0.4, D -0.1 (prefix
+  caching irrelevant); no significant two-factor interaction.
+- LOCALIZATION: frontend flat everywhere (<= 0.55 MB/h); growth split
+  ~50/50 between prefill and decode workers. Each worker PGID contains
+  both the Dynamo worker code and the vLLM EngineCore: the
+  orchestration-vs-inference split INSIDE the workers is not yet
+  resolved (next small experiment: per-process split within each worker,
+  e.g. in the bridge center points). Hypothesis only: KV-transfer
+  bookkeeping (symmetric, per request, grows with prompt -> KV blocks).
+- Block check: CP growth per request cp1 9.36 / cp2 9.38 / cp3 9.25 KB
+  (cp3 post-reboot): shift < 1.5%; post-reboot design points fit the
+  pre-reboot pattern. The earlier "declining CP slope" watch item was a
+  realized-rate artefact (0.211 vs 0.205 rps): per request the CPs agree.
+- Resource-exhaustion implication: memory exhaustion in days under
+  sustained load (frame as such, responsible disclosure).
+Caveats: autocorrelation makes the per-run CIs optimistic; FDR /
+stepness pipeline not yet run; E's realized intensity is rate-dependent.
+
+**Rerun plan (pending review and server validation).** The generated
+`extension_dow_rescoped` schedule repeats the 38 Triton/vLLM runs with
+whole-container v2 scope and adds one 48 h Dynamo bridge at the center
+of W3. It uses three machine windows capped at 25 days, with 14, 14 and
+11 scheduled runs. The projected totals are 22.6, 22.1 and 17.9 days,
+including setup, calibration, overhead and two 6 h scope soaks in W1.
+Triton and vLLM each have one center point per window. Quarter blocks preserve
+balance for all main effects and the seven two-factor contrasts outside
+AC, AD and CD. Calibration is separate for each window and valid for
+30 days. See [the rerun procedure](docs/rerun_windows.md).
+
+**Server work pending.** Close `extension_dow_screening` on the server
+before W1. Run the two W1 scope soaks before calibration. Before
+dispatching cp4, verify the Dynamo per-process tags on hardware in a short
+validation run. Record the server closure and hardware results here when
+available.
+
+---
+
 ## RESUME HERE (2026-11-07): host REBOOTED, Dynamo tail cleared to start
 
 **OFF-BOX VALIDATION OF THE 15 COMPLETED DYNAMO RUNS (2026-11-07).**
