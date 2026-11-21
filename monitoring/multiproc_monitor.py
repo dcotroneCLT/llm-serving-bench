@@ -50,6 +50,25 @@ Component spec (JSON, --components-file):
 `expected_count` is the number of recorded PGIDs (logical instances). `pgids`
 is injected by attach_run/launch_cell from the bring-up identity file.
 
+Per-process split (OPT-IN, "per_process_split": true at the top level of the
+spec, i.e. monitors.components.per_process_split in the cell yaml). Default OFF:
+without the key the sampler, its CSV schemas and its files are exactly the
+historical ones. When ON, every engine-group component ALSO writes
+perproc_<label>_NNNNNN.csv with one row per sampled process per tick:
+(pid, create_time, ppid, tag, USS/PSS/RSS). The tag is a CLOSED set
+(PROCESS_TAGS): dynamo_main (the process matching the component's own cmdline
+pattern: the Dynamo worker / frontend entry point), vllm_enginecore (the vLLM
+EngineCore subprocess, whose process title is VLLM::EngineCore) or other. The
+rows are the very values summed into the component row of the same tick (one
+memory_full_info read per process), so per tick sum(perproc) == component; a
+process whose identity cannot be read is excluded from BOTH, leaving the tick
+membership-incomplete. This separates Dynamo orchestration code from the
+inference engine INSIDE the prefill/decode worker process groups. Each new
+process identity (pid, create_time) is also appended ONCE to
+perproc_identities.jsonl with its tag, process name and cmdline, so the tag can
+be audited against the real process tree (the EngineCore tag relies on vLLM's
+process title; verify it on the first ticks of the first run that opts in).
+
 Runs under sudo (like proc_monitor) so USS/PSS are readable for processes not
 owned by the launching user.
 """
@@ -79,6 +98,17 @@ COMPONENT_FIELDS = [
     "membership_complete",
     "uss_bytes", "rss_bytes", "vms_bytes", "pss_bytes",
     "pids", "_sample_duration_s", "_wall_clock_unix",
+]
+
+# Closed per-process tag set (R5). Never extend ad hoc: analysis groups by it.
+PROCESS_TAGS = ("dynamo_main", "vllm_enginecore", "other")
+# "EngineCor" also matches the 15-char comm truncation of VLLM::EngineCore.
+ENGINECORE_RE = re.compile(r"EngineCore?")
+
+PERPROC_FIELDS = [
+    "ts_unix", "label", "group", "pid", "create_time", "ppid", "tag",
+    "uss_bytes", "pss_bytes", "rss_bytes", "component_membership_complete",
+    "_wall_clock_unix",
 ]
 
 AGG_FIELDS = [
@@ -159,37 +189,74 @@ def resolve_all(
     return buckets, unexpected
 
 
-def sample_component(procs: list[psutil.Process]) -> dict[str, Any]:
-    """Sum USS/RSS/VMS/PSS over the resolved PIDs, tolerating per-PID exits."""
+def process_tag(cmdline: str, component: "Component", name: str = "") -> str:
+    """Closed-set tag of one process inside a component (see PROCESS_TAGS).
+    The EngineCore title is checked first, on the cmdline AND the process name
+    (setproctitle rewrites both; comm is truncated to 15 chars)."""
+    if ENGINECORE_RE.search(cmdline or "") or ENGINECORE_RE.search(name or ""):
+        return "vllm_enginecore"
+    if cmdline and component.matches(cmdline):
+        return "dynamo_main"
+    return "other"
+
+
+def sample_component(procs: list[psutil.Process],
+                     component: Optional["Component"] = None) -> dict[str, Any]:
+    """Sum USS/RSS/VMS/PSS over the resolved PIDs, tolerating per-PID exits.
+
+    With `component` given (per-process split ON) each summed process is also
+    returned under "per_process" with its identity and tag; a process whose
+    identity cannot be read is left out of the sums too, so the per-process
+    rows always add up to the component values."""
     uss = rss = vms = pss = 0
     sampled_pids: list[int] = []
+    per_process: list[dict] = []
     for proc in procs:
         try:
             mem = proc.memory_full_info()
+            if component is not None:
+                cmdline, name = " ".join(proc.cmdline()), proc.name()
+                identity = {"pid": proc.pid, "create_time": proc.create_time(),
+                            "ppid": proc.ppid(), "name": name, "cmdline": cmdline[:512],
+                            "tag": process_tag(cmdline, component, name)}
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             # Exited between resolve and read, or unreadable: do not crash the
             # tick; this PID is simply not counted (membership becomes < matched).
             continue
+        if component is not None:
+            per_process.append({**identity,
+                                "uss_bytes": getattr(mem, "uss", 0) or 0,
+                                "pss_bytes": getattr(mem, "pss", 0) or 0,
+                                "rss_bytes": getattr(mem, "rss", 0) or 0})
         uss += getattr(mem, "uss", 0) or 0
         rss += getattr(mem, "rss", 0) or 0
         vms += getattr(mem, "vms", 0) or 0
         pss += getattr(mem, "pss", 0) or 0
         sampled_pids.append(proc.pid)
-    return {
+    out = {
         "uss_bytes": uss, "rss_bytes": rss, "vms_bytes": vms, "pss_bytes": pss,
         "sampled_pids": sampled_pids,
     }
+    if component is not None:
+        out["per_process"] = per_process
+    return out
 
 
-def tick(components: list[Component], root_pid: Optional[int], ts: float) -> tuple[list[dict], dict[str, dict]]:
-    """One coherent measurement: resolve-all then sample-all under one ts."""
+def tick(components: list[Component], root_pid: Optional[int], ts: float,
+         per_process: bool = False) -> tuple[list[dict], dict[str, dict]]:
+    """One coherent measurement: resolve-all then sample-all under one ts.
+
+    per_process (opt-in, default False) attaches "_per_process" rows to each
+    engine-group component row; the CSV writers ignore unknown keys, so the
+    component/aggregate CSVs are byte-identical either way."""
     buckets, unexpected = resolve_all(components, root_pid)
     comp_rows: list[dict] = []
     by_group: dict[str, dict] = {}
     for c in components:
         procs = buckets[c.label]
         n_matched = len(procs)
-        s = sample_component(procs)
+        split = per_process and c.group == "engine"
+        s = sample_component(procs, c if split else None)
         n_sampled = len(s["sampled_pids"])
         n_unexpected = unexpected.get(c.label, 0)
 
@@ -224,6 +291,11 @@ def tick(components: list[Component], root_pid: Optional[int], ts: float) -> tup
             "pss_bytes": s["pss_bytes"] if n_sampled > 0 else None,
             "pids": ",".join(str(p) for p in s["sampled_pids"]),
         }
+        if split:
+            row["_per_process"] = [
+                {"ts_unix": ts, "label": c.label, "group": c.group,
+                 "component_membership_complete": complete, **proc_row}
+                for proc_row in s["per_process"]]
         comp_rows.append(row)
         g = by_group.setdefault(c.group, {
             "n_components_expected": 0, "n_components_complete": 0, "n_pids_sampled": 0,
@@ -258,6 +330,8 @@ def main() -> None:
     container_sampler = None
     scope_fields = []
     component_fields = COMPONENT_FIELDS
+    # R5 opt-in; meaningful only for the PGID/regex (Dynamo) sampler.
+    per_process = bool(spec.get("per_process_split")) and spec.get("scope_type") != "container_tree"
     if spec.get("scope_type") == "container_tree":
         from container_scope import ContainerSampler, SCOPE_FIELDS
         container_sampler = ContainerSampler(spec, args.output_dir)
@@ -271,6 +345,12 @@ def main() -> None:
             rotation_seconds=args.rotation_seconds, fieldnames=component_fields))
         for c in components
     }
+    perproc_writers = {
+        c.label: CsvRotatingWriter(WriterConfig(
+            output_dir=args.output_dir, base_name=f"perproc_{c.label}",
+            rotation_seconds=args.rotation_seconds, fieldnames=PERPROC_FIELDS))
+        for c in components if per_process and c.group == "engine"
+    }
     groups = sorted({c.group for c in components})
     agg_writers = {
         g: CsvRotatingWriter(WriterConfig(
@@ -283,8 +363,13 @@ def main() -> None:
     watchdog = Watchdog(timeout_seconds=args.watchdog_timeout_s, sentinel=None)
     shutdown = ShutdownEvent()
 
+    seen_identities: set[tuple[str, int, float]] = set()
+    identities_path = args.output_dir / "perproc_identities.jsonl"
+
     print(f"[multiproc_monitor] components={[c.label for c in components]} "
-          f"root_pid={root_pid} engine_group={engine_group}", flush=True)
+          f"root_pid={root_pid} engine_group={engine_group}"
+          + (f" per_process_split={sorted(perproc_writers)}" if per_process else ""),
+          flush=True)
 
     start = time.monotonic()
     n = 0
@@ -298,7 +383,7 @@ def main() -> None:
             ts = time.time()
             t0 = time.monotonic()
             result = watchdog.call(lambda: container_sampler.tick(ts) if container_sampler
-                                   else tick(components, root_pid, ts))
+                                   else tick(components, root_pid, ts, per_process=per_process))
             dur = time.monotonic() - t0
             wall = time.time()
             if result is None:
@@ -329,6 +414,15 @@ def main() -> None:
                 row["_sample_duration_s"] = dur
                 row["_wall_clock_unix"] = wall
                 comp_writers[row["label"]].write(row)
+                for proc_row in row.get("_per_process", ()):
+                    perproc_writers[row["label"]].write({**proc_row, "_wall_clock_unix": wall})
+                    key = (row["label"], proc_row["pid"], proc_row["create_time"])
+                    if key not in seen_identities:
+                        seen_identities.add(key)
+                        with identities_path.open("a") as stream:
+                            stream.write(json.dumps({
+                                k: proc_row[k] for k in ("ts_unix", "label", "pid", "create_time",
+                                                          "ppid", "tag", "name", "cmdline")}) + "\n")
             for g, agg in by_group.items():
                 complete = agg["n_components_complete"] == agg["n_components_expected"]
                 agg_writers[g].write({
@@ -347,6 +441,8 @@ def main() -> None:
             n += 1
     finally:
         for w in comp_writers.values():
+            w.close()
+        for w in perproc_writers.values():
             w.close()
         for w in agg_writers.values():
             w.close()

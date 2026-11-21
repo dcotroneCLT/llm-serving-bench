@@ -249,6 +249,69 @@ def check_no_orphans(run_dir: Path, components: list[dict]) -> tuple[bool, list[
     return ok, msgs
 
 
+PROCESS_TAGS = ("dynamo_main", "vllm_enginecore", "other")
+
+
+def check_per_process_split(run_dir: Path, components: list[dict]) -> tuple[bool, list[str]]:
+    """R5 (opt-in Dynamo per-process split): on every membership-complete tick
+    of every engine component, the perproc_<label> rows must (a) exist, (b) carry
+    exactly the component row's PIDs with a closed-set tag, and (c) sum to the
+    component's USS/PSS/RSS. Reports per-tag USS at the first and last complete
+    tick (orchestration vs inference engine inside each worker)."""
+    msgs: list[str] = []
+    ok = True
+    for comp in components:
+        if comp.get("group", "engine") != "engine":
+            continue
+        label = comp["label"]
+        perproc: dict[str, list[dict]] = {}
+        for row in _read_csvs(run_dir, f"perproc_{label}"):
+            perproc.setdefault(row["ts_unix"], []).append(row)
+        if not perproc:
+            ok = False
+            msgs.append(f"    FAIL: {label}: per_process_split is on but perproc_{label} has no rows")
+            continue
+        checked = mismatched = missing = bad_tags = 0
+        first = last = None
+        for row in _read_csvs(run_dir, label):
+            if str(row.get("membership_complete", "")).lower() != "true":
+                continue
+            ts = row["ts_unix"]
+            procs = perproc.get(ts)
+            if not procs:
+                missing += 1
+                continue
+            checked += 1
+            if any(p.get("tag") not in PROCESS_TAGS for p in procs):
+                bad_tags += 1
+            same_pids = _pids(row.get("pids")) == {int(p["pid"]) for p in procs} and \
+                len(procs) == len({p["pid"] for p in procs})
+            sums_ok = all(
+                _f(row.get(field)) is not None and
+                abs(sum(_f(p.get(field)) or 0.0 for p in procs) - _f(row[field])) <= 1.0
+                for field in ("uss_bytes", "pss_bytes", "rss_bytes"))
+            if not (same_pids and sums_ok):
+                mismatched += 1
+            by_tag: dict[str, float] = {}
+            for p in procs:
+                by_tag[p.get("tag")] = by_tag.get(p.get("tag"), 0.0) + (_f(p.get("uss_bytes")) or 0.0)
+            first = first or by_tag
+            last = by_tag
+        line = (f"    {label}: per-process sums == component on {checked - mismatched}/{checked} "
+                f"complete ticks")
+        if missing or mismatched or bad_tags or not checked:
+            ok = False
+            msgs.append(line + f"  FAIL (missing={missing}, mismatched={mismatched}, "
+                               f"unknown_tags={bad_tags})")
+            continue
+        msgs.append(line)
+        for tag in PROCESS_TAGS:
+            if tag in (first or {}) or tag in (last or {}):
+                msgs.append(f"      {tag:<16} USS first {(first or {}).get(tag, 0.0) / 1e6:9.1f} MB"
+                            f"  last {(last or {}).get(tag, 0.0) / 1e6:9.1f} MB")
+    return ok, msgs
+
+
 def check_multi_gpu(run_dir: Path, gpu_devices: list[int]) -> tuple[bool, list[str]]:
     msgs = []
     ok = True
@@ -374,6 +437,10 @@ def main() -> None:
         results.append(("aggregate", ok2)); results.append(("multi_gpu", okg))
         print("\n[2b] No stray processes outside recorded pgids (orphan red flag):")
         oko, mo = check_no_orphans(args.run_dir, components); print("\n".join(mo)); results.append(("no_orphans", oko))
+        if comp_spec.get("per_process_split"):
+            print("\n[2c] Per-process split (opt-in): per-process sums == component sums:")
+            okp, mp = check_per_process_split(args.run_dir, components)
+            print("\n".join(mp)); results.append(("per_process_split", okp))
 
     if args.scope_only:
         passed = all(ok for _, ok in results)
