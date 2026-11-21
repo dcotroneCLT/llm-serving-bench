@@ -10,9 +10,9 @@
 # Fixed order seed 20261120: design points shuffled per system, the minority
 # system spread evenly through the majority, the center-point block in the middle.
 #
-# Projection: setup 2 h + soak 12 h + calibration 17 h (14 cells x 1.214 h)
+# Projection: setup 2 h + soak 12.5 h + calibration 17 h (14 cells x 1.214 h)
 #   + runs 504 h + overhead 8 h (16 runs x 0.5 h)
-#   = 543 h = 22.62 days; retry margin 2.38 days in 25 (required >= 1.5).
+#   = 543.5 h = 22.65 days; retry margin 2.35 days in 25 (required >= 1.5).
 # Calibration age at the last dispatch ~19.77 d (limit 30 d).
 #
 # Execution order (14 runs):
@@ -48,13 +48,13 @@ rerun_window:
   projected_n_runs: 14
   projected_n_soak_runs: 2
   projected_setup_h: 2.0
-  projected_soak_h: 12.0
+  projected_soak_h: 12.5
   projected_calibration_h: 17.0
   projected_runs_h: 504.0
   projected_overhead_h: 8.0
-  projected_total_h: 543.0
-  projected_total_days: 22.62
-  projected_retry_margin_days: 2.38
+  projected_total_h: 543.5
+  projected_total_days: 22.65
+  projected_retry_margin_days: 2.35
   projected_required_margin_days: 1.5
   projected_calibration_age_at_last_dispatch_days: 19.77
 

@@ -176,7 +176,7 @@ class Durations(unittest.TestCase):
             cells = descriptor(k)["cells"]
             runs_h = sum(cell_doc(c)["duration_s"] for c in cells) / 3600
             calib_h = len(cells) * 17.0 / 14.0
-            soak_h = 2 * 6.0 if k == 1 else 0.0
+            soak_h = 2 * 6.25 if k == 1 else 0.0
             n_soak = 2 if k == 1 else 0
             overhead_h = (len(cells) + n_soak) * grw.RUN_OVERHEAD_H + grw.WINDOW_SETUP_H
             total_d = (runs_h + calib_h + soak_h + overhead_h) / 24
@@ -189,8 +189,16 @@ class Durations(unittest.TestCase):
             self.assertAlmostEqual(meta["projected_retry_margin_days"], margin_d, places=2)
         # The calibration pace is the stated 17 h for 14 cells.
         self.assertAlmostEqual(descriptor(1)["rerun_window"]["projected_calibration_h"], 17.0)
-        self.assertEqual(descriptor(1)["rerun_window"]["projected_soak_h"], 12.0)
+        self.assertEqual(descriptor(1)["rerun_window"]["projected_soak_h"], 12.5)
         self.assertEqual(descriptor(2)["rerun_window"]["projected_soak_h"], 0.0)
+
+    def test_soak_has_margin_over_the_soak_check_threshold(self):
+        # soak_check.py --min-hours 6.0 applies to the EFFECTIVE sampled span;
+        # a run declared at exactly 6 h would fail on one missing tick.
+        self.assertGreaterEqual(grw.SOAK_DURATION_S, 6 * 3600 + 10 * 60)
+        for system in grw.SOAK_CELLS:
+            doc = cell_doc({"yaml": f"cells/rerun/{grw.SOAK_CELLS[system]}.yaml"})
+            self.assertEqual(doc["duration_s"], grw.SOAK_DURATION_S)
 
     def test_infeasible_plan_is_refused(self):
         orders = grw.window_order()

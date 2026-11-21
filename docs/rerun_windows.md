@@ -91,7 +91,7 @@ the window).
 
 | Window | Runs | Soak | Calibration | Runs + overhead + setup | Total | Retry margin in 25 d | Calibration age at last dispatch |
 |---|---|---|---|---|---|---|---|
-| W1 | 504 h | 12 h | 17.0 h | 8 h + 2 h | 22.6 d | 2.4 d | ~19.8 d |
+| W1 | 504 h | 12.5 h | 17.0 h | 8 h + 2 h | 22.6 d | 2.4 d | ~19.8 d |
 | W2 | 504 h | none | 17.0 h | 7 h + 2 h | 22.1 d | 2.9 d | ~19.8 d |
 | W3 | 408 h | none | 13.4 h | 5.5 h + 2 h | 17.9 d | 7.1 d | ~15.7 d |
 
@@ -250,7 +250,7 @@ Acceptance:
 ```bash
 tmux new -d -s rerun_soak \
   'python3 scripts/campaign.py --campaign-yaml campaigns/extension/dow_rerun_w1_soak.yaml --start'
-# after both runs completed (about 13 h):
+# after both runs completed (about 13.5 h):
 for s in triton vllm; do
   python3 analysis/soak_check.py --run-dir "$HOME/wosar/runs/extension_dow_rescoped_soak_${s}_r01" \
     --json "$HOME/wosar/ops/soak_${s}.json"

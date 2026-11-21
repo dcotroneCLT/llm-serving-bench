@@ -4,7 +4,43 @@ Living hand-off document for the WoSAR 2026 n=3 campaign. Updated by hand
 whenever something material changes. Designed so a new chat session (or
 a co-author) can pick up the thread in under five minutes.
 
-Last updated: 2026-11-17 (ET).
+Last updated: 2026-11-21 (ET).
+
+---
+
+## RESUME HERE (2026-11-21): rerun implementation reviewed, GO after one small fix
+
+Independent review of the nine rerun commits (0cbd87e..1cbc3d7) for the
+three-window Triton/vLLM rerun (`extension_dow_rescoped`, docs/rerun_windows.md).
+
+Verified: 652 tests pass; both generator `--check` runs are clean; the rerun
+design matrix was recomputed independently (W1 14 runs, W2 14, W3 11; Triton
+8/4/4, vLLM 4/8/4; all main effects balanced per window per system; only AC,
+AD, CD exposed; one center point per system per window; cp4 in W3); the Dynamo
+path is unchanged (cells, deploy, sampler default, tail descriptor); all 38
+Triton/vLLM cells use the container_tree v2 scope; cp4 differs from cp1 only by
+`per_process_split: true`; descriptors dry-run correctly (soak needs no
+calibration, per-window calibration dirs, calibrate_dow refuses the soak
+descriptor and lists exactly the window cells, 17.0 h / 13.4 h); p11, p01, p07
+pass the new gate (CoV vs theory, PSS diagnostic).
+
+One fix required before W1 (sent to Claude Code): the soak declares exactly
+6 h and soak_check requires an effective sampled span of at least 6 h. On the
+Dynamo sampler the span exceeds the declared duration by only 0.1 ms, and the
+container_tree sampler has never been measured on this point, so one missing
+tick would fail a 13 h soak by 5 s. Fix: soak duration 6 h 15 min, threshold
+stays 6 h.
+
+Notes, not blockers:
+- cp4 is recalibrated in W3, so its absolute rate can differ from cp1..cp3.
+  Compare the bridge on growth per request and report the realized rates.
+- The soak has never run on hardware; it is the first hardware test of the
+  100%-complete-scope criterion. A FAIL there is information, not a defect.
+- The 0 MiB vs 610 MiB VRAM baseline discrepancy (2026-11-17) must be
+  explained at the W1 snapshot step.
+
+Next: apply the fix, pull on the box, then docs/rerun_windows.md section 5
+(close the old campaign, reboot, snapshot, soak, calibration, dry-run, start).
 
 ---
 

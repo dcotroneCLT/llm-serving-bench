@@ -45,7 +45,7 @@ class SoakCells(unittest.TestCase):
             workload = copy.deepcopy(soak["workload"]["client_config_overrides"])
             self.assertEqual(workload.pop("target_rate_rps"), 0.10)
             self.assertEqual(workload, p16[system]["workload"]["client_config_overrides"])
-            self.assertEqual(soak["duration_s"], 6 * 3600)
+            self.assertEqual(soak["duration_s"], 22_500)       # 6 h 15 min
             self.assertNotIn("calibration_fraction", soak)
 
     def test_soak_descriptor_needs_no_calibration(self):

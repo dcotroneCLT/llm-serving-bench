@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Acceptance check for the W1 whole-container scope soak (R4).
 
-A soak run (cells soak_triton / soak_vllm, 6 h on the p16 shape) must show that
+A soak run (cells soak_triton / soak_vllm, 6 h 15 min on the p16 shape) must show that
 the whole-container v2 scope holds for hours before a window commits to 36 h
 runs, where an identity-loss latch would abort the run. PASS requires ALL of:
 
