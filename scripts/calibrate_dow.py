@@ -65,9 +65,23 @@ Verdict: the orchestrator ends by running the campaign's own pre-flight
 (campaign.py --dry-run) and printing its head -- success is that dry-run moving
 from 57 MISSING to 0.
 
+Per-window calibration (the rescoped rerun, docs/rerun_windows.md): point
+--campaign-yaml at ONE window descriptor (campaigns/extension/dow_rerun_w<k>.yaml).
+Only that window's cells are calibrated (the descriptor lists nothing else), one
+fresh stack per sweep, method v2.1 unchanged, each JSON written to the cell's
+calibration_file -- which the guard below requires to lie inside the window's
+declared rerun_window.calibration_dir (state/calibration_rerun/w<k>/). The
+--dry-run prints the projected calibration duration for the cells still to do.
+
+Refusals before anything starts (check_descriptor): a descriptor whose state
+file is CLOSED (re-calibrating a superseded campaign would overwrite its
+calibration evidence) -> exit 11; a cell without calibration_file (e.g. a soak
+cell) or, for a window descriptor, a calibration_file outside the window's
+calibration_dir -> exit 3.
+
 Usage (run inside tmux; it tees to campaigns/extension/state/logs/):
-  tmux new -d -s calib_dow \\
-    'python3 scripts/calibrate_dow.py --campaign-yaml campaigns/extension/dow_campaign.yaml'
+  tmux new -d -s calib_w1 \\
+    'python3 scripts/calibrate_dow.py --campaign-yaml campaigns/extension/dow_rerun_w1.yaml'
 """
 
 from __future__ import annotations
@@ -129,10 +143,17 @@ EXIT_SOME_FAILED = 1
 EXIT_BRINGUP = 2
 # Host-precondition codes mirror launch_cell's where they overlap: 7 = free-space
 # gate, 8 = residual active run / unkillable orphan, 9 = run-slot lock held.
+EXIT_DESCRIPTOR = 3        # descriptor not calibratable (see check_descriptor)
 EXIT_DISK = 7
 EXIT_PRECONDITION = 8
 EXIT_LOCK_HELD = 9
+EXIT_CAMPAIGN_CLOSED = camp.EXIT_CAMPAIGN_CLOSED   # 11, same meaning as campaign.py
 EXIT_INTERRUPTED = 130
+
+# Projected wall time of ONE cell's calibration (fresh bring-up + v2.1 sweep +
+# teardown), from the measured v2 full pass (~72 h for 57 cells) and the rerun
+# plan's 17 h per 14 cells. Override with --est-sweep-minutes.
+DEFAULT_EST_SWEEP_MIN = 17 * 60 / 14
 
 
 def system_of(cell_id: str) -> str:
@@ -312,6 +333,41 @@ def calibration_is_valid(calib_path, cell_id: str, fraction: Optional[float],
     return True, f"ok (status={calib.get('status')}, rate={calib.get('rate_calibrated_rps')})"
 
 
+def check_descriptor(campaign_yaml: Path) -> Optional[tuple[int, str]]:
+    """Refuse a descriptor this orchestrator must not calibrate. Returns
+    (exit_code, message) or None when it is fine.
+
+      * CLOSED state file -> EXIT_CAMPAIGN_CLOSED: its calibrations are evidence.
+      * a cell without calibration_file -> EXIT_DESCRIPTOR (nothing to write to;
+        e.g. the uncalibrated W1 soak cells).
+      * a window descriptor (rerun_window.calibration_dir) whose cell writes
+        outside that directory -> EXIT_DESCRIPTOR (windows must never share or
+        overwrite each other's calibrations)."""
+    campaign_yaml = Path(campaign_yaml).resolve()
+    campaign = camp.load_campaign(campaign_yaml)
+    state_path = (campaign_yaml.parent / campaign.get(
+        "state_file", "state/campaign_state.json")).resolve()
+    try:
+        closure = camp.state_closure(state_path)
+    except (OSError, json.JSONDecodeError) as e:
+        return EXIT_DESCRIPTOR, f"unreadable state file {state_path}: {e}"
+    if closure is not None:
+        return EXIT_CAMPAIGN_CLOSED, camp.closure_message(state_path, closure)
+    specs = camp.build_schedule(campaign, campaign_yaml)
+    missing = [s.cell_id for s in specs if not s.calibration_file]
+    if missing:
+        return EXIT_DESCRIPTOR, f"cells without calibration_file (not calibration targets): {missing}"
+    window = campaign.get("rerun_window")
+    if window:
+        calib_dir = (campaign_yaml.parent / window["calibration_dir"]).resolve()
+        outside = [s.cell_id for s in specs
+                   if Path(s.calibration_file).resolve().parent != calib_dir]
+        if outside:
+            return EXIT_DESCRIPTOR, (f"window W{window.get('window')}: calibration_file outside "
+                                     f"{calib_dir} for {outside}")
+    return None
+
+
 def publish_calibration(tmp_out: Path, out_path: Path,
                         rc: Optional[int] = None,
                         orchestration: Optional[dict] = None) -> Optional[dict]:
@@ -400,7 +456,8 @@ class Orchestrator:
                  grid_map: dict, env_rates: Optional[list[float]],
                  min_free_gb: float = 20.0, step_min_s: float = 600.0,
                  ceil_mult: float = 20.0, min_method_version: Optional[int] = None,
-                 engine_failure_retries: int = 1, logf=None) -> None:
+                 engine_failure_retries: int = 1, logf=None,
+                 est_sweep_min: float = DEFAULT_EST_SWEEP_MIN) -> None:
         self.campaign_yaml = Path(campaign_yaml)
         self.runs_root = Path(runs_root)
         self.repo_root = Path(repo_root)
@@ -427,6 +484,7 @@ class Orchestrator:
         self.grid_map = grid_map or {}
         self.env_rates = env_rates
         self.min_free_gb = float(min_free_gb)
+        self.est_sweep_min = float(est_sweep_min)
         self._logf = logf
 
         # The args namespace launch_cell's lifecycle classes read from. Only a
@@ -739,25 +797,40 @@ class Orchestrator:
 
     # -- orchestration ------------------------------------------------------
 
+    def projected_duration_s(self, n_todo: int) -> float:
+        """Projected wall time to calibrate n_todo cells (one fresh stack each)."""
+        return n_todo * self.est_sweep_min * 60.0
+
     def run_plan_only(self) -> int:
-        """--dry-run for the orchestrator itself: print the grouped plan and each
-        cell's current validity, bring nothing up."""
+        """--dry-run for the orchestrator itself: print the grouped plan, each
+        cell's current validity and the projected duration, bring nothing up."""
         groups = self.plan_groups()
         total = sum(len(cells) for _, cells in groups)
         valid = 0
+        todo_by_system: dict[str, int] = {}
         self.log(f"plan: {total} cells across {len(groups)} systems "
                  f"(order: {', '.join(s for s, _ in groups)})")
         for system, cells in groups:
             self.log(f"  system {system}: {len(cells)} cells")
             for spec in cells:
                 ok, reason = self._status_fn(spec)
-                if ok:
+                if ok and not self.forced(spec.cell_id):
                     valid += 1
+                else:
+                    todo_by_system[system] = todo_by_system.get(system, 0) + 1
                 grid = self.resolve_grid(spec)
-                mark = "VALID " if ok else "TODO  "
+                mark = ("FORCED" if self.forced(spec.cell_id)
+                        else "VALID " if ok else "TODO  ")
                 self.log(f"    {mark} {spec.cell_id}  frac={spec.calibration_fraction}  "
-                         f"grid={grid}  ({reason})")
-        self.log(f"plan: {valid}/{total} already valid, {total - valid} to calibrate")
+                         f"grid={grid}  -> {spec.calibration_file}  ({reason})")
+        todo = total - valid
+        self.log(f"plan: {valid}/{total} already valid, {todo} to calibrate")
+        proj_s = self.projected_duration_s(todo)
+        finish = datetime.fromtimestamp(self._now() + proj_s, timezone.utc)
+        self.log(f"projected duration: {proj_s / 3600:.1f} h for {todo} cells "
+                 f"({self.est_sweep_min:.1f} min/cell, one fresh stack per sweep; "
+                 + ", ".join(f"{s}={n}" for s, n in todo_by_system.items())
+                 + f") -> ETA {finish.isoformat(timespec='minutes')} if started now")
         return EXIT_OK
 
     def run(self) -> int:
@@ -1133,6 +1206,7 @@ def build_orchestrator(args) -> Orchestrator:
         env_rates=_env_rates(),
         min_free_gb=min_free_gb,
         logf=logf,
+        est_sweep_min=args.est_sweep_minutes,
     )
 
 
@@ -1168,9 +1242,18 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true",
                    help="Print the grouped plan and each cell's current validity, then exit "
                         "(no lock, no bring-up).")
+    p.add_argument("--est-sweep-minutes", type=float, default=DEFAULT_EST_SWEEP_MIN,
+                   help="Projected minutes per cell for the --dry-run duration "
+                        f"(default {DEFAULT_EST_SWEEP_MIN:.1f} = 17 h per 14 cells).")
     p.add_argument("--no-log-file", action="store_true",
                    help="Do not tee to campaigns/extension/state/logs/ (stdout only).")
     args = p.parse_args()
+
+    refusal = check_descriptor(args.campaign_yaml)
+    if refusal is not None:
+        rc, msg = refusal
+        print(f"[calibrate_dow] REFUSED: {msg}", file=sys.stderr)
+        sys.exit(rc)
 
     orch = build_orchestrator(args)
     if args.dry_run:
