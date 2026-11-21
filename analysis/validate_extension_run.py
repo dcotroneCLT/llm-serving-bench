@@ -24,6 +24,7 @@ import math
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -373,13 +374,37 @@ def check_client_features(run_dir: Path, target_prefix_frac: float,
     return ok, msgs
 
 
+def pss_uss_report(diagnostics: list[dict]) -> list[str]:
+    """R6: the PSS total trend next to USS for every aggregate, and a WARNING
+    (never a failure) when PSS - USS grows significantly: shared-memory growth
+    that the USS response cannot see."""
+    if not diagnostics:
+        return ["    PSS vs USS: no aggregate with both USS and PSS samples"]
+    msgs = ["    PSS vs USS per aggregate (Sen slope, MB/h; diagnostic, not gated):"]
+    for d in diagnostics:
+        msgs.append(f"      {d['aggregate']:<28} USS {d['uss_slope_bytes_per_h'] / 1e6:+9.3f}  "
+                    f"PSS {d['pss_slope_bytes_per_h'] / 1e6:+9.3f}  "
+                    f"PSS-USS {d['pss_minus_uss_slope_bytes_per_h'] / 1e6:+9.3f} "
+                    f"(p={d['pss_minus_uss_mk_p']:.2g})")
+        if d.get("flag_shared_growth"):
+            msgs.append(f"    WARN: {d['aggregate']}: PSS - USS grows significantly -> "
+                        "shared-memory growth invisible to USS (inspect before interpreting USS)")
+    return msgs
+
+
 def check_analysis(run_dir: Path, repo_root: Path) -> tuple[bool, list[str]]:
-    cmd = [sys.executable, str(repo_root / "analysis" / "aging_trends.py"),
-           "--run-dir", str(run_dir), "--csv"]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    except subprocess.SubprocessError as e:
-        return False, [f"    FAIL: aging_trends crashed: {e}"]
+    with tempfile.TemporaryDirectory() as tmp:
+        pss_path = Path(tmp) / "pss.json"
+        cmd = [sys.executable, str(repo_root / "analysis" / "aging_trends.py"),
+               "--run-dir", str(run_dir), "--csv", "--pss-json", str(pss_path)]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.SubprocessError as e:
+            return False, [f"    FAIL: aging_trends crashed: {e}"]
+        try:
+            diagnostics = json.loads(pss_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            diagnostics = []
     if out.returncode != 0:
         return False, [f"    FAIL: aging_trends rc={out.returncode}: {out.stderr.strip()[:300]}"]
     try:
@@ -392,7 +417,7 @@ def check_analysis(run_dir: Path, repo_root: Path) -> tuple[bool, list[str]]:
         has_uss = False
     n_rows = max(0, len(out.stdout.splitlines()) - 1)
     msg = [f"    aging_trends: {n_rows} indicator rows, proc.uss_bytes={'usable' if has_uss else 'missing/insufficient/non-finite'}"]
-    return has_uss, msg
+    return has_uss, msg + pss_uss_report(diagnostics)
 
 
 def main() -> None:

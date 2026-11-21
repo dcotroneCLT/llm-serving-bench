@@ -27,6 +27,17 @@ Pipeline:
   5. Mark a trend as significant when both MK q-value < alpha AND the Sen
      CI excludes zero.
 
+PSS vs USS diagnostic (R6). USS is the summable, authoritative response, but
+it is blind to growth of SHARED pages (shm segments, shared file mappings,
+CUDA IPC buffers mapped by several processes). For every aggregate -- the
+canonical proc aggregate and every monitored component (whole-container roles,
+Dynamo components) -- the PSS total trend is reported next to the USS trend,
+together with the trend of the gap PSS - USS (computed per raw sample before
+downsampling). A gap that grows significantly (Hamed-Rao MK p < 0.01, Sen CI
+above zero, slope >= 1 MB/h) is FLAGGED as a warning: shared-memory growth
+invisible to USS. The diagnostic is NOT part of the BH-FDR family above (the
+per-run q-values and the --csv rows are unchanged); --pss-json writes it out.
+
 Proc monitor catalog:
   Il catalogo include solo metriche istantanee o derivate (rate). I
   counter cumulativi sono esclusi perche' crescono linearmente per
@@ -48,6 +59,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import json
 import sys
 import warnings
 from pathlib import Path
@@ -64,6 +76,11 @@ except ImportError:
     sys.exit(2)
 
 from aging_io import infer_cell_id, load_manifest, resolve_warmup, truthy_series, discover_proc_prefix
+
+
+# PSS - USS gap flag (warning only): significance and materiality floors.
+PSS_GAP_ALPHA = 0.01
+PSS_GAP_MIN_SLOPE_BYTES_PER_H = 1e6
 
 
 # ---------- data loading ----------
@@ -317,6 +334,49 @@ def load_gpu_series(run_dir: Path, warmup_s: float, window_seconds: int) -> list
     return series
 
 
+def add_pss_gap(frame: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Per raw sample PSS - USS column (before downsampling), when both exist."""
+    if frame is None or "pss_bytes" not in frame or "uss_bytes" not in frame:
+        return frame
+    frame = frame.copy()
+    frame["pss_minus_uss_bytes"] = (pd.to_numeric(frame["pss_bytes"], errors="coerce")
+                                    - pd.to_numeric(frame["uss_bytes"], errors="coerce"))
+    return frame
+
+
+def pss_uss_diagnostic(name: str, frame: Optional[pd.DataFrame]) -> Optional[dict]:
+    """USS, PSS and PSS - USS trends for one aggregate (downsampled frame)."""
+    if frame is None or frame.empty or "pss_minus_uss_bytes" not in frame:
+        return None
+    t = frame["_t_hours"]
+    uss = trend_one_indicator(frame["uss_bytes"], t)
+    pss = trend_one_indicator(frame["pss_bytes"], t)
+    gap = trend_one_indicator(frame["pss_minus_uss_bytes"], t)
+    flagged = bool(
+        np.isfinite(gap["sen_slope_per_hour"]) and np.isfinite(gap["ci_low"])
+        and np.isfinite(gap["mk_p"])
+        and gap["sen_slope_per_hour"] >= PSS_GAP_MIN_SLOPE_BYTES_PER_H
+        and gap["ci_low"] > 0 and gap["mk_p"] < PSS_GAP_ALPHA)
+    out = {"aggregate": name, "n": gap["n"], "flag_shared_growth": flagged}
+    for key, res in (("uss", uss), ("pss", pss), ("pss_minus_uss", gap)):
+        out[f"{key}_slope_bytes_per_h"] = res["sen_slope_per_hour"]
+        out[f"{key}_ci_low"] = res["ci_low"]
+        out[f"{key}_ci_high"] = res["ci_high"]
+        out[f"{key}_mk_p"] = res["mk_p"]
+        out[f"{key}_mean_bytes"] = res["mean"]
+    return out
+
+
+def format_pss_diagnostic(d: dict) -> str:
+    mb = 1e6
+    return (f"{d['aggregate']:<28} USS {d['uss_slope_bytes_per_h'] / mb:+10.3f}  "
+            f"PSS {d['pss_slope_bytes_per_h'] / mb:+10.3f}  "
+            f"PSS-USS {d['pss_minus_uss_slope_bytes_per_h'] / mb:+10.3f} MB/h "
+            f"[{d['pss_minus_uss_ci_low'] / mb:+.3f}, {d['pss_minus_uss_ci_high'] / mb:+.3f}] "
+            f"p={d['pss_minus_uss_mk_p']:.2g}"
+            + ("  WARNING: shared-memory growth invisible to USS" if d["flag_shared_growth"] else ""))
+
+
 def bh_fdr(pvalues: list[float], alpha: float = 0.10) -> list[float]:
     p = np.asarray(pvalues, dtype=float)
     valid = ~np.isnan(p)
@@ -350,6 +410,8 @@ def main() -> None:
     p.add_argument("--csv", action="store_true",
                    help="emit one CSV row per (run_id, indicator) to stdout "
                         "instead of the human-readable table.")
+    p.add_argument("--pss-json", type=Path, default=None,
+                   help="write the PSS vs USS diagnostic (every aggregate) as JSON.")
     args = p.parse_args()
 
     run_dir = args.run_dir_flag if args.run_dir_flag is not None else args.run_dir
@@ -383,6 +445,7 @@ def main() -> None:
             if "process_alive" in proc.columns:
                 proc = proc[truthy_series(proc["process_alive"])]
             proc = filter_warmup(proc, "ts_unix", warmup_s)
+            proc = add_pss_gap(proc)
             proc_ds = downsample_to_minutes(proc, "ts_unix", args.downsample_seconds)
             print(f"  proc ({proc_prefix}): {len(proc)} post-warmup -> {len(proc_ds)} per-window samples",
                   file=progress)
@@ -394,17 +457,24 @@ def main() -> None:
     # Whole-container roles are sampled coherently with the canonical proc
     # aggregate. Expose their trends without replacing the total response.
     component_series = []
+    # PSS vs USS diagnostic frames (R6): every aggregate, outside the BH family.
+    pss_frames: list[tuple[str, pd.DataFrame]] = []
     monitor_spec = load_manifest(run_dir).get("monitors")
     component_spec = (monitor_spec.get("components") or {}) if isinstance(monitor_spec, dict) else {}
-    if component_spec.get("scope_type") == "container_tree":
-        for component in component_spec["components"]:
-            frame = load_csvs(run_dir, component["label"])
-            if frame is not None:
-                frame = frame[truthy_series(frame["membership_complete"])]
-                frame = filter_warmup(frame, "ts_unix", warmup_s)
-                if not frame.empty:
-                    component_series.append(("component." + component["role"],
-                                             downsample_to_minutes(frame, "ts_unix", args.downsample_seconds)))
+    container_tree = component_spec.get("scope_type") == "container_tree"
+    for component in component_spec.get("components") or []:
+        frame = load_csvs(run_dir, component["label"])
+        if frame is None or "membership_complete" not in frame:
+            continue
+        frame = frame[truthy_series(frame["membership_complete"])]
+        frame = add_pss_gap(filter_warmup(frame, "ts_unix", warmup_s))
+        if frame is None or frame.empty:
+            continue
+        ds = downsample_to_minutes(frame, "ts_unix", args.downsample_seconds)
+        name = "component." + (component["role"] if container_tree else component["label"])
+        pss_frames.append((name, ds))
+        if container_tree:
+            component_series.append((name, ds))
 
     system = load_csvs(run_dir, "system")
     if system is None:
@@ -457,6 +527,11 @@ def main() -> None:
     if not catalog:
         print("No indicators to analyze. Aborting.", file=sys.stderr); sys.exit(1)
 
+    if proc_ds is not None:
+        pss_frames.insert(0, ("proc", proc_ds))
+    pss_diagnostics = [d for name, frame in pss_frames
+                       if (d := pss_uss_diagnostic(name, frame)) is not None]
+
     print(f"\nAnalyzing {len(catalog)} indicators ...", file=progress)
 
     rows = []
@@ -482,7 +557,14 @@ def main() -> None:
         mk_significant = (not np.isnan(q)) and (q <= args.alpha)
         r["significant"] = bool(mk_significant and ci_excludes_zero)
 
+    if args.pss_json is not None:
+        args.pss_json.write_text(json.dumps(pss_diagnostics, indent=2, default=float) + "\n")
+
     if args.csv:
+        # The CSV rows stay exactly the BH-family indicators; the PSS diagnostic
+        # goes to stderr (and --pss-json) so downstream aggregators are unchanged.
+        for d in pss_diagnostics:
+            print(f"[pss-vs-uss] {format_pss_diagnostic(d)}", file=sys.stderr)
         writer = csv.writer(sys.stdout)
         writer.writerow([
             "run_id", "cell_id", "indicator", "n_samples",
@@ -519,6 +601,15 @@ def main() -> None:
               f"{r['ci_low']:>14.4g} {r['ci_high']:>14.4g} "
               f"{r['mk_p']:>9.4f} {r['q_value']:>9.4f} {sig:>5}")
     print("=" * 140)
+
+    if pss_diagnostics:
+        print("\nPSS vs USS per aggregate (diagnostic, not in the FDR family; MB/h):")
+        for d in pss_diagnostics:
+            print("  " + format_pss_diagnostic(d))
+        flagged = [d["aggregate"] for d in pss_diagnostics if d["flag_shared_growth"]]
+        if flagged:
+            print(f"  WARNING: PSS - USS grows significantly on {', '.join(flagged)} "
+                  "(shared-memory growth invisible to USS)")
 
     sig_count = sum(1 for r in rows if r["significant"])
     print(f"\nSignificant trends (MK q<{args.alpha:.2f} AND Sen CI excludes 0): "
