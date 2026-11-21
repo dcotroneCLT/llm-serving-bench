@@ -102,8 +102,11 @@ class WholeRunFixture(ScopeFixture):
             {"submitted_at_unix": self.start + t, "status": "ok", "e2e_latency_s": 1,
              "shared_prefix_applied": (t // 5) % 5 < 2}
             for t in range(0, self.duration, 5)])
+        # The fields the real client records (R7 checks CoV against the theory
+        # for the recorded rate and arrival count).
         (self.rd / "client/arrival_stats.json").write_text(json.dumps({
-            "arrival_mode": "poisson", "interarrival_cv": 1}))
+            "arrival_mode": "poisson", "interarrival_cv": 1, "target_rate_rps": 0.2,
+            "realized_count": 240}))
 
     def write_manifest(self):
         (self.rd / "manifest.json").write_text(json.dumps(self.manifest))

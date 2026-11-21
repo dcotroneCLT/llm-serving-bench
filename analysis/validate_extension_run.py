@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from arrival_theory import check_realized_cv  # noqa: E402
 from ecc_check import ecc_verdict  # noqa: E402
 from run_integrity import check_run_integrity, saved_client_config  # noqa: E402
 
@@ -324,7 +325,8 @@ def check_multi_gpu(run_dir: Path, gpu_devices: list[int]) -> tuple[bool, list[s
 
 
 def check_client_features(run_dir: Path, target_prefix_frac: float,
-                          target_arrival_mode: Optional[str] = None) -> tuple[bool, list[str]]:
+                          target_arrival_mode: Optional[str] = None,
+                          config: Optional[dict] = None) -> tuple[bool, list[str]]:
     msgs = []
     ok = True
     rows = _read_csvs(run_dir / "client", "requests") if (run_dir / "client").exists() else []
@@ -349,17 +351,22 @@ def check_client_features(run_dir: Path, target_prefix_frac: float,
     if arr_path.exists():
         arr = json.loads(arr_path.read_text())
         cv = arr.get("interarrival_cv")
-        try:
-            cv_number = float(cv)
-        except (ValueError, TypeError):
-            cv_number = float("nan")
         msgs.append(f"    arrival_mode={arr.get('arrival_mode')} realized CoV={cv} rate={arr.get('realized_rate_rps')}")
         if target_arrival_mode is not None and arr.get("arrival_mode") != target_arrival_mode:
             ok = False
             msgs.append("    FAIL: realized arrival mode differs from the recorded workload")
-        if arr.get("arrival_mode") == "bursty" and (not math.isfinite(cv_number) or cv_number < 1.5):
+        # Realized vs theoretical CoV for the RECORDED rate / burst_factor /
+        # burst_on_seconds (analysis/arrival_theory.py). Replaces the fixed
+        # CoV >= 1.5 rule, which failed correctly generated low-rate bursty
+        # runs (an on/off burst holds < 1 request at low absolute rates).
+        verdict, detail = check_realized_cv(arr, config)
+        if verdict == "fail":
             ok = False
-            msgs.append("    FAIL: bursty CoV not >> 1 (burstiness had no effect)")
+            msgs.append(f"    FAIL: {detail}")
+        elif verdict == "low_power":
+            msgs.append(f"    NOTE: {detail}")
+        else:
+            msgs.append(f"    CoV check: {detail}")
     else:
         msgs.append("    arrival_stats.json: MISSING")
         ok = False
@@ -451,7 +458,8 @@ def main() -> None:
     try:
         config = saved_client_config(args.run_dir, manifest)
         target = float(args.target_prefix_frac if args.target_prefix_frac is not None else config["prefix_repeat_fraction"])
-        okc, mc = check_client_features(args.run_dir, target, config.get("arrival_mode", "poisson"))
+        okc, mc = check_client_features(args.run_dir, target, config.get("arrival_mode", "poisson"),
+                                        config)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         okc, mc = False, [f"    FAIL: cannot resolve recorded prefix target: {exc}"]
     print("\n".join(mc)); results.append(("client_features", okc))
